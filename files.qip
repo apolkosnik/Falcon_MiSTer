@@ -1,0 +1,48 @@
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_top.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_core.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_memsys.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_mmu.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_cache.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_bus.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_alu.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_muldiv.v
+set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_regfile.v
+set_global_assignment -name SEARCH_PATH rtl/AP68030/rtl
+set_global_assignment -name SEARCH_PATH rtl/AP68030/rtl/core
+set_global_assignment -name SEARCH_PATH rtl/falcon
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_system.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_memarb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_combel.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_videl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_psg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp_timer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp_usart.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_acia.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd_keymap.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_nvram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_blitter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_crossbar.sv
+# Bring-up builds without some devices (testing only):
+#   FALCON_BRINGUP="NO_IDE NO_FDC NO_DSP" quartus_sh --flow compile Falcon
+if {[info exists ::env(FALCON_BRINGUP)]} {
+	foreach d $::env(FALCON_BRINGUP) { set_global_assignment -name VERILOG_MACRO "FALCON_$d=1" }
+}
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ide.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_fdc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_fdc_ncr5380.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/falcon_dsp.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp56k_core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp56k_dec.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp56k_alu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp_periph.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp_ram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp56k_rom.sv
+set_global_assignment -name SEARCH_PATH rtl/falcon/dsp
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_scsi.sv
+# device modules are appended here as they are integrated
+set_global_assignment -name QIP_FILE rtl/pll.qip
+set_global_assignment -name SDC_FILE Falcon.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE Falcon.sv

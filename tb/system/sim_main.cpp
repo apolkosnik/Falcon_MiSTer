@@ -4,12 +4,14 @@
 //     --ms N            simulated milliseconds to run (default 3000)
 //     --ide0 FILE       IDE master image      --ide1 FILE  IDE slave image
 //     --fda FILE        floppy A image (.ST)  --fdb FILE   floppy B image
+//     --scsi0/--scsi1 FILE  SCSI hard disks    --scsicd FILE SCSI ID 2 CD-ROM (.iso)
 //     --frames DIR      write every captured frame as DIR/frame_NNNN.ppm
 //     --frame-every N   only every Nth frame (default 1)
 //     --monitor M       0 mono, 1 RGB, 2 VGA (default), 3 TV
 //     --ram MB          4 or 14 (default 14)
 //     --pctrace N       print the PC every N clocks
 //     --berrtrace       print every bus error cycle
+//     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
 #include "Vtb_top.h"
@@ -47,7 +49,9 @@ int main(int argc, char **argv) {
     int frame_every = 1, monitor = 2, ram = 14;
     long pctrace = 0;
     bool berrtrace = false;
-    Disk disk[4];
+    unsigned io_lo = 1, io_hi = 0;
+    double io_from = 0;
+    Disk disk[7];
     std::vector<Event> events;
 
     for (int i = 1; i < argc; i++) {
@@ -65,12 +69,17 @@ int main(int argc, char **argv) {
         else if (a == "--fdb") open_disk(1);
         else if (a == "--ide0") open_disk(2);
         else if (a == "--ide1") open_disk(3);
+        else if (a == "--scsi0") open_disk(4);
+        else if (a == "--scsi1") open_disk(5);
+        else if (a == "--scsicd") open_disk(6);
         else if (a == "--frames") frames_dir = next();
         else if (a == "--frame-every") frame_every = atoi(next().c_str());
         else if (a == "--monitor") monitor = atoi(next().c_str());
         else if (a == "--ram") ram = atoi(next().c_str());
         else if (a == "--pctrace") pctrace = atol(next().c_str());
         else if (a == "--berrtrace") berrtrace = true;
+        else if (a == "--iotrace") sscanf(next().c_str(), "%x:%x", &io_lo, &io_hi);
+        else if (a == "--iofrom") io_from = atof(next().c_str());
         else if (a == "--key") { double t; unsigned c; sscanf(next().c_str(), "%lf:%x", &t, &c); events.push_back({t, 0, (int)c, 0, 0}); }
         else if (a == "--mouse") { double t; int dx, dy, b; sscanf(next().c_str(), "%lf:%d:%d:%d", &t, &dx, &dy, &b); events.push_back({t, 1, dx, dy, b}); }
     }
@@ -126,7 +135,7 @@ int main(int argc, char **argv) {
         if (cyc == 1000) { rtc_toggle = !rtc_toggle; top->rtc[2] = rtc_toggle; }
 
         // mount the images once, one slot per clock pulse like hps_io
-        if (cyc >= 2000 && mount_step < 4) {
+        if (cyc >= 2000 && mount_step < 7) {
             int n = mount_step;
             if (top->img_mounted) top->img_mounted = 0;
             else {
@@ -137,7 +146,7 @@ int main(int argc, char **argv) {
                 }
                 mount_step++;
             }
-        } else if (mount_step >= 4 && top->img_mounted) top->img_mounted = 0;
+        } else if (mount_step >= 7 && top->img_mounted) top->img_mounted = 0;
 
         // scripted input
         for (auto &e : events) {
@@ -161,9 +170,9 @@ int main(int argc, char **argv) {
         }
 
         // hps_io block protocol
-        uint32_t lba[4];
-        for (int n = 0; n < 4; n++) lba[n] = top->sd_lba_f[n];
-        for (int n = 0; n < 4; n++) {
+        uint32_t lba[7];
+        for (int n = 0; n < 7; n++) lba[n] = top->sd_lba_f[n];
+        for (int n = 0; n < 7; n++) {
             Disk &d = disk[n];
             bool rd = (top->sd_rd >> n) & 1, wr = (top->sd_wr >> n) & 1;
             if (d.phase == 0 && (rd || wr)) {
@@ -177,7 +186,7 @@ int main(int argc, char **argv) {
             }
         }
         top->sd_buff_wr = 0;
-        for (int n = 0; n < 4; n++) {
+        for (int n = 0; n < 7; n++) {
             Disk &d = disk[n];
             if (d.phase == 1) {
                 if (--d.delay <= 0) { d.phase = d.idx < 0 ? 3 : 2; d.idx = 0; top->sd_ack |= 1 << n; }
@@ -191,7 +200,7 @@ int main(int argc, char **argv) {
                 break;
             }
             if (d.phase == 3) {           // core -> HPS: address now, data next clock
-                if (d.idx > 0) d.buf[d.idx - 1] = (top->sd_buff_din_f >> (8 * n)) & 0xFF;
+                if (d.idx > 0) d.buf[d.idx - 1] = (uint8_t)(top->sd_buff_din_f >> (8 * n));
                 if (d.idx == 512) {
                     if (d.f && !d.ro) { fseek(d.f, (long)d.lba * 512, SEEK_SET); fwrite(d.buf, 1, 512, d.f); fflush(d.f); }
                     d.phase = 4;
@@ -239,6 +248,19 @@ int main(int argc, char **argv) {
         if (berrtrace && top->dbg_berr && !prev_berr)
             printf("[%9.3f ms] BERR a=%08x fc=%d %s pc=%08x\n", now_ms, top->dbg_a, top->dbg_fc, top->dbg_rw ? "rd" : "wr", top->dbg_pc);
         prev_berr = top->dbg_berr;
+
+        // device bus trace: print on the acknowledge (read data valid)
+        {
+            static unsigned t_addr; static bool t_we, t_pend; static unsigned t_din; static int t_u, t_l;
+            if (top->dbg_dev_stb) { t_addr = top->dbg_dev_addr; t_we = top->dbg_dev_we; t_din = top->dbg_dev_din; t_u = top->dbg_dev_uds; t_l = top->dbg_dev_lds; t_pend = true; }
+            if (t_pend && top->dbg_dev_ack) {
+                t_pend = false;
+                if (t_addr >= io_lo && t_addr <= io_hi && now_ms >= io_from) {
+                    if (t_we) printf("[%9.3f ms] IOW %06x %s = %04x pc=%08x\n", now_ms, t_addr, t_u && t_l ? "w" : t_u ? "e" : "o", t_din, top->dbg_pc);
+                    else printf("[%9.3f ms] IOR %06x %s -> %04x pc=%08x\n", now_ms, t_addr, t_u && t_l ? "w" : t_u ? "e" : "o", top->dbg_dev_dout, top->dbg_pc);
+                }
+            }
+        }
 
         if (top->dbg_halted) { printf("[%9.3f ms] CPU HALTED (double bus fault) pc=%08x\n", now_ms, top->dbg_pc); break; }
     }

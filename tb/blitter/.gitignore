@@ -1,0 +1,9 @@
+obj/
+syn/db/
+syn/incremental_db/
+syn/output_files/
+syn/*.rpt
+syn/*.summary
+syn/*.pin
+syn/*.log
+syn/*.qws

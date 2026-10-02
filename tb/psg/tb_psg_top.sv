@@ -32,7 +32,7 @@ module tb_psg_top (
     output            n_ack,
     output      [4:0] n_cha
 );
-    falcon_psg #(.VOL_HEX("../../rtl/falcon/falcon_psg_vol.hex")) u_tab (
+    falcon_psg #(.VOL_MEM("../../rtl/falcon/falcon_psg_vol.mem")) u_tab (
         .clk(clk), .reset(reset), .bus_cs(bus_cs), .bus_stb(bus_stb), .bus_we(bus_we),
         .bus_addr(bus_addr), .bus_uds(bus_uds), .bus_lds(bus_lds), .bus_din(bus_din),
         .bus_dout(t_dout), .bus_ack(t_ack), .port_a_in(port_a_in), .port_b_in(port_b_in),

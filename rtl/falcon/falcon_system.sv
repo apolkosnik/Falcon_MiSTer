@@ -31,17 +31,18 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 	input      [31:0] joy1,
 	input      [64:0] rtc,
 
-	// disk slots: 0 floppy A, 1 floppy B, 2 IDE master, 3 IDE slave
-	input       [3:0] img_mounted,
+	// disk slots: 0 floppy A, 1 floppy B, 2 IDE master, 3 IDE slave,
+	//             4..6 SCSI ID 0..2 (2 = CD-ROM); Main's FALCON_SCSI_SLOT0 = 4
+	input       [6:0] img_mounted,
 	input             img_readonly,
 	input      [63:0] img_size,
-	output     [31:0] sd_lba[4],
-	output      [3:0] sd_rd,
-	output      [3:0] sd_wr,
-	input       [3:0] sd_ack,
+	output     [31:0] sd_lba[7],
+	output      [6:0] sd_rd,
+	output      [6:0] sd_wr,
+	input       [6:0] sd_ack,
 	input       [8:0] sd_buff_addr,
 	input       [7:0] sd_buff_dout,
-	output      [7:0] sd_buff_din[4],
+	output      [7:0] sd_buff_din[7],
 	input             sd_buff_wr,
 
 	// video
@@ -249,6 +250,7 @@ wire [15:0] ide_dout, combel_dout, videl_dout, fdc_dout, psg_dout, xbar_dout, nv
 wire [15:0] blit_dout, dsp_dout, mfp_dout, acia_dout;
 wire        ide_ack, combel_ack, videl_ack, fdc_ack, psg_ack, xbar_ack, nvram_ack;
 wire        blit_ack, dsp_ack, mfp_ack, acia_ack;
+wire        xbar_berr, fdc_berr;
 reg   [7:0] scc_ptr;
 
 always @* begin
@@ -259,9 +261,9 @@ always @* begin
 		if      (sel_ide)    begin dev_dout = ide_dout;    dev_ack = ide_ack;    end
 		else if (sel_combel) begin dev_dout = combel_dout; dev_ack = combel_ack; end
 		else if (sel_videl || sel_pal) begin dev_dout = videl_dout; dev_ack = videl_ack; end
-		else if (sel_fdc)    begin dev_dout = fdc_dout;    dev_ack = fdc_ack;    end
+		else if (sel_fdc)    begin dev_dout = fdc_dout;    dev_ack = fdc_ack;    dev_berr = fdc_berr; end
 		else if (sel_psg)    begin dev_dout = psg_dout;    dev_ack = psg_ack;    end
-		else if (sel_xbar)   begin dev_dout = xbar_dout;   dev_ack = xbar_ack;   end
+		else if (sel_xbar)   begin dev_dout = xbar_dout;   dev_ack = xbar_ack;   dev_berr = xbar_berr; end
 		else if (sel_nvram)  begin dev_dout = nvram_dout;  dev_ack = nvram_ack;  end
 		else if (sel_blit)   begin dev_dout = blit_dout;   dev_ack = blit_ack;   end
 		else if (sel_scc)    begin dev_dout = 16'h2C2C;    dev_ack = dev_stb;    end  // RR0: Tx empty, DCD, CTS
@@ -306,17 +308,31 @@ falcon_videl #(.CLK_HZ(CLK_HZ)) videl
 // ---- PSG ----
 wire  [7:0] porta, portb;
 wire signed [15:0] psg_audio;
-falcon_psg #(.CLK_HZ(CLK_HZ)) psg
+wire        [15:0] psg_raw;
+wire               psg_stb;
+falcon_psg #(.CLK_HZ(CLK_HZ), .MIRROR(0)) psg
 (
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_psg), .bus_addr(dev_addr[7:1]), .bus_dout(psg_dout), .bus_ack(psg_ack),
 	.port_a_in(8'hFF), .port_b_in(8'hFF),
-	.port_a_out(porta), .port_b_out(portb),
-	.sample(psg_audio)
+	.port_a_out(porta), .port_b_out(portb), .port_a_oe(), .port_b_oe(),
+	.ch_a(), .ch_b(), .ch_c(),
+	.snd_sample(psg_raw), .snd_stb(psg_stb)
 );
 
+// The PSG level is Hatari's 0..32767 table value; remove its DC offset
+// with a one-pole high-pass (about 5 Hz at the 250 kHz sample rate), as
+// Hatari's Falcon path does before the codec.
+reg  signed [31:0] psg_dc;
+wire signed [16:0] psg_ac = $signed({2'b00, psg_raw[14:0]}) - $signed(psg_dc[31:15]);
+always @(posedge clk) begin
+	if (reset) psg_dc <= 32'sd16384 <<< 15;
+	else if (psg_stb) psg_dc <= psg_dc + ((($signed({2'b00, psg_raw[14:0]}) <<< 15) - psg_dc) >>> 13);
+end
+assign psg_audio = (psg_ac > 17'sd32767) ? 16'h7FFF : (psg_ac < -17'sd32768) ? 16'h8000 : psg_ac[15:0];
+
 // ---- MFP ----
-wire       mfp_irq, mfp_iack_ack;
+wire       mfp_irq, mfp_iack_ack, mfp_iack_spur;
 reg        mfp_iack;
 wire [7:0] mfp_vector;
 wire       acia_irq, fdc_irq, ide_irq, blit_busy, sndint, soundint;
@@ -325,7 +341,7 @@ falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 (
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_mfp), .bus_addr(dev_addr[5:1]), .bus_dout(mfp_dout), .bus_ack(mfp_ack),
-	.irq(mfp_irq), .iack(mfp_iack), .iack_vector(mfp_vector), .iack_ack(mfp_iack_ack),
+	.irq(mfp_irq), .iack(mfp_iack), .iack_vector(mfp_vector), .iack_ack(mfp_iack_ack), .iack_spurious(mfp_iack_spur),
 	.gpip_in({sndint, 1'b1, ~(fdc_irq | ide_irq), ~acia_irq, ~blit_busy, 1'b1, 1'b1, 1'b1}),
 	.gpip_out(), .gpip_oe(),
 	.tai(soundint), .tbi(videl_de),
@@ -339,19 +355,33 @@ falcon_acia #(.CLK_HZ(CLK_HZ)) acia
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_acia), .bus_addr(dev_addr[2:1]), .bus_dout(acia_dout), .bus_ack(acia_ack),
 	.irq(acia_irq),
-	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joystick_0(joy0), .joystick_1(joy1),
+	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joystick_0(joy1), .joystick_1(joy0),   // MiSTer joystick 1 -> ST port 1 (games), 2 -> port 0 (mouse port)
 	.midi_rx(midi_rx), .midi_tx(midi_tx)
 );
 
 // ---- NVRAM / RTC ----
+// the default NVRAM image follows the monitor setting: rebuild it when it changes
+reg [1:0] monitor_d;
+reg       nv_init;
+always @(posedge clk) begin
+	monitor_d <= monitor;
+	nv_init   <= (monitor_d != monitor);
+end
+
 falcon_nvram #(.CLK_HZ(CLK_HZ)) nvram
 (
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_nvram), .bus_addr(dev_addr[1:1]), .bus_dout(nvram_dout), .bus_ack(nvram_ack),
-	.rtc(rtc), .monitor(monitor)
+	.rtc(rtc),
+	.cfg_vga(monitor == 2'b10), .cfg_lang(8'd0), .cfg_kbd(8'd0), .nv_init(nv_init),
+	.nv_addr(6'd0), .nv_dout(), .nv_din(8'd0), .nv_wr(1'b0), .nv_changed(),
+	.irq()
 );
 
+`ifndef FALCON_NO_IDE
 // ---- IDE ----
+wire ide_led;
+assign hdd_led = ide_led | scsi_led;
 falcon_ide ide
 (
 	.clk(clk), .reset(dev_reset),
@@ -361,14 +391,26 @@ falcon_ide ide
 	.sd_lba0(sd_lba[2]), .sd_lba1(sd_lba[3]), .sd_rd(sd_rd[3:2]), .sd_wr(sd_wr[3:2]), .sd_ack(sd_ack[3:2]),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din0(sd_buff_din[2]), .sd_buff_din1(sd_buff_din[3]), .sd_buff_wr(sd_buff_wr),
-	.led(hdd_led)
+	.led(ide_led)
 );
 
+`else
+// bring-up build without the IDE controller
+assign ide_dout = 16'hFFFF; assign ide_ack = dev_stb & sel_ide; assign ide_irq = 0; assign ide_led = 0;
+assign sd_lba[2] = 0; assign sd_lba[3] = 0; assign sd_rd[3:2] = 0; assign sd_wr[3:2] = 0;
+assign sd_buff_din[2] = 0; assign sd_buff_din[3] = 0;
+`endif
+
+`ifndef FALCON_NO_FDC
 // ---- FDC + DMA ----
-falcon_fdc #(.CLK_HZ(CLK_HZ)) fdc
+wire        hdc_acc, hdc_we, hdc_irq_set, hdc_irq_clr, scsi_led;
+wire  [2:0] hdc_rs;
+wire  [7:0] hdc_wdata, hdc_rdata, hdc_push_byte, hdc_pull_byte;
+wire        hdc_push_req, hdc_push_ack, hdc_pull_req, hdc_pull_ack, hdc_flush;
+falcon_fdc #(.CLK_HZ(CLK_HZ), .EXT_SCSI(1)) fdc
 (
 	.clk(clk), .reset(dev_reset),
-	`DEVBUS(sel_fdc), .bus_addr(dev_addr[3:1]), .bus_dout(fdc_dout), .bus_ack(fdc_ack),
+	`DEVBUS(sel_fdc), .bus_addr(dev_addr[3:1]), .bus_dout(fdc_dout), .bus_ack(fdc_ack), .bus_berr(fdc_berr),
 	.irq(fdc_irq),
 	.drv_sel(porta[2:1]), .side_sel(porta[0]),
 	.dma_req(fdc_dreq), .dma_we(fdc_dwe), .dma_addr(fdc_daddr), .dma_be(fdc_dbe),
@@ -377,8 +419,39 @@ falcon_fdc #(.CLK_HZ(CLK_HZ)) fdc
 	.sd_lba0(sd_lba[0]), .sd_lba1(sd_lba[1]), .sd_rd(sd_rd[1:0]), .sd_wr(sd_wr[1:0]), .sd_ack(sd_ack[1:0]),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din0(sd_buff_din[0]), .sd_buff_din1(sd_buff_din[1]), .sd_buff_wr(sd_buff_wr),
-	.led(fdd_led)
+	.led(fdd_led),
+	.hdc_acc(hdc_acc), .hdc_we(hdc_we), .hdc_rs(hdc_rs), .hdc_wdata(hdc_wdata),
+	.hdc_rdata(hdc_rdata), .hdc_irq_set(hdc_irq_set), .hdc_irq_clr(hdc_irq_clr),
+	.hdc_push_req(hdc_push_req), .hdc_push_byte(hdc_push_byte), .hdc_push_ack(hdc_push_ack),
+	.hdc_pull_req(hdc_pull_req), .hdc_pull_byte(hdc_pull_byte), .hdc_pull_ack(hdc_pull_ack),
+	.hdc_flush(hdc_flush)
 );
+
+// ---- SCSI: NCR 5380 behind the DMA chip ($FF8604 with DMA mode bit 3) ----
+falcon_scsi #(.CLK_HZ(CLK_HZ)) scsi
+(
+	.clk(clk), .reset(dev_reset),
+	.acc(hdc_acc), .we(hdc_we), .rs(hdc_rs), .wdata(hdc_wdata), .rdata(hdc_rdata),
+	.irq_set(hdc_irq_set), .irq_clr(hdc_irq_clr),
+	.dma_push_req(hdc_push_req), .dma_push_byte(hdc_push_byte), .dma_push_ack(hdc_push_ack),
+	.dma_pull_req(hdc_pull_req), .dma_pull_byte(hdc_pull_byte), .dma_pull_ack(hdc_pull_ack),
+	.dma_flush(hdc_flush),
+	.img_mounted(img_mounted[6:4]), .img_readonly(img_readonly), .img_size(img_size),
+	.sd_lba0(sd_lba[4]), .sd_lba1(sd_lba[5]), .sd_lba2(sd_lba[6]),
+	.sd_rd(sd_rd[6:4]), .sd_wr(sd_wr[6:4]), .sd_ack(sd_ack[6:4]),
+	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
+	.sd_buff_din0(sd_buff_din[4]), .sd_buff_din1(sd_buff_din[5]), .sd_buff_din2(sd_buff_din[6]),
+	.sd_buff_wr(sd_buff_wr),
+	.led(scsi_led)
+);
+
+`else
+// bring-up build without the floppy controller
+assign fdc_dout = 16'hFFFF; assign fdc_ack = dev_stb & sel_fdc; assign fdc_berr = 0; assign fdc_irq = 0; assign fdd_led = 0;
+assign fdc_dreq = 0; assign fdc_dwe = 0; assign fdc_daddr = 0; assign fdc_dbe = 0; assign fdc_dwdata = 0;
+assign sd_lba[0] = 0; assign sd_lba[1] = 0; assign sd_rd[1:0] = 0; assign sd_wr[1:0] = 0;
+assign sd_buff_din[0] = 0; assign sd_buff_din[1] = 0;
+`endif
 
 // ---- Blitter: owns the bus through BR/BG/BGACK ----
 wire blit_br;
@@ -414,21 +487,23 @@ always @(posedge clk) begin
 end
 
 // ---- DMA sound / crossbar / codec ----
-wire        ssi_slot_stb, ssi_frame, ssi_tx_valid;
+wire        ssi_slot_stb, ssi_frame, ssi_tx_valid, ssi_tx_en, ssi_rx_en, ssi_rx_frame, ssi_hs_play_req;
 wire [15:0] ssi_rx_data, ssi_tx_data;
 falcon_crossbar #(.CLK_HZ(CLK_HZ)) crossbar
 (
 	.clk(clk), .reset(dev_reset),
-	`DEVBUS(sel_xbar), .bus_addr(dev_addr[6:1]), .bus_dout(xbar_dout), .bus_ack(xbar_ack),
+	`DEVBUS(sel_xbar), .bus_addr(dev_addr[6:1]), .bus_dout(xbar_dout), .bus_ack(xbar_ack), .bus_berr(xbar_berr),
 	.dma_req(snd_req), .dma_we(snd_we), .dma_addr(snd_addr), .dma_be(snd_be),
 	.dma_wdata(snd_wdata), .dma_rdata(snd_rdata), .dma_ack(snd_ack),
 	.sndint(sndint), .soundint(soundint),
 	.psg_audio(psg_audio), .mic_l(16'sd0), .mic_r(16'sd0),
 	.audio_l(audio_l), .audio_r(audio_r), .audio_stb(),
 	.ssi_slot_stb(ssi_slot_stb), .ssi_frame(ssi_frame), .ssi_rx_data(ssi_rx_data),
-	.ssi_tx_data(ssi_tx_data), .ssi_tx_valid(ssi_tx_valid)
+	.ssi_tx_data(ssi_tx_data), .ssi_tx_valid(ssi_tx_valid),
+	.ssi_tx_en(ssi_tx_en), .ssi_rx_en(ssi_rx_en), .ssi_rx_frame(ssi_rx_frame), .ssi_hs_play_req(ssi_hs_play_req), .dbg_underrun()
 );
 
+`ifndef FALCON_NO_DSP
 // ---- DSP56001 ----
 wire       dsp_hreq;
 wire [7:0] dsp_ivr;
@@ -438,8 +513,18 @@ falcon_dsp dsp
 	`DEVBUS(sel_dsp), .bus_addr(dev_addr[2:1]), .bus_dout(dsp_dout), .bus_ack(dsp_ack),
 	.hreq(dsp_hreq), .ivr(dsp_ivr), .iack(1'b0),
 	.ssi_slot_stb(ssi_slot_stb), .ssi_frame(ssi_frame), .ssi_rx_data(ssi_rx_data),
-	.ssi_tx_data(ssi_tx_data), .ssi_tx_valid(ssi_tx_valid)
+	.ssi_tx_data(ssi_tx_data), .ssi_tx_valid(ssi_tx_valid),
+	.ssi_tx_en(ssi_tx_en), .ssi_rx_en(ssi_rx_en), .ssi_rx_frame(ssi_rx_frame),
+	.ssi_hs_play_req(ssi_hs_play_req)
 );
+
+`else
+// bring-up build without the DSP
+wire       dsp_hreq = 0;
+wire [7:0] dsp_ivr = 8'h0F;
+assign dsp_dout = 16'hFFFF; assign dsp_ack = dev_stb & sel_dsp;
+assign ssi_tx_data = 0; assign ssi_tx_valid = 0; assign ssi_hs_play_req = 0;
+`endif
 
 //////////////////////////////////////////////////////////////////
 //  Interrupts (M68000_Update_intlev)
@@ -483,7 +568,7 @@ always @(posedge clk) begin
 		end
 	I_MFP:
 		if (mfp_iack_ack) begin
-			iack_vector <= mfp_vector;
+			iack_vector <= mfp_vector;     // $18 (spurious) when the request vanished
 			iack_done   <= 1;
 			ist         <= I_IDLE;
 		end

@@ -18,16 +18,16 @@ module tb_top
 	input      [31:0] joy0,
 	input      [64:0] rtc,
 
-	input       [3:0] img_mounted,
+	input       [6:0] img_mounted,
 	input             img_readonly,
 	input      [63:0] img_size,
-	output    [127:0] sd_lba_f,
-	output      [3:0] sd_rd,
-	output      [3:0] sd_wr,
-	input       [3:0] sd_ack,
+	output    [223:0] sd_lba_f,
+	output      [6:0] sd_rd,
+	output      [6:0] sd_wr,
+	input       [6:0] sd_ack,
 	input       [8:0] sd_buff_addr,
 	input       [7:0] sd_buff_dout,
-	output     [31:0] sd_buff_din_f,
+	output     [55:0] sd_buff_din_f,
 	input             sd_buff_wr,
 
 	output      [7:0] r,
@@ -50,7 +50,16 @@ module tb_top
 	output     [31:0] dbg_a,
 	output      [2:0] dbg_fc,
 	output            dbg_rw,
-	output            dbg_berr
+	output            dbg_berr,
+	output            dbg_dev_stb,
+	output     [23:0] dbg_dev_addr,
+	output            dbg_dev_we,
+	output            dbg_dev_uds,
+	output            dbg_dev_lds,
+	output     [15:0] dbg_dev_din,
+	output            dbg_dev_ack,
+	output     [15:0] dbg_dev_dout,
+	output            dbg_mfp_irq
 );
 
 assign dbg_pc     = system.dbg_pc;
@@ -61,16 +70,25 @@ assign dbg_a      = system.cpu_a;
 assign dbg_fc     = system.cpu_fc;
 assign dbg_rw     = system.cpu_rw;
 assign dbg_berr   = ~system.berr_n;
+assign dbg_dev_stb  = system.dev_stb;
+assign dbg_dev_addr = {system.dev_addr, 1'b0};
+assign dbg_dev_we   = system.dev_we;
+assign dbg_dev_uds  = system.dev_uds;
+assign dbg_dev_lds  = system.dev_lds;
+assign dbg_dev_din  = system.dev_din;
+assign dbg_dev_ack  = system.dev_ack & system.dev_cs;
+assign dbg_dev_dout = system.dev_dout;
+assign dbg_mfp_irq  = system.mfp_irq;
 
 wire        DDRAM_BUSY, DDRAM_DOUT_READY, DDRAM_RD, DDRAM_WE;
 wire  [7:0] DDRAM_BURSTCNT, DDRAM_BE;
 wire [28:0] DDRAM_ADDR;
 wire [63:0] DDRAM_DOUT, DDRAM_DIN;
 
-wire [31:0] sd_lba[4];
-wire  [7:0] sd_buff_din[4];
-assign sd_lba_f      = {sd_lba[3], sd_lba[2], sd_lba[1], sd_lba[0]};
-assign sd_buff_din_f = {sd_buff_din[3], sd_buff_din[2], sd_buff_din[1], sd_buff_din[0]};
+wire [31:0] sd_lba[7];
+wire  [7:0] sd_buff_din[7];
+assign sd_lba_f      = {sd_lba[6], sd_lba[5], sd_lba[4], sd_lba[3], sd_lba[2], sd_lba[1], sd_lba[0]};
+assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_din[3], sd_buff_din[2], sd_buff_din[1], sd_buff_din[0]};
 
 falcon_system #(.CLK_HZ(32000000)) system
 (

@@ -53,7 +53,7 @@ I/O decode (word address bits [23:1] are given to each device):
 | FF8000-FF800F  | `falcon_combel` (memory config $FF8001, monitor $FF8006, bus control $FF8007) | |
 | FF8200-FF82C3  | `falcon_videl`    | VBL, HBL, DE (to MFP TBI)     |
 | FF8604-FF860F  | `falcon_fdc` (ST DMA + WD1772) | GPIP5 (FDC/HDC)  |
-| FF8780-FF878F  | SCSI (NCR5380 through the DMA chip) - later |    |
+| FF8604 (DMA mode bit 3) | `falcon_scsi` NCR 5380, through the DMA chip in `falcon_fdc` (target responses from Main_MiSTer support/falcon) | GPIP5 |
 | FF8800-FF88FF  | `falcon_psg` (YM2149, mirrors every 4 bytes) |   |
 | FF8900-FF8943  | `falcon_crossbar` (DMA sound, crossbar, codec) | GPIP7, MFP TAI |
 | FF8960-FF8963  | `falcon_nvram` (MC146818)                      |   |
@@ -77,9 +77,11 @@ I/O decode (word address bits [23:1] are given to each device):
 
 MFP GPIP inputs (Falcon):
 - I0 printer BUSY (1 = no printer)
-- I1 RS232 DCD (inverted, from the SCC on the Falcon: 1)
+- I1 Centronics ACK on the Falcon (idle: 1)
 - I2 RS232 CTS (inverted: 1)
-- I3 blitter busy (0 while the blitter runs - inverted "done" line)
+- I3 blitter busy (0 while the blitter runs - inverted "done" line).  Hatari
+  wires the blitter here for the Falcon too and delivers the DSP's HREQ
+  directly on IPL6 (dsp.c notes the real board may use GPIP3); we follow Hatari.
 - I4 ACIA IRQ (0 when either ACIA requests)
 - I5 FDC/HDC IRQ (0 = request; WD1772 INTRQ via the DMA chip, OR IDE INTRQ)
 - I6 RS232 RI (1)
@@ -187,7 +189,7 @@ input             sd_buff_wr
 | `falcon_acia` | `rtl/falcon/falcon_acia.sv`, `falcon_ikbd.sv` | two MC6850 + IKBD (HD6301) behaviour |
 | `falcon_psg` | `rtl/falcon/falcon_psg.sv` | YM2149 |
 | `falcon_nvram` | `rtl/falcon/falcon_nvram.sv` | MC146818 RTC + NVRAM |
-| `falcon_ide` | `rtl/falcon/falcon_ide.sv` | IDE (ATA PIO, one drive) |
+| `falcon_ide` | `rtl/falcon/falcon_ide.sv` | IDE (ATA PIO, master and slave) |
 | `falcon_fdc` | `rtl/falcon/falcon_fdc.sv` | ST DMA chip + WD1772 |
 | `falcon_blitter` | `rtl/falcon/falcon_blitter.sv` | Blitter |
 | `falcon_crossbar` | `rtl/falcon/falcon_crossbar.sv` | DMA sound, crossbar, codec |

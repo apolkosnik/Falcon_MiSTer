@@ -45,6 +45,13 @@ void YMFormat_EndRecording(void) {}
 void golden_init(void)
 {
 	ConfigureParams.System.nMachineType = MACHINE_FALCON;
+	/* Sound_Update (called by psg.c on data writes) resamples whatever the
+	 * testbench generated to the host rate; it only reads YM_Buffer_250.
+	 * It needs a valid YM clock to avoid a division by zero.  The stubbed
+	 * ClocksTimings_ConvertCycles makes YM2149_Run generate no samples, so
+	 * only golden_tick advances the YM state. */
+	MachineClocks.YM_Freq = 2000000;
+	nAudioFrequency = 44100;
 	YmVolumeMixing = YM_TABLE_MIXING;		/* configuration.c default */
 	YM2149_LPF_Filter = YM2149_LPF_FILTER_PWM;	/* sound.c default */
 	Ym2149_Init();

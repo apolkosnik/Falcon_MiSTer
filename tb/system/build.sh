@@ -1,16 +1,21 @@
 #!/bin/sh
 # Build the full-system simulation of the real RTL.
+#   BRINGUP="NO_IDE NO_FDC NO_DSP" ./build.sh   leaves those devices out
 set -e
 cd "$(dirname "$0")"
 R=../../rtl
-FIREBEE_V=$(ls build/vhdl/*.v 2>/dev/null || true)
+DEFS=""
+SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_cpubus.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_combel.sv
+ $R/falcon/falcon_videl.sv $R/falcon/falcon_psg.sv $R/falcon/falcon_mfp.sv $R/falcon/falcon_mfp_timer.sv $R/falcon/falcon_mfp_usart.sv
+ $R/falcon/falcon_acia.sv $R/falcon/falcon_ikbd.sv $R/falcon/falcon_ikbd_keymap.sv $R/falcon/falcon_nvram.sv
+ $R/falcon/falcon_blitter.sv $R/falcon/falcon_crossbar.sv"
+case " $BRINGUP " in *" NO_IDE "*) DEFS="$DEFS +define+FALCON_NO_IDE" ;; *) SRCS="$SRCS $(ls $R/falcon/falcon_ide*.sv)" ;; esac
+case " $BRINGUP " in *" NO_FDC "*) DEFS="$DEFS +define+FALCON_NO_FDC" ;; *) SRCS="$SRCS $(ls $R/falcon/falcon_fdc*.sv)" ;; esac
+case " $BRINGUP " in *" NO_DSP "*) DEFS="$DEFS +define+FALCON_NO_DSP" ;; *) SRCS="$SRCS $(ls $R/falcon/dsp/*.sv)" ;; esac
+# the PSG volume table is found relative to the project root, as in Quartus
+mkdir -p rtl/falcon && ln -sf ../../$R/falcon/falcon_psg_vol.mem rtl/falcon/falcon_psg_vol.mem
 verilator --cc --exe --build -j 16 -O3 --x-assign fast --x-initial fast \
-	-Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD -Wno-MULTIDRIVEN \
-	--top-module tb_top -Mdir obj_dir \
+	-Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD -Wno-MULTIDRIVEN -Wno-UNOPTFLAT \
+	--top-module tb_top -Mdir ${OBJ:-obj_dir} $DEFS \
 	-I$R/AP68030/rtl -I$R/AP68030/rtl/core -I$R/falcon -I$R/falcon/dsp \
-	tb_top.sv ddr3_model.sv \
-	$R/AP68030/rtl/*.v \
-	$(ls $R/falcon/*.sv $R/falcon/*.v 2>/dev/null) \
-	$(ls $R/falcon/dsp/*.sv $R/falcon/dsp/*.v 2>/dev/null) \
-	$FIREBEE_V \
-	sim_main.cpp
+	tb_top.sv ddr3_model.sv $R/AP68030/rtl/*.v $SRCS sim_main.cpp

@@ -69,6 +69,9 @@ localparam CONF_STR = {
 	"S1,ST ,Floppy B:;",
 	"S2,VHDIMGHDF,IDE Master;",
 	"S3,VHDIMGHDF,IDE Slave;",
+	"S4,VHDIMGHDF,SCSI 0;",
+	"S5,VHDIMGHDF,SCSI 1;",
+	"S6,ISOCUEBIN,SCSI 2 CD-ROM;",
 	"-;",
 	"O[2:1],Monitor,VGA,RGB,TV,Mono;",
 	"O[3],ST-RAM,14 MB,4 MB;",
@@ -97,18 +100,19 @@ wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 wire        ioctl_wait;
 
-// disk slots: 0 floppy A, 1 floppy B, 2 IDE master, 3 IDE slave
-wire  [3:0] img_mounted;
+// disk slots: 0 floppy A, 1 floppy B, 2 IDE master, 3 IDE slave, 4..6 SCSI ID 0..2
+// (seven is the hps_io ceiling: the mount byte's bit 7 is the read-only flag)
+wire  [6:0] img_mounted;
 wire        img_readonly;
 wire [63:0] img_size;
-wire [31:0] sd_lba[4];
-wire  [3:0] sd_rd, sd_wr, sd_ack;
+wire [31:0] sd_lba[7];
+wire  [6:0] sd_rd, sd_wr, sd_ack;
 wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout;
-wire  [7:0] sd_buff_din[4];
+wire  [7:0] sd_buff_din[7];
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(4)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),

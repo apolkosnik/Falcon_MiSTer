@@ -56,7 +56,8 @@
 //   Sound_GenerateSamples) are not done here; the crossbar / audio output
 //   stage owns them.
 // VOL_TABLE = 1: Hatari's default YM_TABLE_MIXING table (32768 x 15 bit ROM
-//   from falcon_psg_vol.hex, generated from Hatari's own code by
+//   from falcon_psg_vol.mem ($readmemb, path relative to the Quartus project
+//   directory, parameter VOL_MEM), generated from Hatari's own code by
 //   tb/psg/gen_vol_hex.c), 48 M10K blocks.
 // VOL_TABLE = 0: Hatari's YM_LINEAR_MIXING ((v[A]+v[B]+v[C])/3, scaled to
 //   0..32767), no block RAM, one multiplier.
@@ -96,7 +97,7 @@ module falcon_psg #(
     parameter bit    MIRROR     = 1'b1,
     parameter bit    VOL_TABLE  = 1'b1,
     parameter bit    PWM_FILTER = 1'b1,
-    parameter        VOL_HEX    = "rtl/falcon/falcon_psg_vol.hex"
+    parameter        VOL_MEM    = "rtl/falcon/falcon_psg_vol.mem"
 ) (
     input             clk,
     input             reset,
@@ -356,8 +357,9 @@ reg        mix_valid;
 
 generate
 if (VOL_TABLE) begin : g_table
-    (* ramstyle = "M10K" *) reg [14:0] vol_rom [0:32767];
-    initial $readmemh(VOL_HEX, vol_rom);
+    // max_depth 2048: 2K x 5 M10K mode, 48 blocks (8K x 1 mode would need 60)
+    (* ramstyle = "M10K", max_depth = 2048 *) reg [14:0] vol_rom [0:32767];
+    initial $readmemb(VOL_MEM, vol_rom);
     always @(posedge clk) begin
         mix_val <= vol_rom[{ch_c, ch_b, ch_a}];
     end

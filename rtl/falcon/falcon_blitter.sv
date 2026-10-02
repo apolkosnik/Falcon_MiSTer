@@ -69,12 +69,14 @@
 //   - The halftone RAM, the source buffer and x_count_reset are not cleared
 //     by reset (as Blitter_Reset); they power up as 0.
 
+/* verilator lint_off UNUSEDPARAM */
 module falcon_blitter #(
     parameter CLK_HZ               = 32000000,
     parameter NONHOG_BLIT_ACCESSES = 64,
     parameter NONHOG_CPU_ACCESSES  = 64,
     parameter NONHOG_CPU_TIMEOUT   = 512
 ) (
+/* verilator lint_on UNUSEDPARAM */
     input             clk,
     input             reset,
 
@@ -132,15 +134,16 @@ module falcon_blitter #(
     // ------------------------------------------------------------------
     // internal state (BlitterState / BlitterVars)
     // ------------------------------------------------------------------
-    reg [31:0] buffer    = 32'h0;
+    reg [31:0] buffer;
     reg [15:0] bus_word;
-    reg [15:0] dst_word  = 16'h0;
-    reg [15:0] end_mask  = 16'h0;
-    reg [15:0] wdata     = 16'h0;
+    reg [15:0] dst_word;
+    reg [15:0] end_mask;
+    reg [15:0] wdata;
     reg        st_fxsr, st_nfsr, have_fxsr, have_src, fetch_src, have_dst;
-    reg        need_src  = 1'b0;
-    reg        need_dst  = 1'b0;
-    reg        weird     = 1'b0;   // nfsr && x_count == 1 for the current word
+    reg        need_src;
+    reg        need_dst;
+    reg        weird;      // nfsr && x_count == 1 for the current word
+
 
     localparam P_STOP  = 2'd0;     // idle
     localparam P_RUN   = 2'd1;     // wants / owns the bus
@@ -169,6 +172,22 @@ module falcon_blitter #(
     assign busy   = (phase != P_STOP);
     assign dma_be = 2'b11;
 
+    // power-up values of the state that reset does not clear
+    initial begin
+        buffer        = 32'h0;
+        dst_word      = 16'h0;
+        end_mask      = 16'h0;
+        wdata         = 16'h0;
+        need_src      = 1'b0;
+        need_dst      = 1'b0;
+        weird         = 1'b0;
+        x_count_reset = 17'h0;
+        rd_kind       = 2'd0;
+        bus_dout      = 16'h0;
+        dma_addr      = 23'h0;
+        dma_wdata     = 16'h0;
+    end
+
     // ------------------------------------------------------------------
     // datapath helpers
     // ------------------------------------------------------------------
@@ -184,7 +203,9 @@ module falcon_blitter #(
     endfunction
 
     // Blitter_SourceRead
+    /* verilator lint_off UNUSEDSIGNAL */
     wire [31:0] buf_sh   = buffer >> v_skew;
+    /* verilator lint_on UNUSEDSIGNAL */
     wire [15:0] src_word = buf_sh[15:0];
     // Blitter_GetHalftoneWord
     wire [15:0] ht_word  = ctl_smudge ? ht[src_word[3:0]] : ht[line_nr];

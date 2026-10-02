@@ -60,7 +60,9 @@ module falcon_mfp_usart (
     input      [7:0] din,
     // read side effects (one clock each)
     input            rsr_rd,
-    input            tsr_rd,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input            tsr_rd,       // would clear UE (synchronous mode only)
+    /* verilator lint_on UNUSEDSIGNAL */
     input            udr_rd,
     output reg [7:0] scr,
     output     [7:0] ucr_q,
@@ -154,6 +156,7 @@ module falcon_mfp_usart (
     reg  [7:0] rx_sh;
     reg        rx_parbit;
     reg        si_s1, si_s2;
+    reg        rx_wait_mark;   // after a break / framing error: wait for the line to go high
 
     wire rx_line = loopback ? ((tx_te || tx_busy) ? tx_line : 1'b1) : si_s2;
     wire [4:0] rx_half = div16 ? 5'd7 : 5'd0;
@@ -203,6 +206,7 @@ module falcon_mfp_usart (
             rx_bit    <= 4'd0;
             rx_sh     <= 8'd0;
             rx_parbit <= 1'b0;
+            rx_wait_mark <= 1'b0;
             udr_rx    <= 8'd0;
             si_s1     <= 1'b1;
             si_s2     <= 1'b1;
@@ -332,7 +336,10 @@ module falcon_mfp_usart (
             if (tc_rise && rx_re && async) begin
                 case (rx_state)
                     RX_IDLE: begin
-                        if (!rx_line) begin
+                        if (rx_wait_mark) begin
+                            if (rx_line)
+                                rx_wait_mark <= 1'b0;
+                        end else if (!rx_line) begin
                             if (div16) begin
                                 rx_state <= RX_START;
                                 rx_cnt   <= 5'd1;
@@ -374,6 +381,7 @@ module falcon_mfp_usart (
                             rx_cnt   <= 5'd0;
                             rx_state <= RX_IDLE;
                             rx_cip   <= 1'b0;
+                            rx_wait_mark <= !rx_line;
                             if (!rx_line && rx_data_al == 8'd0 &&
                                 (!par_en || !rx_parbit)) begin
                                 // break: all zero character without stop bit
@@ -412,6 +420,7 @@ module falcon_mfp_usart (
             // receiver disabled: abort and clear the flags
             if (!rx_re) begin
                 rx_state <= RX_IDLE;
+                rx_wait_mark <= 1'b0;
                 rx_cip   <= 1'b0;
                 rx_bf    <= 1'b0;
                 rx_oe    <= 1'b0;
