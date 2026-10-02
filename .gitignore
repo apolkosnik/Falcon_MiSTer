@@ -1,0 +1,15 @@
+ref/emutos.zip
+ref/emutos-512k-1.3/
+ref/firebee/
+db/
+incremental_db/
+output_files/
+*.qws
+tb/*/obj_dir*/
+tb/*/build/
+tb/*/syn/
+tb/system/media/*.img
+tb/system/media/*.st
+tb/system/*.hex
+tb/system/frames*/
+build_id.v

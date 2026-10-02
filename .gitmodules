@@ -1,0 +1,3 @@
+[submodule "rtl/AP68030"]
+	url = https://github.com/apolkosnik/AP68030.git
+	path = rtl/AP68030

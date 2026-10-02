@@ -1,0 +1,4 @@
+media/*.img
+media/*.st
+*.hex
+frames*/
