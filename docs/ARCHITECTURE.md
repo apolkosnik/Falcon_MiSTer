@@ -87,7 +87,8 @@ MFP GPIP inputs (Falcon):
 - I6 RS232 RI (1)
 - I7 DMA sound SNDINT (Falcon: the DMA sound "play" signal)
 - TAI (timer A input): DMA sound SOUNDINT (frame end event)
-- TBI (timer B input): Videl display enable DE (event count mode counts lines)
+- TBI (timer B input): Videl `de_tb`, the display enable once per SOURCE line
+  (line-doubled modes count the repeat copy only, as Hatari counts ST lines)
 
 ## Common device register bus
 

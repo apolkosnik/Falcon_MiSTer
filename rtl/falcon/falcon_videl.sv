@@ -110,6 +110,7 @@ module falcon_videl #(
 	output reg        vblank,
 	output reg        ce_pix,
 	output reg        de,
+	output reg        de_tb,           // display enable for MFP Timer B (one per source line)
 	output reg        vbl,
 	output reg        hbl,
 	output reg        field,
@@ -485,6 +486,18 @@ assign hhc_rd = hhc_full[9:0];
 reg  [1:0] pix_ph;
 reg        hsync_s, hblank_s, vblank_s, vsync_s, de_s, hwin_s;
 reg        line_pend;
+// Line doubling (VMD bit 0): Timer B and HBL count source lines, as
+// Hatari does on the Falcon (one event per ST line).  Of the two output
+// copies of a source line only the second (repeat) copy drives de_tb, and
+// HBL fires on every second output line, in phase with the repeat copies.
+// So the end-of-DE event (AER bit 3 = 0) comes after both copies have been
+// shown (a palette change in the Timer B interrupt never splits a pair);
+// with AER bit 3 = 1 the event is the start of the repeat copy.
+reg        dl_par;                  // parity of the next display line (1 = repeat copy)
+reg        pend_rep, pend_dbl;      // flags of the display line pending at HDB
+reg        de_rep;                  // current DE is a first copy of a doubled line
+reg        out_par;                 // output line parity for HBL in doubled modes
+reg        lt_dbl;
 reg        frame_start;             // one clock pulse at the VFC wrap
 reg        hdb_go;                  // HDB of a display line (pulse)
 reg        go_pending;
@@ -498,6 +511,7 @@ wire [10:0] vdb_m = vdb[10:0], vde_m = vde[10:0], vss_m = vss[10:0];
 wire at_end  = (hpos >= pos_l - 15'd1);
 wire at_half = (hpos == pos_hh - 15'd1);
 wire [10:0] vfc_inc = (vfc >= vft_m) ? 11'd0 : vfc + 11'd1;
+wire vfc_wrap_now = (at_end || at_half) && (vfc_inc == 11'd0);
 wire vcond = (vfc >= vdb_m) && (vfc < vde_m);
 wire vcond_next = (vfc_inc >= vdb_m) && (vfc_inc < vde_m);
 
@@ -513,6 +527,7 @@ always @(posedge clk) begin
 		hpos <= 15'd0; vfc <= 11'd0; pix_ph <= 2'd0;
 		hsync_s <= 1'b0; hblank_s <= 1'b1; vblank_s <= 1'b1; vsync_s <= 1'b0;
 		de_s <= 1'b0; hwin_s <= 1'b0; line_pend <= 1'b0;
+		dl_par <= 1'b0; pend_rep <= 1'b0; pend_dbl <= 1'b0; de_rep <= 1'b0; out_par <= 1'b0; lt_dbl <= 1'b0;
 		field <= 1'b0;
 		lt_clk25 <= 1'b0;
 		lt_bpl <= 3'd2; lt_cyc <= 2'd0; lt_sd <= 3'd1; lt_st <= 1'b0; lt_mono <= 1'b0; lt_vco8 <= 1'b1;
@@ -542,6 +557,8 @@ always @(posedge clk) begin
 			lt_hscroll <= hsc65[3:0];
 			lt_hsync_pol <= vco[6];
 			lt_vsync_pol <= vco[5];
+			lt_dbl   <= vmd[0];
+			out_par  <= ~out_par;
 		end else begin
 			hpos <= hpos + 15'd1;
 		end
@@ -552,6 +569,7 @@ always @(posedge clk) begin
 			vsync_s <= (vfc_inc >= vss_m);
 			if (vfc_inc == 11'd0) begin
 				frame_start <= 1'b1;
+				dl_par <= 1'b0;
 				field <= ~field;
 			end
 		end
@@ -568,14 +586,23 @@ always @(posedge clk) begin
 
 		// horizontal events (positions are those of the current tick)
 		if (hpos == 15'd0) hsync_s <= 1'b0;        // hsync ends with the line
-		if (hpos == pos_hss) begin hsync_s <= 1'b1; hbl <= 1'b1; end
+		if (hpos == pos_hss) begin hsync_s <= 1'b1; if (!lt_dbl || out_par) hbl <= 1'b1; end
 		if (hpos == pos_hbe) hblank_s <= 1'b0;
 		if (hpos == pos_hbb) hblank_s <= 1'b1;
 		if (hpos == pos_hdb) begin
 			line_pend <= vcond;
+			if (vcond) begin
+				pend_rep <= (vfc_wrap_now ? 1'b0 : dl_par);
+				pend_dbl <= vmd[0];
+				dl_par   <= (vfc_wrap_now ? 1'b0 : dl_par) ^ vmd[0];
+			end
 			if (vcond) hdb_go <= 1'b1;
 		end
 		if (hpos == pos_deon) begin
+			if (line_pend || (hpos == pos_hdb && vcond)) begin
+				de_rep  <= pend_dbl && !pend_rep;
+				if (pend_dbl) out_par <= pend_rep;   // keep HBL in phase with the repeat copies
+			end
 			hwin_s <= 1'b1;
 			if (line_pend || (hpos == pos_hdb && vcond)) de_s <= 1'b1;
 			line_pend <= 1'b0;
@@ -603,6 +630,7 @@ end
 
 wire hblank_eff = lt_mono ? ~hwin_s : hblank_s;
 wire de_vis     = de_s & ~hblank_eff & ~vblank_s;
+wire de_tb_vis  = de_vis & ~de_rep;
 
 //----------------------------------------------------------------------------
 // Fetch: double line buffer (512 x 64), lines fetched one ahead
@@ -883,6 +911,7 @@ wire        use_spal = lt_st && (lt_bpl != 3'd4);
 wire  [7:0] pal_idx  = !de_s ? 8'd0 :
                        (ln_bpl == 3'd2 && !ln_st) ? {lt_bank, pix_idx[3:0]} : pix_idx;
 
+reg        s0_detb, s1_detb;
 reg        s1_tc, s1_de, s1_vis, s1_hs, s1_vs, s1_ce, s1_spal, s1_hb, s1_vb;
 reg [15:0] s1_tcw;
 
@@ -905,6 +934,7 @@ always @(posedge clk) begin
 	s0_tc   <= ln_tc && de_s;
 	s0_tcw  <= tc_word;
 	s0_de   <= de_vis;
+	s0_detb <= de_tb_vis;
 	s0_vis  <= ~(hblank_eff | vblank_s);
 	s0_hb   <= hblank_eff;
 	s0_vb   <= vblank_s;
@@ -913,7 +943,7 @@ always @(posedge clk) begin
 	s0_spal <= use_spal;
 	end
 
-	s1_tc <= s0_tc; s1_tcw <= s0_tcw; s1_de <= s0_de; s1_vis <= s0_vis;
+	s1_tc <= s0_tc; s1_tcw <= s0_tcw; s1_de <= s0_de; s1_detb <= s0_detb; s1_vis <= s0_vis;
 	s1_hb <= s0_hb; s1_vb <= s0_vb; s1_hs <= s0_hs; s1_vs <= s0_vs;
 	s1_spal <= s0_spal;
 end
@@ -925,7 +955,7 @@ endfunction
 always @(posedge clk) begin
 	if (reset) begin
 		r <= 8'd0; g <= 8'd0; b <= 8'd0;
-		hsync <= 1'b1; vsync <= 1'b1; hblank <= 1'b1; vblank <= 1'b1; ce_pix <= 1'b0; de <= 1'b0;
+		hsync <= 1'b1; vsync <= 1'b1; hblank <= 1'b1; vblank <= 1'b1; ce_pix <= 1'b0; de <= 1'b0; de_tb <= 1'b0;
 	end else begin
 		hsync  <= s1_hs;
 		vsync  <= s1_vs;
@@ -933,6 +963,7 @@ always @(posedge clk) begin
 		vblank <= s1_vb;
 		ce_pix <= s1_ce;
 		de     <= s1_de;
+		de_tb  <= s1_detb;
 		if (!s1_vis) begin
 			r <= 8'd0; g <= 8'd0; b <= 8'd0;
 		end else if (s1_tc && s1_de) begin

@@ -121,6 +121,9 @@ struct LineRec {
 struct FrameRec {
 	uint64_t start, clocks;
 	int hsyncs, de_lines, vis_lines, vbl, hbl, field, underruns;
+	int tb_falls, detb_diff;
+	uint64_t first_de_rise, last_de_fall;
+	std::vector<uint64_t> hbl_t, tbf_t;   // hbl pulses, de_tb falling edges
 	int max_de, min_de, max_vis, min_vis;
 	int vruns, vrun_min, vrun_max;      // visible (non blank) runs
 	int border_err, blank_err, border_n;
@@ -131,7 +134,7 @@ struct FrameRec {
 
 struct Monitor {
 	bool hs_pol = false, vs_pol = false;   // active level
-	bool prev_hs = false, prev_vs = false, prev_de = false;
+	bool prev_hs = false, prev_vs = false, prev_de = false, prev_detb = false;
 	bool in_line = false, in_frame = false;
 	LineRec ln;
 	FrameRec fr;
@@ -241,10 +244,14 @@ struct Monitor {
 		}
 		if (in_frame) {
 			if (top->vbl) fr.vbl++;
-			if (top->hbl) fr.hbl++;
+			if (top->hbl) { fr.hbl++; fr.hbl_t.push_back(cycles); }
+			if (!top->de_tb && prev_detb) { fr.tb_falls++; fr.tbf_t.push_back(cycles); }
+			if (top->de != top->de_tb) fr.detb_diff++;
+			if (top->de && !prev_de && fr.first_de_rise == 0) fr.first_de_rise = cycles;
+			if (!top->de && prev_de) fr.last_de_fall = cycles;
 			if (top->underrun) fr.underruns++;
 		}
-		prev_hs = hs; prev_vs = vs; prev_de = top->de;
+		prev_hs = hs; prev_vs = vs; prev_de = top->de; prev_detb = top->de_tb;
 	}
 } mon;
 
@@ -542,7 +549,16 @@ static void test_mode(const Mode &m, bool worst_latency = false)
 		check(f.min_de == m.width && f.max_de == m.width, "active pixels per line %d..%d, expected %d",
 		      f.min_de, f.max_de, m.width);
 		check(f.vbl == 1, "one VBL pulse per field (%d)", f.vbl);
-		check(f.hbl == f.hsyncs, "one HBL pulse per line (%d hbl, %d lines)", f.hbl, f.hsyncs);
+		if (m.dbl) {
+			check(f.hbl == f.hsyncs / 2 || f.hbl == (f.hsyncs + 1) / 2,
+			      "doubled mode: one HBL pulse per two output lines (%d hbl, %d lines)", f.hbl, f.hsyncs);
+			check(f.tb_falls == m.height / 2, "doubled mode: %d de_tb pulses, expected %d (one per source line)",
+			      f.tb_falls, m.height / 2);
+		} else {
+			check(f.hbl == f.hsyncs, "one HBL pulse per line (%d hbl, %d lines)", f.hbl, f.hsyncs);
+			check(f.detb_diff == 0 && f.tb_falls == m.height, "de_tb == de (%d differing clocks, %d de_tb pulses)",
+			      f.detb_diff, f.tb_falls);
+		}
 		check(f.underruns == 0, "no line buffer underrun (%d)", f.underruns);
 		int checked = 0;
 		int errs = compare_image(m, f, base, 0, 0, &checked);
@@ -903,6 +919,88 @@ static void test_polarity()
 	      m.vco | 0x60, hs_hi * 100 / n, vs_hi * 100 / n);
 }
 
+// Timer B / HBL in a line doubled mode (VGA ST low): one event per source
+// line, on the repeat copy; a COLOR00 change made at the k-th de_tb falling
+// edge (a Timer B event count interrupt with AER bit 3 = 0) first shows on
+// output display line 2k.
+static void test_timerb()
+{
+	const Mode &m = modes[3];
+	printf("\n== Timer B / HBL per source line in %s ==\n", m.name);
+	do_reset(m.monitor);
+	uint32_t base = 0x100000;
+	fill_ram(base, 200000, 21);
+	set_palettes(22);
+	program_mode(m, base);
+	mon.capture = true;
+	run_frames(1, 4000000);
+	run_frames(1, 4000000);
+	const FrameRec &f = mon.frames.back();
+	check(f.tb_falls == 200, "%d de_tb falling edges per frame, expected 200", f.tb_falls);
+	int hbl_disp = 0;
+	for (uint64_t t : f.hbl_t) if (t >= f.first_de_rise && t <= f.last_de_fall) hbl_disp++;
+	check(hbl_disp == 200, "%d HBL pulses during the 400 displayed output lines, expected 200 (%d per frame, %d lines)",
+	      hbl_disp, f.hbl, f.hsyncs);
+	// HBL phase: in this mode HSS (672) falls inside the DE of its output
+	// line (36..676), so each HBL of a displayed pair must come while de_tb
+	// is high, i.e. on the repeat copy
+	{
+		int on_rep = 0, n = 0; bool pv = true;
+		while (true) { tick(); bool vs = !top->vsync; if (vs && !pv) break; pv = vs; }
+		pv = true;
+		while (true) {
+			tick();
+			if (top->hbl) { if (top->de) { n++; if (top->de_tb) on_rep++; } }
+			bool vs = !top->vsync; if (vs && !pv) break; pv = vs;
+		}
+		check(n == 200 && on_rep == 200, "HBL pulses inside display lines: %d, on the repeat copy: %d (expected 200/200)", n, on_rep);
+	}
+	// first de_tb fall comes after the second copy of source line 0:
+	// the 2nd DE run ends there (de and de_tb fall together)
+	// - count de falling edges before the first de_tb fall
+	{
+		// rerun a frame and watch both
+		bool pd = false, pt = false; int de_falls = 0, first = -1;
+		bool pv = true; while (true) { tick(); bool vs = !top->vsync; if (vs && !pv) break; pv = vs; }
+		while (first < 0) {
+			tick();
+			if (!top->de && pd) de_falls++;
+			if (!top->de_tb && pt) first = de_falls;
+			pd = top->de; pt = top->de_tb;
+		}
+		check(first == 2, "first de_tb fall at the end of DE run %d (expected 2: after both copies of line 0)", first);
+	}
+	// COLOR00 change at each de_tb falling edge
+	uint16_t col[202];
+	for (int k = 0; k < 202; k++) col[k] = (k * 0x123 + 0x456) & 0xFFF;
+	{
+		bool pv = true; while (true) { tick(); bool vs = !top->vsync; if (vs && !pv) break; pv = vs; }
+	}
+	ww(0xFF8240, col[0]);
+	// wait for the next frame start (vsync) so the frame begins with col[0]
+	{
+		bool pv = true; while (true) { tick(); bool vs = !top->vsync; if (vs && !pv) break; pv = vs; }
+	}
+	std::vector<uint32_t> left;   // border colour just before each DE run
+	uint32_t last_border = 0; bool pt = false, pd = false;
+	int k = 0;
+	while ((int)left.size() < 400) {
+		tick();
+		bool detb_fall = !top->de_tb && pt;
+		if (top->ce_pix && !top->hblank && !top->vblank && !top->de)
+			last_border = ((uint32_t)top->r << 16) | ((uint32_t)top->g << 8) | top->b;
+		if (top->de && !pd) left.push_back(last_border);
+		pt = top->de_tb; pd = top->de;
+		if (detb_fall) { k++; ww(0xFF8240, col[k]); }    // Timer B interrupt handler
+	}
+	int bad = 0;
+	for (int j = 0; j < 400; j++) {
+		uint32_t e = ste_rgb(col[j / 2]);
+		if (left[j] != e) { if (bad < 5) printf("    line %d border %06x expected %06x\n", j, left[j], e); bad++; }
+	}
+	check(bad == 0 && k >= 199, "COLOR00 written at the k-th de_tb fall first shows on output line 2k (%d wrong of 400, %d events)", bad, k);
+}
+
 int main(int argc, char **argv)
 {
 	Verilated::commandArgs(argc, argv);
@@ -925,6 +1023,7 @@ int main(int argc, char **argv)
 	test_latching();
 	test_sync_stability();
 	test_polarity();
+	test_timerb();
 
 	printf("\n%d checks passed, %d failed\n", n_pass, n_fail);
 	printf("%s\n", n_fail ? "FAIL" : "PASS");

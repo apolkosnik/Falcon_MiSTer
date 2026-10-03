@@ -291,7 +291,7 @@ falcon_combel combel
 );
 
 // ---- Videl ----
-wire videl_vbl, videl_hbl, videl_de;
+wire videl_vbl, videl_hbl, videl_de, videl_de_tb;
 falcon_videl #(.CLK_HZ(CLK_HZ)) videl
 (
 	.clk(clk), .reset(dev_reset),
@@ -302,7 +302,7 @@ falcon_videl #(.CLK_HZ(CLK_HZ)) videl
 	.monitor_type(monitor),
 	.vid_req(vid_req), .vid_addr(vid_addr), .vid_ack(vid_ack), .vid_data(vid_data), .vid_valid(vid_valid),
 	.r(r), .g(g), .b(b), .hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank),
-	.ce_pix(ce_pix), .de(videl_de), .vbl(videl_vbl), .hbl(videl_hbl)
+	.ce_pix(ce_pix), .de(videl_de), .de_tb(videl_de_tb), .vbl(videl_vbl), .hbl(videl_hbl)
 );
 
 // ---- PSG ----
@@ -344,7 +344,7 @@ falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 	.irq(mfp_irq), .iack(mfp_iack), .iack_vector(mfp_vector), .iack_ack(mfp_iack_ack), .iack_spurious(mfp_iack_spur),
 	.gpip_in({sndint, 1'b1, ~(fdc_irq | ide_irq), ~acia_irq, ~blit_busy, 1'b1, 1'b1, 1'b1}),
 	.gpip_out(), .gpip_oe(),
-	.tai(soundint), .tbi(videl_de),
+	.tai(soundint), .tbi(videl_de_tb),   // one event per source line (Hatari's ST line timing)
 	.tao(), .tbo(), .tco(), .tdo(mfp_tdo),
 	.si(ser_rx), .so(ser_tx)
 );
