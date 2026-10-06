@@ -17,6 +17,16 @@
 //  One command is outstanding at a time.  DMA writes are reported on the
 //  snoop port so the CPU data cache never holds stale lines.
 //
+//  DMA accesses (d0..d2) follow Hatari's memory banks: ST-RAM is read and
+//  written directly (SysMem_wget reads the RAM, not the ROM vectors), ROM
+//  and cartridge are read only (ROMmem_wput never stores), and anything else
+//  is a bus-error region that reads $0000 and ignores writes
+//  (STMemory_DMA_ReadWord/WriteWord).  Writes to $000000-$000007 are dropped
+//  for the DMA sound and the blitter, which go through SysMem_wput; the disk
+//  DMA copies straight into ST-RAM (fdc.c STMemory_SafeCopy, ncr5380.c) and
+//  may write there.  A dropped access is acknowledged without a DDR3 cycle.
+//  (The system sends the blitter's I/O accesses to the device bus, not here.)
+//
 //  Byte order: guest data is big endian (lowest address in the most
 //  significant byte); the DDR3 is little endian, so 64-bit words are byte
 //  reversed at this boundary and nowhere else.
@@ -26,6 +36,7 @@ module falcon_memarb
 (
 	input             clk,
 	input             reset,       // power-on only: the loader runs while the machine is in reset
+	input       [3:0] ram_mb,      // ST-RAM size in MB: DMA writes stop at ram_mb * 1 MB
 
 	// video: 4 x 64-bit read bursts
 	input             vid_req,
@@ -126,9 +137,13 @@ reg  [7:0] g_be;        // [7] = lowest address
 reg  [2:0] g_owner;
 reg  [1:0] g_sub;
 reg        g_any;
+reg        g_ok;        // 0: a DMA access outside writable/readable memory, no DDR3 cycle
 
-always @* begin
-	g_any = 1; g_we = 0; g_addr = 0; g_wdata = 0; g_be = 0; g_owner = M_CPU; g_sub = 0;
+wire [23:0] ram_top = {ram_mb, 20'd0};
+
+always @* begin : sel
+	reg [23:0] wa;
+	g_any = 1; g_we = 0; g_addr = 0; g_wdata = 0; g_be = 0; g_owner = M_CPU; g_sub = 0; g_ok = 1;
 	if (vid_req) begin
 		g_owner = M_VID; g_addr = vid_addr; g_be = 8'hFF;
 	end else if (ld_pend) begin
@@ -147,6 +162,15 @@ always @* begin
 		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_addr[23:3]; g_sub = {cpu_addr[2], 1'b0};
 		g_wdata = {2{cpu_wdata}}; g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
 	end else g_any = 0;
+
+	// memory types for the DMA masters
+	wa = {g_addr, g_sub, 1'b0};
+	if (g_owner == M_D0 || g_owner == M_D1 || g_owner == M_D2) begin
+		if (g_we)
+			g_ok = (wa < ram_top) && (wa[23:3] != 21'd0 || g_owner == M_D1);
+		else
+			g_ok = (wa < ram_top) || (wa[23:19] == 5'b11100) || (wa[23:17] == 7'b1111101);
+	end
 end
 
 wire [63:0] rd_be = swap64(DDRAM_DOUT);      // guest order
@@ -167,7 +191,15 @@ always @(posedge clk) begin
 	S_IDLE:
 		// a master that was acknowledged last clock still shows its old
 		// request this clock, so never start right after an acknowledge
-		if (g_any && !(d0_ack | d1_ack | d2_ack | cpu_ack)) begin
+		if (g_any && !g_ok && !(d0_ack | d1_ack | d2_ack | cpu_ack)) begin
+			// bus-error region, ROM write or reset-vector write: no DDR3 cycle
+			case (g_owner)
+				M_D0:    begin d0_rdata <= 16'h0000; d0_ack <= 1; end
+				M_D1:    begin d1_rdata <= 16'h0000; d1_ack <= 1; end
+				default: begin d2_rdata <= 16'h0000; d2_ack <= 1; end
+			endcase
+		end
+		else if (g_any && !(d0_ack | d1_ack | d2_ack | cpu_ack)) begin
 			owner      <= g_owner;
 			sub        <= g_sub;
 			cmd_we     <= g_we;

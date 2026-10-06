@@ -30,3 +30,8 @@ tb/system/media/hdcontent/
 tb/*/dbgobj/
 tb/scsi/work/
 tb/scsi/main_src/
+ref/124beers/
+ref/chorensha_src/
+tb/system/*.out
+tb/system/media/beers_content/
+tb/system/media/x1600_content/

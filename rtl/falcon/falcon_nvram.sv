@@ -121,6 +121,7 @@ module falcon_nvram #(
     input       [7:0] nv_din,
     input             nv_wr,
     output reg        nv_changed,
+    output            nv_ready,    // default image complete; save/load may proceed
 
     output            irq
 );
@@ -489,6 +490,7 @@ reg  [5:0] img_ptr;
 reg  [7:0] img_sum;
 wire [7:0] img_byte = default_byte(img_ptr, cfg_vga, cfg_lang, cfg_kbd);
 wire       img_go   = (reset && !img_done && !img_busy) || nv_init;
+assign nv_ready = img_done && !img_busy && !nv_init;
 
 // ---------------------------------------------------------------------------
 // Sequential datapath: calendar increment, alarm compare, time load

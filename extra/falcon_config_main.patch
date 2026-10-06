@@ -1,0 +1,1050 @@
+diff --git a/menu.cpp b/menu.cpp
+--- a/menu.cpp
++++ b/menu.cpp
+@@ -63,6 +63,7 @@
+ #include "joymapping.h"
+ #include "recent.h"
+ #include "support.h"
++#include "support/falcon/falcon_config.h"
+ #include "bootcore.h"
+ #include "ide.h"
+ #include "profiling.h"
+@@ -195,6 +196,15 @@
+ 	MENU_MINIMIG_SAVECONFIG2,
+ 	MENU_MINIMIG_PRESET1,
+ 	MENU_MINIMIG_PRESET2,
++
++	// Falcon (keep render/input states adjacent)
++	MENU_FALCON_MAIN1,
++	MENU_FALCON_MAIN2,
++	MENU_FALCON_FDD_SELECTED,
++	MENU_FALCON_LOAD_CONFIG1,
++	MENU_FALCON_LOAD_CONFIG2,
++	MENU_FALCON_SAVE_CONFIG1,
++	MENU_FALCON_SAVE_CONFIG2,
+ 
+ 	// Atari ST
+ 	MENU_ST_MAIN1,
+@@ -1624,6 +1634,7 @@
+ 			{
+ 				menustate = MENU_CORES1;
+ 			}
++			else if (is_falcon() && mgl->done) menustate = MENU_FALCON_MAIN1;
+ 			else if (saved_menustate)
+ 			{
+ 				menustate = saved_menustate;
+@@ -1927,7 +1938,7 @@
+ 			uint32_t selentry = 0;
+ 			menumask = 0;
+ 
+-			OsdSetTitle(page ? title : user_io_get_core_name());
++			OsdSetTitle(page ? title : is_falcon() ? "Modify config" : user_io_get_core_name());
+ 
+ 			dip_submenu = -1;
+ 			manual_submenu = -1;
+@@ -2042,7 +2053,15 @@
+ 							int num = (p[idx] >= '0' && p[idx] <= '9') ? p[idx] - '0' : 0;
+ 							if (!mgl->done && num == mgl->item[mgl->current].index && (p[0] == mgl->item[mgl->current].type)) mgl->item[mgl->current].submenu = selentry;
+ 
+-							if (is_x86() && x86_get_image_name(num))
++							if (is_falcon())
++							{
++								const char *path = p[0] == 'F' ? falcon_config_rom(num) : falcon_config_disk(num);
++								const char *name = strrchr(path, '/');
++								char label[128];
++								substrcpy(label, p, 2);
++								snprintf(s, sizeof(s), " %s %s", label, path[0] ? (name ? name + 1 : path) : "<empty>");
++							}
++							else if (is_x86() && x86_get_image_name(num))
+ 							{
+ 								strcpy(s, " ");
+ 								substrcpy(s + 1, p, 2);
+@@ -2215,7 +2234,7 @@
+ 			for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
+ 
+ 			// exit row
+-			if (!page)
++			if (!page && !is_falcon())
+ 			{
+ 				MenuWrite(entry, STD_EXIT, menusub == selentry, 0, OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
+ 			}
+@@ -2298,7 +2317,7 @@
+ 		break;
+ 
+ 	case MENU_GENERIC_MAIN3:
+-		saved_menustate = MENU_GENERIC_MAIN1;
++		saved_menustate = is_falcon() && mgl->done ? MENU_FALCON_MAIN1 : MENU_GENERIC_MAIN1;
+ 
+ 		// F/S option not found -> deactivate mgl.
+ 		if (!mgl->done && mgl->item[mgl->current].submenu < 0)
+@@ -2311,9 +2330,13 @@
+ 		{
+ 			menustate = MENU_NONE1;
+ 		}
+-		else if(back || (left && page) || (menusub == menusub_last && select))
+-		{
+-			if(!page) menustate = MENU_NONE1;
++		else if(back || (left && (page || is_falcon())) || (menusub == menusub_last && select))
++		{
++			if (!page)
++			{
++				menustate = is_falcon() ? MENU_FALCON_MAIN1 : MENU_NONE1;
++				if (is_falcon()) menusub = 2;
++			}
+ 			else
+ 			{
+ 				firstmenu = 0;
+@@ -3157,6 +3180,11 @@
+ 					menusub = 0;
+ 					menustate = MENU_ST_MAIN1;
+ 				}
++				else if (is_falcon())
++				{
++					menusub = 0;
++					menustate = MENU_FALCON_MAIN1;
++				}
+ 				else
+ 				{
+ 					menusub = 0;
+@@ -4157,6 +4185,11 @@
+ 				{
+ 					menusub = 0;
+ 					menustate = MENU_ST_MAIN1;
++				}
++				else if (is_falcon())
++				{
++					menusub = 0;
++					menustate = MENU_FALCON_MAIN1;
+ 				}
+ 				else
+ 				{
+@@ -4637,6 +4670,177 @@
+ 		/******************************************************************/
+ 		/* st main menu                                                 */
+ 		/******************************************************************/
++
++	case MENU_FALCON_MAIN1:
++		OsdSetSize(16);
++		OsdSetTitle("Falcon", 0);
++		helptext_idx = 0;
++		menumask = 0x3FF;
++		firstmenu = 0;
++		page = 0;
++		m = 0;
++		for (unsigned i = 0; i < 2; ++i)
++		{
++			const char *path = falcon_config_disk(i);
++			const char *name = strrchr(path, '/');
++			snprintf(s, 29, " %c: %s", 'A' + i, path[0] ? (name ? name + 1 : path) : "<empty>");
++			OsdWrite(m++, s, menusub == i);
++		}
++		OsdWrite(m++);
++		OsdWrite(m++, " Modify config             \x16", menusub == 2);
++		OsdWrite(m++, " Load config               \x16", menusub == 3);
++		OsdWrite(m++, " Save config               \x16", menusub == 4);
++		OsdWrite(m++);
++		snprintf(s, 29, " Joysticks swap: %s", user_io_get_joyswap() ? "Yes" : "No");
++		OsdWrite(m++, s, menusub == 5);
++		OsdWrite(m++);
++		OsdWrite(m++, " Reset", menusub == 6);
++		OsdWrite(m++, " Cold Boot", menusub == 7);
++		OsdWrite(m++, " Reset NVRAM", menusub == 8);
++		for (; m < 15; ++m) OsdWrite(m);
++		OsdWrite(15, STD_EXIT, menusub == 9, 0, OSD_ARROW_RIGHT | OSD_ARROW_LEFT);
++		parentstate = MENU_FALCON_MAIN1;
++		menustate = MENU_FALCON_MAIN2;
++		break;
++
++	case MENU_FALCON_MAIN2:
++		if (menu || back) menustate = MENU_NONE1;
++		else if (right)
++		{
++			menustate = MENU_COMMON1;
++			menusub = 0;
++		}
++		else if (left)
++		{
++			menustate = MENU_MISC1;
++			menusub = 3;
++		}
++		else if (menusub < 2 && (select || recent))
++		{
++			if (falcon_config_disk(menusub)[0])
++			{
++				user_io_set_index(menusub);
++				user_io_file_mount("", menusub);
++				menustate = MENU_FALCON_MAIN1;
++			}
++			else
++			{
++				fs_Options = SCANO_DIR;
++				fs_MenuSelect = MENU_FALCON_FDD_SELECTED;
++				fs_MenuCancel = MENU_FALCON_MAIN1;
++				strcpy(fs_pFileExt, "ST ");
++				if (select) SelectFile(Selected_S[menusub], fs_pFileExt, fs_Options, fs_MenuSelect, fs_MenuCancel, menusub + 500);
++				else if (recent_init(menusub + 500)) menustate = MENU_RECENT1;
++			}
++		}
++		else if (select)
++		{
++			switch (menusub)
++			{
++			case 2:
++				menustate = MENU_GENERIC_MAIN1;
++				menusub = 0;
++				page = 0;
++				firstmenu = 0;
++				break;
++			case 3:
++				menustate = MENU_FALCON_LOAD_CONFIG1;
++				menusub = 0;
++				break;
++			case 4:
++				menustate = MENU_FALCON_SAVE_CONFIG1;
++				menusub = 0;
++				break;
++			case 5:
++				user_io_set_joyswap(!user_io_get_joyswap());
++				menustate = MENU_FALCON_MAIN1;
++				break;
++			case 6:
++			case 7:
++			case 8:
++				{
++					const char *option = menusub == 6 ? "[0]" : menusub == 7 ? "[7]" : "[8]";
++					user_io_status_set(option, 1);
++					user_io_status_set(option, 0);
++					menustate = MENU_NONE1;
++				}
++				break;
++			case 9:
++				menustate = MENU_NONE1;
++				break;
++			}
++		}
++		break;
++
++	case MENU_FALCON_FDD_SELECTED:
++		user_io_set_index(menusub);
++		if (user_io_file_mount(selPath, menusub))
++		{
++			recent_update(SelectedDir, selPath, SelectedLabel, menusub + 500);
++			menustate = MENU_FALCON_MAIN1;
++		}
++		else
++		{
++			MenuHide();
++			Info("Cannot mount floppy image", 5000);
++		}
++		break;
++
++	case MENU_FALCON_LOAD_CONFIG1:
++	case MENU_FALCON_SAVE_CONFIG1:
++		{
++			bool save = menustate == MENU_FALCON_SAVE_CONFIG1;
++			OsdSetSize(16);
++			OsdSetTitle(save ? "Save Config" : "Load Config", 0);
++			helptext_idx = 0;
++			firstmenu = 0;
++			parentstate = menustate;
++			menumask = 0x200;
++			m = 0;
++			OsdWrite(m++);
++			OsdWrite(m++, " Startup config:");
++			for (unsigned i = 0; i < 9; ++i)
++			{
++				char label[64];
++				bool enabled = falcon_config_describe(i, label, sizeof(label)) || save;
++				if (enabled) menumask |= 1 << i;
++				snprintf(s, 29, "  %s", label);
++				OsdWrite(m++, s, menusub == i, !enabled);
++				if (!i)
++				{
++					OsdWrite(m++);
++					OsdWrite(m++, " Other configs:");
++				}
++			}
++			for (; m < 15; ++m) OsdWrite(m);
++			OsdWrite(15, STD_BACK, menusub == 9);
++			// Move off an empty initial slot, even before the first key press.
++			if (!(menumask & (1 << menusub)))
++			{
++				while (!(menumask & (1 << menusub))) ++menusub;
++			}
++			else menustate = save ? MENU_FALCON_SAVE_CONFIG2 : MENU_FALCON_LOAD_CONFIG2;
++		}
++		break;
++
++	case MENU_FALCON_LOAD_CONFIG2:
++	case MENU_FALCON_SAVE_CONFIG2:
++		{
++			bool save = menustate == MENU_FALCON_SAVE_CONFIG2;
++			saved_menustate = parentstate;
++			if (menu || back || left || (select && menusub == 9))
++			{
++				menustate = MENU_FALCON_MAIN1;
++				menusub = save ? 4 : 3;
++			}
++			else if (select && menusub < 9 && (menumask & (1 << menusub)))
++			{
++				bool ok = save ? falcon_config_save(menusub) : falcon_config_load(menusub);
++				MenuHide();
++				Info(ok ? (save ? "Config saved" : "Config loaded") : falcon_config_error(), ok ? 1500 : 5000);
++			}
++		}
++		break;
+ 
+ 	case MENU_ST_MAIN1:
+ 		OsdSetSize(16);
+@@ -8659,6 +8863,7 @@
+ 	{
+ 		switch (menustate)
+ 		{
++		case MENU_FALCON_MAIN2:
+ 		case MENU_ST_MAIN2:
+ 		case MENU_ARCHIE_MAIN2:
+ 		case MENU_MINIMIG_MAIN2:
+diff --git a/user_io.cpp b/user_io.cpp
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -42,6 +42,8 @@
+ #include "frame_timer.h"
+ #include "scaler.h"
+ #include "support.h"
++#include "support/falcon/falcon_nvram.h"
++#include "support/falcon/falcon_config.h"
+ 
+ static char core_path[1024] = {};
+ static char rbf_path[1024] = {};
+@@ -1521,6 +1523,7 @@
+ 
+ 	user_io_read_confstr();
+ 	user_io_read_core_name();
++	if (is_falcon()) falcon_config_init();
+ 
+ 	if ((fpga_get_buttons() & BUTTON_OSD) && is_menu())
+ 	{
+@@ -1661,12 +1664,17 @@
+ 				{
+ 					atari5200_init();
+ 				}
++				else if (is_falcon() && falcon_config_boot())
++				{
++					// Startup profile loaded its options, NVRAM, ROM and media.
++				}
+ 				else
+ 				{
+ 					const char *home = HomeDir();
+ 
+ 					if (is_uneon()) x86_ide_set();
+ 					if (is_cdi()) cdi_load_root_nvram();
++					if (is_falcon()) falcon_nvram_load();
+ 					if (is_marty()) marty_init();
+ 
+ 					if (!strlen(path) || !user_io_file_tx(path, 0, 0, 0, 1))
+@@ -2370,6 +2378,7 @@
+ 
+ 	// notify core of possible sd image change
+ 	spi_uio_cmd8(UIO_SET_SDSTAT, (1 << index) | (writable ? 0 : 0x80));
++	if (is_falcon()) falcon_config_record_disk(index, ret ? name : "");
+ 	return ret ? 1 : 0;
+ }
+ 
+@@ -3056,6 +3065,7 @@
+ 	}
+ 
+ 	mdplus_init(name); // MD+ CDDA init
++	if (is_falcon()) falcon_config_record_rom(index, name, composite);
+ 
+ 	return 1;
+ }
+@@ -3999,6 +4009,7 @@
+ 	if (is_saturn()) saturn_poll();
+ 	if (is_marty()) marty_poll();
+ 	if (is_cdi()) cdi_poll();
++	if (is_falcon()) falcon_nvram_poll();
+ 	if (is_psx()) psx_poll();
+ 	if (is_neogeo_cd()) neocd_poll();
+ 	if (is_n64()) n64_poll();
+diff --git a/support/falcon/falcon_config.cpp b/support/falcon/falcon_config.cpp
+new file mode 100644
+--- /dev/null
++++ b/support/falcon/falcon_config.cpp
+@@ -0,0 +1,197 @@
++#include "falcon_config.h"
++#include "falcon_nvram.h"
++#include "../../file_io.h"
++#include "../../user_io.h"
++#include "../../menu.h"
++#include <cstdio>
++#include <cstring>
++
++namespace
++{
++// Byte-only, versioned format, independent of compiler padding/endianness.
++// Only status[6:1] is persistent: reset/cold-reset/NVRAM-reset are actions.
++struct Config
++{
++	char magic[8];
++	uint8_t version, options, joyswap, composite;
++	char path[9][1024]; // TOS, cartridge, floppy A/B, IDE 0/1, SCSI 0/1/2
++};
++static_assert(sizeof(Config) == 9228, "Falcon config layout");
++const char magic[8] = {'F', 'L', 'C', 'N', 'C', 'F', 'G', 0};
++Config current = {};
++char error[160] = {};
++
++bool fail(const char *message, const char *path = "")
++{
++	const char *name = strrchr(path, '/');
++	snprintf(error, sizeof(error), "%s%s%s", message, path[0] ? ": " : "", name ? name + 1 : path);
++	printf("Falcon config: %s\n", error);
++	return false;
++}
++
++bool filename(unsigned slot, char *name)
++{
++	if (slot > 8) return fail("Invalid config slot");
++	snprintf(name, 16, "FALCON%u.CFG", slot);
++	return true;
++}
++
++bool read_config(unsigned slot, Config &config)
++{
++	char name[16];
++	if (!filename(slot, name)) return false;
++	if (FileLoadConfig(name, nullptr, 0) != sizeof(config) ||
++	    FileLoadConfig(name, &config, sizeof(config)) != sizeof(config))
++		return fail("Missing or invalid config", name);
++	if (memcmp(config.magic, magic, sizeof(magic)) || config.version != 1 ||
++	    config.options > 63 || config.joyswap > 1 || config.composite > 1)
++		return fail("Invalid config format", name);
++	for (auto &path : config.path)
++		if (!memchr(path, 0, sizeof(path))) return fail("Invalid config path", name);
++	if (!config.path[0][0]) return fail("Config has no TOS image", name);
++	return true;
++}
++
++bool preflight(const Config &config)
++{
++	// Reject missing/unreadable files before resetting or changing the machine.
++	for (const auto &path : config.path)
++	{
++		if (!path[0]) continue;
++		fileTYPE file;
++		if (!FileOpen(&file, path)) return fail("Cannot open config media", path);
++		bool ok = FileGetSize(&file) > 0;
++		FileClose(&file);
++		if (!ok) return fail("Empty config media", path);
++	}
++	return true;
++}
++
++void clear_cartridge()
++{
++	// The cartridge is RAM in DDR3, without a presence bit. Erase its entire
++	// 128 KiB aperture when a profile has no cartridge, including after boot.
++	uint8_t bytes[1024];
++	memset(bytes, 0xFF, sizeof(bytes));
++	user_io_set_index(2);
++	user_io_set_download(1);
++	for (unsigned i = 0; i < 128; ++i) user_io_file_tx_data(bytes, sizeof(bytes));
++	user_io_set_download(0);
++	falcon_config_record_rom(2, "", false);
++}
++
++bool apply(const Config &config, bool boot)
++{
++	user_io_status_set("[0]", 1);
++	user_io_status_set("[6:1]", config.options);
++	user_io_set_joyswap(config.joyswap);
++	// Startup defaults must see the saved monitor type. Loading a profile
++	// during use must preserve guest NVRAM, including changes not yet saved.
++	if (boot) falcon_nvram_load();
++	bool ok = user_io_file_tx(config.path[0], 1, 0, 0, config.composite);
++	if (!ok) fail("Cannot load TOS", config.path[0]);
++	if (ok)
++	{
++		// Clear first so a smaller cartridge cannot leave bytes from an old one.
++		clear_cartridge();
++		if (config.path[1][0] && !user_io_file_tx(config.path[1], 2))
++			ok = fail("Cannot load cartridge", config.path[1]);
++		for (unsigned i = 0; i < 7; ++i)
++		{
++			user_io_set_index(i);
++			int mounted = user_io_file_mount(config.path[i + 2], i);
++			if (config.path[i + 2][0] && !mounted)
++				ok = fail("Cannot mount config media", config.path[i + 2]);
++		}
++	}
++	// A profile switch is a cold boot. Keep reset asserted until all media
++	// changes have finished; the normal startup path releases reset at boot.
++	user_io_status_set("[7]", 1);
++	user_io_status_set("[7]", 0);
++	if (!boot) user_io_status_set("[0]", 0);
++	return ok;
++}
++}
++
++void falcon_config_init()
++{
++	memset(&current, 0, sizeof(current));
++	error[0] = 0;
++}
++
++void falcon_config_record_rom(unsigned index, const char *path, bool composite)
++{
++	index &= 63; // high bits identify the file extension
++	if (index > 2) return;
++	unsigned entry = index == 2 ? 1 : 0;
++	snprintf(current.path[entry], sizeof(current.path[entry]), "%s", path);
++	if (!entry) current.composite = composite;
++	StoreIdx_F(entry + 1, current.path[entry]);
++}
++
++void falcon_config_record_disk(unsigned index, const char *path)
++{
++	if (index >= 7) return;
++	snprintf(current.path[index + 2], sizeof(current.path[index + 2]), "%s", path);
++	StoreIdx_S(index, current.path[index + 2]);
++}
++
++const char *falcon_config_rom(unsigned index)
++{
++	return index >= 1 && index <= 2 ? current.path[index - 1] : "";
++}
++
++const char *falcon_config_disk(unsigned index)
++{
++	return index < 7 ? current.path[index + 2] : "";
++}
++
++bool falcon_config_save(unsigned slot)
++{
++	char name[16];
++	if (!filename(slot, name)) return false;
++	if (!current.path[0][0]) return fail("Load a TOS image before saving");
++	Config config = current;
++	memcpy(config.magic, magic, sizeof(magic));
++	config.version = 1;
++	config.options = user_io_status_get("[6:1]");
++	config.joyswap = !!user_io_get_joyswap();
++	if (FileSaveConfig(name, &config, sizeof(config)) != sizeof(config))
++		return fail("Cannot save config", name);
++	return true;
++}
++
++bool falcon_config_load(unsigned slot)
++{
++	Config config;
++	return read_config(slot, config) && preflight(config) && apply(config, false);
++}
++
++bool falcon_config_boot()
++{
++	Config config;
++	// No usable startup config: retain the normal boot.rom/boot.vhd path.
++	if (!read_config(0, config) || !preflight(config)) return false;
++	if (!apply(config, true)) Info(error, 5000);
++	return true;
++}
++
++bool falcon_config_describe(unsigned slot, char *text, unsigned size)
++{
++	Config config;
++	bool valid = read_config(slot, config);
++	if (!valid) snprintf(text, size, "%u: <empty/invalid>", slot);
++	else
++	{
++		const char *monitors[] = {"VGA", "RGB", "TV", "Mono"};
++		const char *name = strrchr(config.path[0], '/');
++		snprintf(text, size, "%u: %uM %s %s", slot, config.options & 4 ? 4 : 14,
++		         monitors[config.options & 3], name ? name + 1 : config.path[0]);
++	}
++	return valid;
++}
++
++const char *falcon_config_error()
++{
++	return error;
++}
+diff --git a/support/falcon/falcon_config.h b/support/falcon/falcon_config.h
+new file mode 100644
+--- /dev/null
++++ b/support/falcon/falcon_config.h
+@@ -0,0 +1,18 @@
++#ifndef FALCON_CONFIG_H
++#define FALCON_CONFIG_H
++
++// Slot 0 is loaded at startup; slots 1..8 are selected from the OSD.
++void falcon_config_init();
++bool falcon_config_boot();
++bool falcon_config_load(unsigned slot);
++bool falcon_config_save(unsigned slot);
++bool falcon_config_describe(unsigned slot, char *text, unsigned size);
++const char *falcon_config_error();
++
++// Track successful transfers and mounted media, including boot/MGL loads.
++void falcon_config_record_rom(unsigned index, const char *path, bool composite);
++void falcon_config_record_disk(unsigned index, const char *path);
++const char *falcon_config_rom(unsigned index);
++const char *falcon_config_disk(unsigned index);
++
++#endif
+diff --git a/tests/falcon_config/run.sh b/tests/falcon_config/run.sh
+new file mode 100755
+--- /dev/null
++++ b/tests/falcon_config/run.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++set -euo pipefail
++cd "$(dirname "$0")/../.."
++build=$(mktemp -d)
++trap 'rm -rf "$build"' EXIT
++python3 - "$build" <<'PY'
++from pathlib import Path
++import sys
++s = Path('menu.cpp').read_text()
++p = Path(sys.argv[1])
++start = s.index('enum MENU\n')
++end = s.index('\n};', start) + 3
++(p / 'menu_enum.inc').write_text(s[start:end] + '\n')
++start = s.index('\tcase MENU_FALCON_MAIN1:\n')
++end = s.index('\tcase MENU_ST_MAIN1:\n', start)
++(p / 'menu_cases.inc').write_text(s[start:end])
++PY
++mkdir "$build/storage"
++${CXX:-g++} -std=c++14 -Wall -Wextra -Werror -Wno-format-truncation \
++  -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -fsanitize=address,undefined -g \
++  -I. -I"$build" tests/falcon_config/test.cpp support/falcon/falcon_config.cpp \
++  -o "$build/test"
++"$build/test" "$build/storage"
+diff --git a/tests/falcon_config/test.cpp b/tests/falcon_config/test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/falcon_config/test.cpp
+@@ -0,0 +1,303 @@
++// Host regression of the production profile code and Falcon menu cases.
++// File/HPS/OSD adapters expose inputs, outputs and injected I/O failures.
++#include "support/falcon/falcon_config.h"
++#include "user_io.h"
++#include "menu.h"
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++static unsigned checks;
++#define CHECK(x) do { ++checks; if (!(x)) throw std::runtime_error(std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " #x); } while (0)
++static std::string root, info;
++static uint32_t status;
++static int joy, nv_loads;
++static bool fail_save, require_reset;
++static std::string fail_tx, fail_mount;
++static unsigned tx_index;
++static bool downloading;
++static std::vector<uint8_t> cartridge;
++static std::vector<std::string> events;
++static std::array<std::string, 16> files, disks;
++static std::array<std::string, 7> mounted;
++static bool last_composite;
++
++fileTYPE::fileTYPE() : filp(nullptr), mode(0), type(0), zip(nullptr), size(0), offset(0), path{}, name{} {}
++fileTYPE::~fileTYPE() { if (filp) fclose(filp); }
++int FileOpen(fileTYPE *f, const char *name, char)
++{
++ f->filp = fopen(name, "rb");
++ if (!f->filp) return 0;
++ fseek(f->filp, 0, SEEK_END); f->size = ftell(f->filp); rewind(f->filp);
++ return 1;
++}
++int FileClose(fileTYPE *f) { int r = f->filp ? fclose(f->filp) : 0; f->filp = nullptr; return r; }
++__off64_t FileGetSize(fileTYPE *f) { return f->size; }
++int FileLoadConfig(const char *name, void *buffer, int size)
++{
++ std::ifstream f(root + "/" + name, std::ios::binary | std::ios::ate);
++ if (!f) return 0;
++ int len = f.tellg();
++ if (!buffer) return len;
++ f.seekg(0); f.read(static_cast<char *>(buffer), size ? size : len);
++ return f.gcount();
++}
++int FileSaveConfig(const char *name, void *buffer, int size)
++{
++ if (fail_save) return 0;
++ std::ofstream f(root + "/" + name, std::ios::binary);
++ f.write(static_cast<char *>(buffer), size);
++ return f ? size : 0;
++}
++uint32_t user_io_status_get(const char *opt, int)
++{
++ CHECK(!strcmp(opt, "[6:1]")); return (status >> 1) & 63;
++}
++void user_io_status_set(const char *opt, uint32_t value, int)
++{
++ events.push_back(std::string(opt) + "=" + std::to_string(value));
++ if (!strcmp(opt, "[6:1]")) status = (status & ~126u) | ((value & 63) << 1);
++ else
++ {
++  unsigned bit; CHECK(sscanf(opt, "[%u]", &bit) == 1);
++  status = (status & ~(1u << bit)) | ((value & 1) << bit);
++ }
++}
++void user_io_set_joyswap(int value) { joy = value; }
++int user_io_get_joyswap() { return joy; }
++void StoreIdx_F(int i, const char *path) { files.at(i) = path; }
++void StoreIdx_S(int i, const char *path) { disks.at(i) = path; }
++void falcon_nvram_load()
++{
++ CHECK(status & 1); ++nv_loads;
++ events.push_back("nvram:" + std::to_string((status >> 1) & 3));
++}
++int user_io_file_tx(const char *path, unsigned char index, char, char, char composite, uint32_t)
++{
++ if (require_reset) CHECK(status & 1);
++ CHECK((index & 63) <= 2);
++ events.push_back("rom:" + std::to_string(index));
++ if (fail_tx == path) return 0;
++ last_composite = composite;
++ falcon_config_record_rom(index, path, composite);
++ return 1;
++}
++int user_io_file_mount(const char *path, unsigned char index, char, int)
++{
++ if (require_reset) CHECK(status & 1);
++ CHECK(index < 7);
++ events.push_back("disk:" + std::to_string(index));
++ bool ok = *path && fail_mount != path;
++ mounted.at(index) = ok ? path : "";
++ falcon_config_record_disk(index, mounted.at(index).c_str());
++ return ok;
++}
++void user_io_set_index(unsigned char index) { tx_index = index; }
++void user_io_set_download(unsigned char enable, int)
++{
++ CHECK(tx_index == 2); CHECK(status & 1);
++ downloading = enable;
++ if (enable) cartridge.clear();
++}
++void user_io_file_tx_data(const uint8_t *bytes, uint32_t size)
++{
++ CHECK(downloading && tx_index == 2); CHECK(status & 1);
++ cartridge.insert(cartridge.end(), bytes, bytes + size);
++}
++
++// Compile the Falcon menu code verbatim, extracted from menu.cpp by run.sh.
++#include "menu_enum.inc"
++static unsigned menustate, parentstate, menusub, saved_menustate;
++static uint64_t menumask;
++static unsigned firstmenu, page, m, helptext_idx;
++static bool menu, back, right, left, select_pressed, recent;
++static char s[2048], fs_pFileExt[64], selPath[1024], SelectedDir[1024], SelectedLabel[1024];
++static char Selected_S[16][1024];
++static int fs_Options, fs_MenuSelect, fs_MenuCancel;
++static std::array<std::string,16> rows;
++static std::array<bool,16> highlighted, disabled;
++static std::string title;
++static int picker_recent, recent_saved;
++static const char *STD_EXIT = " Exit", *STD_BACK = " Back";
++static const int OSD_ARROW_RIGHT = 1, OSD_ARROW_LEFT = 2;
++static void OsdSetSize(int size) { CHECK(size == 16); }
++static void OsdSetTitle(const char *text, int) { title = text; }
++static void OsdWrite(unsigned row, const char *text = "", bool selected = false, bool disable = false, int = 0)
++{
++ rows.at(row) = text; highlighted.at(row) = selected; disabled.at(row) = disable;
++}
++void SelectFile(const char *, const char *ext, int, unsigned char selected, unsigned char cancel, int recent_idx)
++{
++ CHECK(!strcmp(ext, "ST ")); CHECK(cancel == MENU_FALCON_MAIN1);
++ menustate = MENU_FILE_SELECT1; fs_MenuSelect = selected; picker_recent = recent_idx;
++}
++static int recent_init(int i) { picker_recent = i; return 1; }
++static void recent_update(const char *, const char *, const char *, int i) { recent_saved = i; }
++void MenuHide() { menustate = MENU_NONE1; }
++void Info(const char *message, int, int, int, int)
++{
++ CHECK(menustate == MENU_NONE1); info = message;
++}
++static void handle_menu()
++{
++ bool select = select_pressed;
++ switch (menustate)
++ {
++#include "menu_cases.inc"
++ default: break;
++ }
++ menu = back = right = left = select_pressed = recent = false;
++}
++static void click(unsigned sub)
++{
++ menusub = sub; select_pressed = true; handle_menu();
++}
++static void open_root()
++{
++ menustate = MENU_FALCON_MAIN1; menusub = 0; handle_menu();
++ CHECK(menustate == MENU_FALCON_MAIN2);
++}
++static void choose_profile(bool save, unsigned slot)
++{
++ open_root(); click(save ? 4 : 3); handle_menu();
++ CHECK(menustate == (save ? MENU_FALCON_SAVE_CONFIG2 : MENU_FALCON_LOAD_CONFIG2));
++ click(slot);
++}
++
++static std::string media(unsigned i)
++{
++ return root + "/media-" + std::to_string(i) + (i < 2 ? ".rom" : ".img");
++}
++static std::vector<char> read_slot(unsigned slot)
++{
++ std::ifstream f(root + "/FALCON" + std::to_string(slot) + ".CFG", std::ios::binary);
++ return std::vector<char>(std::istreambuf_iterator<char>(f), {});
++}
++static void write_slot(unsigned slot, const std::vector<char> &data)
++{
++ std::ofstream f(root + "/FALCON" + std::to_string(slot) + ".CFG", std::ios::binary);
++ f.write(data.data(), data.size());
++}
++static void setup_media()
++{
++ falcon_config_init();
++ for (unsigned i = 0; i < 9; ++i) { std::ofstream f(media(i)); f << "media"; }
++ falcon_config_record_rom(0, media(0).c_str(), false);
++ falcon_config_record_rom(2 | 128, media(1).c_str(), false);
++ for (unsigned i = 0; i < 7; ++i) falcon_config_record_disk(i, media(i + 2).c_str());
++ CHECK(files[1] == media(0) && files[2] == media(1));
++}
++
++int main(int argc, char **argv)
++{
++ try
++ {
++  CHECK(argc == 2); CHECK(MENU_ATARI8BIT_CART2 < 256);
++  root = argv[1]; menustate = MENU_NONE1;
++  falcon_config_init();
++  CHECK(!falcon_config_save(0));
++  events.clear(); CHECK(!falcon_config_boot()); CHECK(events.empty() && !nv_loads);
++  open_root(); CHECK(title == "Falcon" && menumask == 0x3FF);
++  CHECK(rows[3].find("Modify config") != std::string::npos);
++  CHECK(rows[4].find("Load config") != std::string::npos);
++  CHECK(rows[5].find("Save config") != std::string::npos);
++  click(3); handle_menu(); handle_menu();
++  CHECK(menusub == 9 && menumask == 0x200 && highlighted[15]);
++  CHECK(menustate == MENU_FALCON_LOAD_CONFIG2);
++  click(9); CHECK(menustate == MENU_FALCON_MAIN1 && menusub == 3);
++  setup_media();
++  require_reset = true;
++  // Every setting combination, with action/unrelated bits present at save.
++  for (unsigned options = 0; options < 64; ++options)
++  {
++   status = 0x180 | 1 | (options << 1) | (1 << 20); joy = options & 1;
++   CHECK(falcon_config_save(options % 9));
++   status = 1 << 20; joy = 0; events.clear();
++   CHECK(falcon_config_load(options % 9));
++   CHECK(status == ((options << 1) | (1 << 20)) && joy == int(options & 1));
++   CHECK(events.front() == "[0]=1" && events.back() == "[0]=0");
++   CHECK(std::find(events.begin(), events.end(), "[8]=1") == events.end());
++   CHECK(!nv_loads);
++   for (unsigned i = 0; i < 7; ++i) CHECK(mounted[i] == media(i + 2));
++  }
++  for (unsigned slot = 0; slot < 9; ++slot)
++  {
++   choose_profile(true, slot); CHECK(info == "Config saved");
++   char label[64]; CHECK(falcon_config_describe(slot, label, sizeof(label)));
++   CHECK(label[0] == char('0' + slot));
++   choose_profile(false, slot); CHECK(info == "Config loaded");
++  }
++  // Boot applies the selected monitor before NVRAM, then TOS, then disks.
++  status = 2 << 1; joy = 1; CHECK(falcon_config_save(0));
++  events.clear(); status = 1; menustate = MENU_NONE1;
++  CHECK(falcon_config_boot()); CHECK(status == 5 && nv_loads == 1);
++  auto nv = std::find(events.begin(), events.end(), "nvram:2");
++  auto rom = std::find(events.begin(), events.end(), "rom:1");
++  CHECK(nv != events.end() && nv < rom && events.back() == "[7]=0");
++  // Empty media actively removes old mounts and erases a stale cartridge.
++  falcon_config_record_rom(2, "", false);
++  for (unsigned i = 0; i < 7; ++i) falcon_config_record_disk(i, "");
++  CHECK(falcon_config_save(8)); setup_media();
++  CHECK(falcon_config_load(8));
++  CHECK(!*falcon_config_rom(2) && cartridge.size() == 128 * 1024);
++  CHECK(std::all_of(cartridge.begin(), cartridge.end(), [](uint8_t x) { return x == 255; }));
++  for (unsigned i = 0; i < 7; ++i) CHECK(mounted[i].empty() && disks[i].empty());
++  // Composite boot images retain their loader flag through save/load.
++  falcon_config_record_rom(0, media(0).c_str(), true);
++  CHECK(falcon_config_save(7)); CHECK(falcon_config_load(7)); CHECK(last_composite);
++  auto valid = read_slot(7); CHECK(valid.size() == 9228);
++  // Reject malformed files without any reset, ROM or mount side effects.
++  std::vector<std::vector<char>> bad;
++  auto b = valid; b.pop_back(); bad.push_back(b);
++  b = valid; b.push_back(0); bad.push_back(b);
++  for (unsigned byte : {0u, 8u, 9u, 10u, 11u}) { b = valid; b[byte] = char(255); bad.push_back(b); }
++  b = valid; std::fill(b.begin() + 12, b.begin() + 1036, 'x'); bad.push_back(b);
++  b = valid; b[12] = 0; bad.push_back(b);
++  for (auto &data : bad)
++  {
++   write_slot(6, data); events.clear();
++   uint32_t before = status; CHECK(!falcon_config_load(6));
++   CHECK(events.empty() && status == before && nv_loads == 1);
++  }
++  auto startup = read_slot(0);
++  write_slot(0, bad.front()); events.clear();
++  CHECK(!falcon_config_boot()); CHECK(events.empty() && nv_loads == 1);
++  write_slot(0, startup);
++  CHECK(!falcon_config_save(9)); CHECK(!falcon_config_load(9));
++  setup_media(); CHECK(falcon_config_save(5));
++  CHECK(!remove(media(8).c_str())); events.clear();
++  CHECK(!falcon_config_load(5)); CHECK(events.empty());
++  CHECK(std::string(falcon_config_error()).find("media-8") != std::string::npos);
++  setup_media();
++  auto previous = read_slot(5); fail_save = true;
++  choose_profile(true, 5); CHECK(info.find("Cannot save") != std::string::npos);
++  CHECK(previous == read_slot(5)); fail_save = false;
++  // Report late transport/mount errors and release reset, allowing recovery.
++  fail_tx = media(0); CHECK(!falcon_config_load(5)); CHECK(!(status & 1)); fail_tx.clear();
++  fail_mount = media(7); CHECK(!falcon_config_load(5)); CHECK(!(status & 1));
++  CHECK(mounted[5].empty()); fail_mount.clear();
++  require_reset = false;
++  open_root(); click(2); CHECK(menustate == MENU_GENERIC_MAIN1 && !page && !menusub && !firstmenu);
++  open_root(); right = true; handle_menu(); CHECK(menustate == MENU_COMMON1);
++  open_root(); left = true; handle_menu(); CHECK(menustate == MENU_MISC1);
++  open_root(); joy = 0; click(5); CHECK(joy == 1);
++  open_root(); click(7); CHECK(menustate == MENU_NONE1 && !(status & 128));
++  // Both floppy pickers use the same recent-list namespace as the editor.
++  for (unsigned i = 0; i < 2; ++i)
++  {
++   falcon_config_record_disk(i, ""); open_root(); click(i);
++   CHECK(menustate == MENU_FILE_SELECT1 && picker_recent == int(500 + i));
++   strcpy(selPath, media(i + 2).c_str()); menustate = fs_MenuSelect; handle_menu();
++   CHECK(menustate == MENU_FALCON_MAIN1 && recent_saved == int(500 + i));
++   handle_menu(); click(i); CHECK(!*falcon_config_disk(i));
++  }
++  printf("PASS: %u checks (64 option combinations, 9 slots, startup/NVRAM order, media restore/eject, malformed and failed I/O, production menu navigation)\n", checks);
++ }
++ catch (const std::exception &e) { fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
++}
+diff --git a/support/falcon/falcon_nvram.cpp b/support/falcon/falcon_nvram.cpp
+new file mode 100644
+--- /dev/null
++++ b/support/falcon/falcon_nvram.cpp
+@@ -0,0 +1,102 @@
++// Falcon MC146818 persistence: 50 raw bytes, compatible with hatari.nvram.
++// The core uploads a coherent snapshot plus a generation token. Only a
++// successful atomic file replacement is acknowledged; failures are retried
++// by the FPGA and writes made during a save remain dirty.
++#include "falcon_nvram.h"
++#include "../../file_io.h"
++#include "../../user_io.h"
++#include "../../spi.h"
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <sys/stat.h>
++
++static const unsigned NVRAM_SIZE = 50;
++static const unsigned NVRAM_INDEX = 3;
++static const unsigned ACK_INDEX = 4;
++
++static bool nvram_path(char *path, size_t size)
++{
++	int n = snprintf(path, size, "%s/saves/Falcon/falcon.nvram", getRootDir());
++	return n > 0 && (size_t)n < size;
++}
++
++static void download(unsigned index, const uint8_t *bytes, unsigned count)
++{
++	user_io_set_index(index);
++	user_io_set_download(1);
++	if (count) user_io_file_tx_data(bytes, count);
++	user_io_set_download(0);
++}
++
++void falcon_nvram_load()
++{
++	char path[1200];
++	uint8_t bytes[NVRAM_SIZE + 1];
++	unsigned count = 0;
++	if (!nvram_path(path, sizeof(path))) return;
++	FILE *f = fopen(path, "rb");
++	if (f)
++	{
++		size_t n = fread(bytes, 1, sizeof(bytes), f);
++		if (n == NVRAM_SIZE && !ferror(f)) count = NVRAM_SIZE;
++		else printf("Falcon NVRAM: invalid size/read error in %s; using defaults\n", path);
++		fclose(f);
++	}
++	else if (errno != ENOENT)
++	{
++		printf("Falcon NVRAM: cannot read %s: %s\n", path, strerror(errno));
++		return; // Do not replace a file that could not be read with defaults.
++	}
++	// Empty image initializes defaults from the current OSD monitor setting.
++	download(NVRAM_INDEX, bytes, count);
++	printf("Falcon NVRAM: %s %s\n", count ? "loaded" : "defaults for", path);
++}
++
++static bool save_image(const uint8_t *bytes)
++{
++	char path[1200], temp[1216], dir[1200];
++	if (!nvram_path(path, sizeof(path))) return false;
++	snprintf(dir, sizeof(dir), "%s/saves", getRootDir());
++	if (mkdir(dir, 0777) && errno != EEXIST) return false;
++	snprintf(dir, sizeof(dir), "%s/saves/Falcon", getRootDir());
++	if (mkdir(dir, 0777) && errno != EEXIST) return false;
++	snprintf(temp, sizeof(temp), "%s.tmp", path);
++	FILE *f = fopen(temp, "wb");
++	if (!f) return false;
++	bool ok = fwrite(bytes, 1, NVRAM_SIZE, f) == NVRAM_SIZE;
++	if (fflush(f)) ok = false;
++	if (fsync(fileno(f))) ok = false;
++	if (fclose(f)) ok = false;
++	if (ok && rename(temp, path)) ok = false;
++	if (ok)
++	{
++		int fd = open(dir, O_RDONLY | O_DIRECTORY);
++		if (fd < 0) ok = false;
++		else
++		{
++			if (fsync(fd)) ok = false;
++			if (close(fd)) ok = false;
++		}
++	}
++	if (!ok) unlink(temp);
++	return ok;
++}
++
++void falcon_nvram_poll()
++{
++	uint16_t req = spi_uio_cmd(UIO_CHK_UPLOAD);
++	if (!(req & 1) || (req >> 8) != NVRAM_INDEX) return;
++	uint8_t packet[NVRAM_SIZE + 5];
++	user_io_set_index(NVRAM_INDEX);
++	user_io_set_upload(1);
++	user_io_file_rx_data(packet, sizeof(packet));
++	user_io_set_upload(0);
++	if (packet[NVRAM_SIZE + 4] != 0xA5) return; // obsolete request after restore/reset
++	if (!save_image(packet))
++	{
++		printf("Falcon NVRAM: save failed: %s; will retry\n", strerror(errno));
++		return;
++	}
++	download(ACK_INDEX, packet + NVRAM_SIZE, 4);
++}
+diff --git a/support/falcon/falcon_nvram.h b/support/falcon/falcon_nvram.h
+new file mode 100644
+--- /dev/null
++++ b/support/falcon/falcon_nvram.h
+@@ -0,0 +1,9 @@
++#ifndef FALCON_NVRAM_H
++#define FALCON_NVRAM_H
++
++// Call after status/configuration has been sent, before loading the boot ROM.
++void falcon_nvram_load();
++// Service the FPGA's delayed save requests in the normal user_io poll loop.
++void falcon_nvram_poll();
++
++#endif

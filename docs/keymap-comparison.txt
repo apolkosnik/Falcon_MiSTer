@@ -1,0 +1,37 @@
+Falcon_MiSTer versus the official Atari ST core (2026-10-04)
+
+Reference: https://github.com/MiSTer-devel/AtariST_MiSTer
+Commit: 426ef8765fc16cb547e7ff5deb7d9be61003b36d
+Source: rtl/ikbd/ps2.sv and rtl/ikbd/rom/ikbd.hex.
+Falcon: rtl/falcon/falcon_ikbd_keymap.sv (unchanged).
+
+All 512 PS/2 code/extended-bit combinations were simulated against both real
+RTL decoders. The Atari ST matrix was converted to IKBD scancodes using its
+ROM's keyboard table, with the four modifier cells decoded separately.
+All ST matrix keys released correctly. There are 101 mapped combinations
+across the two cores: 92 match and the following nine differ.
+
+PC key         PS/2   Atari ST core           Falcon core
+F12            007    no matrix key           Undo ($61)
+Num Lock       077    no matrix key           keypad ) ($64)
+F11            078    toggles joystick ports  Help ($62)
+Scroll Lock    07E    no matrix key           Undo ($61)
+Right Alt      111    no matrix key           Alternate ($38)
+End            169    keypad ) ($64)          Help ($62)
+Page Down      17A    Undo ($61)              keypad ) ($64)
+Print Screen   17C    keypad ( ($63)          Help ($62)
+Page Up        17D    Help ($62)              keypad ( ($63)
+
+All letters, number-row keys, punctuation, arrows, F1-F10, keypad digits
+and operators, Home, Insert, Delete and the other modifiers agree.
+
+The table describes RTL mappings. With the current hps_io defaults, Main
+intercepts F12 for the OSD and Num Lock/Scroll Lock for keyboard input
+emulation. These keys therefore do not normally reach Falcon's decoder.
+Falcon's F11 is usable for Help, but its two Undo mappings are intercepted.
+The ST core avoids this by using Page Down for Undo and Page Up for Help.
+
+To align the navigation keys with Atari ST, change Page Up to $62,
+Page Down to $61, Print Screen to $63, and End to $64. F11 is a core-specific
+joystick toggle in Atari ST; copying that behavior would require more than
+changing a scancode. No keyboard behavior was changed in this NVRAM fix.

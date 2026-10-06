@@ -30,30 +30,90 @@
 //   Video_GetScreenBaseAddr      (base low byte: & ~3 bitplane, & ~1 TC)
 //
 // Timing generator (derived; Hatari renders whole frames):
-//   * Horizontal unit = D base clocks: D = 16 in ST-shifter mode, else on a
-//     VGA monitor 4 (VMD[3:2]=00) or 2, else cycles/pixel.  A half line is
-//     HHT+2 units, a line two half lines (VGA: 2*200*2 = 800 clocks, RGB:
-//     2*256*4 = 2048 clocks = 64 us, VGA ST-low 2*25*16 = 800).
+//   * Pixel width (dots per pixel) from VMD bits 3:2: 4 (00), 2 (01), 1
+//     (1x); one dot on a mono monitor.  In VGA true colour (VGA monitor or
+//     VCO bits 1:0 = VGA) the pixel is 2 dots unless VMD bit 3 is set (1
+//     dot): VMD[3:2] = 00 is a 2-dot pixel there, not the 4-dot pixel of
+//     the 32 MHz RGB modes.  Evidence: "124 Beers Later" runs 320x240 true
+//     colour with VMD = 1 and TOS's VGA timing (HHT $C6), which is the
+//     800-dot 31.5 kHz line only with 2-dot pixels (Hatari's divider-4 rule
+//     for vdm = 0 was never exercised on VGA: TOS never sets VMD[3:2] = 00
+//     there).  Bitplane modes keep Hatari's rule.
+//   * Horizontal unit = D base clocks:
+//       - ST shifter mode with ST type timing (HHT < $50; TOS's ST tables
+//         use $17/$1A/$3E): D = 16;
+//       - Falcon mode: VGA divider (VGA monitor, or VCO bits 1:0 = VGA as
+//         TOS writes for its VGA sets) 4 (VMD[3:2]=00) or 2 for bitplanes,
+//         the pixel period in true colour (prescaler 1, Falcon spec table
+//         4.7), else the cycles per pixel;
+//       - ST shifter mode with the Falcon timing still loaded (a $8260
+//         write from a Falcon mode): the Falcon unit in effect before the
+//         write is kept, so line and frame timing do not change (Hatari also
+//         changes only $8210, $82C2 and the palette); the picture takes the
+//         ST depth, the VMD pixel width and the $8210 width.
+//     A half line is HHT+2 units, a line two half lines (VGA: 2*200*2 = 800
+//     clocks, RGB: 2*256*4 = 2048 clocks = 64 us, VGA ST-low 2*25*16 = 800).
 //   * HBE (first half) ends the blank, HBB (second half) starts it, HSS
 //     (second half) starts hsync which lasts to the end of the line.
 //   * HDB starts a display line in the first (bit 9 = 0) or second half
 //     line (bit 9 = 1, the line is the next one).  Pixels appear off_b base
-//     clocks after HDB and end off_e base clocks after HDE (second half):
-//       off_b = base + body_b + D, off_e = body_e
-//       Falcon bitplanes: body_b = (128/bpp+18)*cyc, body_e = (128/bpp+2)*cyc
-//       true colour:      body_b = 16*cyc,           body_e = 0
-//       ST shifter mode:  body_b = body_e = (128/bpp+2)*cyc
-//       base = VCO bit 8 ? 64 : 128, plus 64 in ST shifter mode.
-//     These are Hatari's hdb/hde offsets taken in base clocks, with the VCO
-//     bit 8 term of the Falcon documentation ("Authoritative guide to the
-//     Falcon video hardware").  With the TOS 4.04 register tables this gives
-//     exactly the line width ($8210) in pixels for every TOS mode.
+//     clocks after HDB:
+//       off_b = base + body_b + D
+//       Falcon bitplanes: body_b = (128/bpp+18)*cyc
+//       true colour:      body_b = 16*cyc
+//       ST shifter mode:  body_b = (128/bpp+2)*cyc
+//       base = VCO bit 8 ? 64 : 128, plus 64 in ST shifter mode;
+//              0 in true colour at one dot per pixel (VMD bits 3:2 = 10),
+//              derived from the "124 Beers Later" 640x240 TC VGA set (HDB
+//              $1C, HBE $2D, HBB $11D: DE = [HBE, HBB) = 640 dots), the only
+//              real-hardware set known for such a mode.
+//     These are Hatari's hdb offsets taken in base clocks, with the VCO bit 8
+//     term of the Falcon documentation ("Authoritative guide to the Falcon
+//     video hardware").
+//   * The displayed width is Hatari's XSize: $8210 words * 16 / bpp pixels
+//     (VIDEL_getScreenWidth), clipped only by the line length; HDE is not
+//     used for the width (with the TOS tables HDE + Hatari's hde offset
+//     ends exactly there anyway).
 //   * VFC counts half lines 0..VFT (a field is VFT+1 half lines; TOS uses an
 //     odd VFT+1 for interlace).  Display lines start at HDB when VDB <= VFC
 //     < VDE; vertical blank is VFC < VBE or VFC >= VBB, sampled at the start
 //     of each line; vsync while VFC >= VSS.
+//   * Blanking cuts the picture (black), as on the hardware: a line is
+//     blanked when VFC >= VBB (11-bit unsigned; VBB beyond VFT never blanks)
+//     or VFC < VBE with VBE as an 11-bit SIGNED value (bit 10 set = never
+//     blanks the top), both sampled at the line start; pixels before the
+//     HBE position or at/after the HBB position are blanked even inside DE
+//     (HBE/HBB unsigned).  DE, de_tb, HBL and the fetch still run the full
+//     VDB..VDE / HDB window.  Evidence: "124 Beers Later" draws a vertical
+//     curtain by writing VBB/VBE per frame (VBB $243/VBE $4D, $1D9/$B7,
+//     $239/$57, and VBB $3CD/VBE $FEC3, $3FF/$FE91 = open past the top) and
+//     a horizontal one by sweeping HBE up from $18 / HBB down from $96
+//     (Hatari ignores all of it: its borders are clamped to 0, videl.c
+//     VIDEL_getScreenHeight).  TOS's 60 Hz overscan sets (VDE $205, VBB
+//     $201) therefore show 238 of their 240 lines (Timer B still 240).
+//     The vertical blank is sampled at the line start although VFC counts
+//     half lines: TOS's VBB = $3FF with VDE = $3FF only leaves the last
+//     display line intact that way.
+//   * VBL: once per field, at the first line start with VFC >= VBB; if the
+//     field never reaches VBB (VBB > VFT etc.) at the VFC wrap instead.
+//     For TOS modes this is the vertical blank start as before; for the
+//     SM124 (VBB = 0) it is the frame start, 33.5 lines before the display
+//     (Hatari: 34 lines at 71 Hz).
+//   * Timer B (de_tb) and HBL count displayed source lines: in line doubled
+//     modes only the second copy of each source line drives de_tb and HBL
+//     fires every second output line in phase with it (Hatari has one event
+//     per ST line).  Elsewhere de_tb = de.
 //   * Monochrome monitor (SM124): no borders (blank = not display) and one
 //     base clock per pixel whatever VMD says (TOS leaves VMD = 0 there).
+//   * Line doubling (VMD bit 0): each source line is fetched once into one
+//     half of the double line buffer and displayed twice; the next source
+//     line's fetch starts when the first copy of the previous one starts,
+//     so it has two output lines to arrive (640x240 true colour at 60 Hz
+//     needs the same 20 M words/s as TOS's 320x480 true colour).  The
+//     fetch, display, Timer B and HBL are unchanged for interlace and
+//     non-doubled modes.  An underrun (a source line not complete when its
+//     display starts) only sets the underrun output; timing, DE and
+//     blanking stay as programmed and the buffer contents are shown.
 //   * All horizontal registers and the mode are latched at the start of each
 //     line, so CPU writes never glitch sync/blank/DE inside a line.  The
 //     screen base is latched at the start of the frame (VFC wrap).
@@ -61,7 +121,8 @@
 // Deviations / notes:
 //   * VFC ($82A0) and HHC ($8280) read the live counters (Hatari returns a
 //     fake incrementing VFC and the written HHC).
-//   * VCO bits 1:0 read the monitor type input (Hatari: mirror of $8006).
+//   * VCO ($82C0) reads back the written value, bits 1:0 included (Hatari;
+//     TOS writes the monitor bits itself).
 //   * The video counter $8205/7/9 reads the current display line start plus
 //     the words shown so far; writes change the next line fetched.
 //   * Colour bank ($8266 bits 3:0) is applied to 4-bitplane Falcon modes.
@@ -245,7 +306,7 @@ always @(*) begin
 	8'hA8: rd_reg = vdb;
 	8'hAA: rd_reg = vde;
 	8'hAC: rd_reg = vss;
-	8'hC0: rd_reg = {vco[15:2], monitor_type};
+	8'hC0: rd_reg = vco;
 	8'hC2: rd_reg = vmd;
 	default:
 		if ({acc_ra, 1'b0} >= 8'h40 && {acc_ra, 1'b0} <= 8'h5E) rd_reg = {4'd0, spal_cq};
@@ -435,22 +496,51 @@ always @(*) begin
 	else                  m_bpl = 3'd0;
 end
 
-// cycles per pixel (log2) from VMD bits 3:2; one on a mono monitor
+// cycles per pixel (log2) from VMD bits 3:2; one on a mono monitor; VGA
+// true colour: 2 dots unless VMD bit 3 (see the header, 124 Beers Later)
+wire       m_tcvga = (m_bpl == 3'd4) && vga_div;
 wire [1:0] m_cyc = is_mono ? 2'd0 :
+                   m_tcvga ? (vmd[3] ? 2'd0 : 2'd1) :
                    (vmd[3:2] == 2'b00) ? 2'd2 :
                    (vmd[3:2] == 2'b01) ? 2'd1 : 2'd0;
-// horizontal unit (log2 base clocks)
-wire [2:0] m_sd = st_mode ? 3'd4 :
-                  is_vga  ? ((vmd[3:2] == 2'b00) ? 3'd2 : 3'd1) :
-                            {1'b0, m_cyc};
+// Horizontal unit (log2 base clocks):
+//  * ST shifter mode with ST type timing values (HHT < $50; TOS's ST tables
+//    use $17/$1A/$3E): 16 base clocks.
+//  * Falcon mode: VGA 4 (VMD[3:2]=00) or 2 for bitplanes, the pixel period
+//    (4/2/1 dots) in true colour; other monitors cycles/pixel.
+//  * ST shifter mode with Falcon timing still loaded (a $8260 write from a
+//    Falcon mode): the unit in effect before the write is kept (fal_sd), so
+//    the line and frame timing stay exactly as they were; Hatari also only
+//    changes $8210/$82C2/palette there.  Only the pixel width (VMD), depth
+//    and palette change.
+wire       m_stu  = st_mode && (hht[8:0] < 9'h050);
+// VGA divider on a VGA monitor, or when VCO says VGA (TOS writes VCO=$186
+// for its VGA register sets also on a mono monitor)
+wire       vga_div = is_vga || (vco[1:0] == 2'b10);
+// VGA: bitplane modes count in 2-dot units (4 with VMD[3:2]=00, Hatari); true
+// colour counts in pixel periods, i.e. 1 dot with VMD bit 3 (Falcon spec
+// table 4.7: timing generator prescaler 1 in true colour, 2 for bitplanes).
+// TOS's 320x240 true colour sets (VMD bit 2, 2 dots/pixel, HHT $C6) and a
+// 640x240 true colour set (VMD=9, HHT $18E, 124 Beers Later) both give the
+// 800-dot 31.5 kHz line this way.
+wire [2:0] m_fsd  = vga_div ? ((m_bpl == 3'd4) ? {1'b0, m_cyc} : (vmd[3:2] == 2'b00) ? 3'd2 : 3'd1) : {1'b0, m_cyc};
+reg  [2:0] fal_sd;
+always @(posedge clk) begin
+	if (reset) fal_sd <= is_vga ? 3'd1 : is_mono ? 3'd0 : 3'd1;
+	else if (!st_mode) fal_sd <= m_fsd;
+end
+wire [2:0] m_sd = m_stu ? 3'd4 : st_mode ? fal_sd : m_fsd;
 
 reg  [2:0] lt_bpl;
 reg  [1:0] lt_cyc;
 reg  [2:0] lt_sd;
 reg        lt_st, lt_mono, lt_vco8;
-reg  [8:0] lt_hht, lt_hbb, lt_hbe, lt_hss, lt_hde;
+reg  [8:0] lt_hht, lt_hbb, lt_hbe, lt_hss;
 reg  [9:0] lt_hdb;
 reg  [3:0] lt_bank;
+reg  [9:0] lt_lwd;
+reg [14:0] de_cnt;
+reg        vbl_done;                // VBL already given in this field
 
 // positions in base clocks within the line
 wire [9:0]  lt_h   = {1'b0, lt_hht} + 10'd2;
@@ -460,22 +550,34 @@ wire [14:0] pos_hbe = {6'd0, lt_hbe} << lt_sd;
 wire [14:0] pos_hbb = pos_hh + ({6'd0, lt_hbb} << lt_sd);
 wire [14:0] pos_hss = pos_hh + ({6'd0, lt_hss} << lt_sd);
 wire [14:0] pos_hdb = (lt_hdb[9] ? pos_hh : 15'd0) + ({6'd0, lt_hdb[8:0]} << lt_sd);
-wire [14:0] pos_hde = pos_hh + ({6'd0, lt_hde} << lt_sd);
 
 // display offsets (base clocks)
 wire [8:0]  q128   = 9'd128 >> lt_bpl;               // 128/bpp for bitplanes
 wire [9:0]  body_b0 = lt_st ? {1'b0, q128} + 10'd2 :
                       (lt_bpl == 3'd4) ? 10'd16 : {1'b0, q128} + 10'd18;
-wire [9:0]  body_e0 = (lt_bpl == 3'd4 && !lt_st) ? 10'd0 : {1'b0, q128} + 10'd2;
 wire [11:0] body_b = {2'd0, body_b0} << lt_cyc;
-wire [11:0] body_e = {2'd0, body_e0} << lt_cyc;
-wire [11:0] off_base = lt_st ? (lt_vco8 ? 12'd128 : 12'd192) : (lt_vco8 ? 12'd64 : 12'd128);
+// True colour at one dot per pixel (VMD bits 3:2 = 10, prescaler 1): no
+// 64-dot base term.  Derived from the only known real-hardware register set
+// for such a mode, "124 Beers Later" (Trio 1994) 640x240 TC VGA: HDB $1C,
+// HBE $2D, HBB $11D give DE = [HBE, HBB) = 640 dots with off_b = 16 + 1;
+// unverified against hardware otherwise.
+wire        tc_1dot  = (lt_bpl == 3'd4) && (lt_cyc == 2'd0) && !lt_st;
+wire [11:0] off_base = lt_st ? (lt_vco8 ? 12'd128 : 12'd192) :
+                       tc_1dot ? 12'd0 : (lt_vco8 ? 12'd64 : 12'd128);
 wire [11:0] off_b = off_base + body_b + (12'd1 << lt_sd);
-wire [11:0] off_e = body_e;
 wire [15:0] deon_raw  = {1'b0, pos_hdb} + {4'd0, off_b};
-wire [15:0] deoff_raw = {1'b0, pos_hde} + {4'd0, off_e};
 wire [14:0] pos_deon  = (deon_raw  >= {1'b0, pos_l}) ? deon_raw[14:0]  - pos_l : deon_raw[14:0];
-wire [14:0] pos_deoff = (deoff_raw >= {1'b0, pos_l}) ? deoff_raw[14:0] - pos_l : deoff_raw[14:0];
+// displayed width: $8210 words -> pixels (Hatari VIDEL_getScreenWidth XSize),
+// in base clocks, clipped to the line length
+wire [16:0] npx_clk = ((lt_bpl == 3'd4) ? {7'd0, lt_lwd} : ({7'd0, lt_lwd} << (3'd4 - lt_bpl))) << lt_cyc;
+wire [14:0] len_max = pos_l - ({13'd0, 2'd1} << lt_cyc);
+wire [14:0] de_len  = (npx_clk > {2'd0, len_max}) ? len_max : npx_clk[14:0];
+// a line is a display line if the HDB that starts its DE saw VDB <= VFC < VDE:
+// HDB lies in this line (first half: VFC, second half: VFC+1) or, when the
+// DE start wraps past the line end, in the previous line (-2)
+wire        deon_wrap = (deon_raw >= {1'b0, pos_l});
+wire [11:0] vfc_dl   = {1'b0, vfc} + (lt_hdb[9] ? 12'd1 : 12'd0) - (deon_wrap ? 12'd2 : 12'd0);
+wire        disp_ln  = !vfc_dl[11] && (vfc_dl[10:0] >= vdb_m) && (vfc_dl[10:0] < vde_m);
 
 wire [14:0] hhc_full = ((hpos >= pos_hh) ? (hpos - pos_hh) : hpos) >> lt_sd;
 assign hhc_rd = hhc_full[9:0];
@@ -513,7 +615,6 @@ wire at_half = (hpos == pos_hh - 15'd1);
 wire [10:0] vfc_inc = (vfc >= vft_m) ? 11'd0 : vfc + 11'd1;
 wire vfc_wrap_now = (at_end || at_half) && (vfc_inc == 11'd0);
 wire vcond = (vfc >= vdb_m) && (vfc < vde_m);
-wire vcond_next = (vfc_inc >= vdb_m) && (vfc_inc < vde_m);
 
 wire ce_pix_t = ce_base && (pix_ph == 2'd0);
 wire [1:0] cyc_mask = (2'd1 << lt_cyc) - 2'd1;
@@ -527,11 +628,12 @@ always @(posedge clk) begin
 		hpos <= 15'd0; vfc <= 11'd0; pix_ph <= 2'd0;
 		hsync_s <= 1'b0; hblank_s <= 1'b1; vblank_s <= 1'b1; vsync_s <= 1'b0;
 		de_s <= 1'b0; hwin_s <= 1'b0; line_pend <= 1'b0;
+		de_cnt <= 15'd0; vbl_done <= 1'b0; lt_lwd <= 10'd0;
 		dl_par <= 1'b0; pend_rep <= 1'b0; pend_dbl <= 1'b0; de_rep <= 1'b0; out_par <= 1'b0; lt_dbl <= 1'b0;
 		field <= 1'b0;
 		lt_clk25 <= 1'b0;
 		lt_bpl <= 3'd2; lt_cyc <= 2'd0; lt_sd <= 3'd1; lt_st <= 1'b0; lt_mono <= 1'b0; lt_vco8 <= 1'b1;
-		lt_hht <= 9'd198; lt_hbb <= 9'd0; lt_hbe <= 9'd0; lt_hss <= 9'd0; lt_hde <= 9'd0; lt_hdb <= 10'd0;
+		lt_hht <= 9'd198; lt_hbb <= 9'd0; lt_hbe <= 9'd0; lt_hss <= 9'd0; lt_hdb <= 10'd0;
 		lt_bank <= 4'd0; lt_hscroll <= 4'd0; lt_hsync_pol <= 1'b0; lt_vsync_pol <= 1'b0;
 	end else if (ce_base) begin
 		// pixel phase (reset at the line start)
@@ -551,13 +653,13 @@ always @(posedge clk) begin
 			lt_hbb   <= hbb[8:0];
 			lt_hbe   <= hbe[8:0];
 			lt_hss   <= hss[8:0];
-			lt_hde   <= hde[8:0];
 			lt_hdb   <= hdb[9:0];
 			lt_bank  <= spshift[3:0];
 			lt_hscroll <= hsc65[3:0];
 			lt_hsync_pol <= vco[6];
 			lt_vsync_pol <= vco[5];
 			lt_dbl   <= vmd[0];
+			lt_lwd   <= lwd[9:0];
 			out_par  <= ~out_par;
 		end else begin
 			hpos <= hpos + 15'd1;
@@ -570,17 +672,21 @@ always @(posedge clk) begin
 			if (vfc_inc == 11'd0) begin
 				frame_start <= 1'b1;
 				dl_par <= 1'b0;
+				// VBL fallback: the field did not reach VBB
+				if (!vbl_done) vbl <= 1'b1;
+				vbl_done <= 1'b0;
 				field <= ~field;
 			end
 		end
-		if (at_end) begin
-			// vertical blank sampled at the line start
-			if (is_mono) begin
-				vblank_s <= !vcond_next;
-				if (vblank_s == 1'b0 && !vcond_next) vbl <= 1'b1;
-			end else begin
-				vblank_s <= (vfc_inc < vbe_m) || (vfc_inc >= vbb_m);
-				if (vblank_s == 1'b0 && ((vfc_inc < vbe_m) || (vfc_inc >= vbb_m))) vbl <= 1'b1;
+		if (hpos == 15'd0) begin
+			// vertical blank sampled at the line start (VBE/VBB, mono: the
+			// display lines); display lines are never blanked
+			// VBB unsigned, VBE signed (bit 10 set: never blanks the top)
+			vblank_s <= lt_mono ? !disp_ln : ((vfc >= vbb_m) || (!vbe_m[10] && vfc < vbe_m));
+			// VBL: first line start of the field with VFC >= VBB
+			if (!vbl_done && vfc >= vbb_m) begin
+				vbl <= 1'b1;
+				vbl_done <= 1'b1;
 			end
 		end
 
@@ -603,13 +709,19 @@ always @(posedge clk) begin
 				de_rep  <= pend_dbl && !pend_rep;
 				if (pend_dbl) out_par <= pend_rep;   // keep HBL in phase with the repeat copies
 			end
-			hwin_s <= 1'b1;
-			if (line_pend || (hpos == pos_hdb && vcond)) de_s <= 1'b1;
+			if (de_len != 15'd0) begin
+				hwin_s <= 1'b1;
+				de_cnt <= de_len;
+				if (line_pend || (hpos == pos_hdb && vcond)) de_s <= 1'b1;
+			end
 			line_pend <= 1'b0;
-		end
-		if (hpos == pos_deoff) begin
-			hwin_s <= 1'b0;
-			de_s <= 1'b0;
+		end else if (hwin_s) begin
+			// DE lasts exactly the $8210 width
+			if (de_cnt <= 15'd1) begin
+				hwin_s <= 1'b0;
+				de_s <= 1'b0;
+			end
+			de_cnt <= de_cnt - 15'd1;
 		end
 	end
 end
@@ -628,9 +740,12 @@ always @(posedge clk) begin
 	end
 end
 
+// blanking cuts the picture (see the header); SM124: no blank, the display
+// window is the visible line
 wire hblank_eff = lt_mono ? ~hwin_s : hblank_s;
-wire de_vis     = de_s & ~hblank_eff & ~vblank_s;
-wire de_tb_vis  = de_vis & ~de_rep;
+wire vblank_eff = vblank_s;
+wire de_vis     = de_s;
+wire de_tb_vis  = de_s & ~de_rep;
 
 //----------------------------------------------------------------------------
 // Fetch: double line buffer (512 x 64), lines fetched one ahead
@@ -646,10 +761,12 @@ always @(posedge clk) begin
 	lb_q <= lbuf[lb_raddr];
 end
 
-reg  [23:1] f_addr;        // next line word address
-reg         f_rep;         // line doubling: second copy pending
-reg  [10:0] f_idx;         // next line index to fetch in this frame
-reg  [10:0] go_cnt;        // display lines started in this frame
+reg  [23:1] f_addr;        // next source line word address
+reg  [10:0] f_idx;         // next source line index to fetch in this frame
+reg  [10:0] go_cnt;        // output display lines started in this frame
+reg         fr_dbl;        // frame-latched VMD bit 0: each source line is
+                           //   fetched once and displayed twice
+reg         fr_ilace;      // frame-latched VMD bit 1
 reg         f_restart;
 reg         f_busy;
 reg  [23:5] fb_addr;
@@ -668,12 +785,17 @@ wire        hs_on    = (hsc65[3:0] != 4'd0);
 wire  [4:0] bplw     = (m_bpl == 3'd4) ? 5'd16 : (5'd1 << m_bpl);   // words per 16 pixels
 wire [10:0] nwords   = {1'b0, lwd[9:0]} + (hs_on ? {6'd0, bplw} : 11'd0);
 wire [11:0] stride   = {2'd0, lwd[9:0]} + {3'd0, lof} + (hs_on ? {7'd0, bplw} : 12'd0);
-wire        dbl      = vmd[0];
-wire        ilace    = vmd[1];
 wire [12:0] nb_raw   = ({9'd0, f_addr[4:1]} + {2'd0, nwords} + 13'd15) >> 4;
 wire  [6:0] nb       = (nb_raw > 13'd64) ? 7'd64 : nb_raw[6:0];
-wire        f_allow  = (f_idx <= 11'd1) || (go_cnt >= f_idx);
-wire [23:1] f_next   = f_addr + (ilace ? {10'd0, stride, 1'b0} : {11'd0, stride});
+// Source line N goes into buffer N&1, last used by source line N-2.  It is
+// free once the display of that line is over, i.e. once the display of
+// source line N-1 has started: output line N-1 (go_cnt >= N), or in line
+// doubled modes the first copy, output line 2N-2 (go_cnt >= 2N-1).  So in
+// doubled modes a source line has the whole doubled pair (two output
+// lines) to arrive.
+wire [11:0] go_need  = fr_dbl ? ({f_idx, 1'b0} - 12'd1) : {1'b0, f_idx};
+wire        f_allow  = (f_idx <= 11'd1) || ({1'b0, go_cnt} >= go_need);
+wire [23:1] f_next   = f_addr + (fr_ilace ? {10'd0, stride, 1'b0} : {11'd0, stride});
 
 always @(posedge clk) begin
 	lb_we <= 1'b0;
@@ -683,7 +805,7 @@ always @(posedge clk) begin
 		f_restart <= 1'b1;
 		f_idx <= 11'd0;
 		f_addr <= 23'd0;
-		f_rep <= 1'b0;
+		fr_dbl <= 1'b0; fr_ilace <= 1'b0;
 		rxq_cnt <= 2'd0;
 		rx_q <= 8'd0;
 		buf_ready <= 2'b00;
@@ -693,6 +815,8 @@ always @(posedge clk) begin
 		if (frame_start) begin
 			f_restart <= 1'b1;
 			base_l <= {base_hi, base_mid, base_lo & (spshift[8] ? 8'hFE : 8'hFC)};
+			fr_dbl   <= vmd[0];
+			fr_ilace <= vmd[1];
 		end
 
 		// ---- receive side ----
@@ -729,8 +853,7 @@ always @(posedge clk) begin
 				if (f_restart && !frame_start) begin
 					f_restart <= 1'b0;
 					f_idx <= 11'd0;
-					f_rep <= 1'b0;
-					f_addr <= base_l[23:1] + ((ilace && field) ? {11'd0, stride} : 23'd0);
+					f_addr <= base_l[23:1] + ((fr_ilace && field) ? {11'd0, stride} : 23'd0);
 				end else if (!f_restart && !frame_start && f_allow && (rxq_cnt != 2'd2 || pop)) begin
 					if (f_idx[0]) lb_addr1 <= f_addr; else lb_addr0 <= f_addr;
 					buf_ready[f_idx[0]] <= (nb == 7'd0);
@@ -742,8 +865,7 @@ always @(posedge clk) begin
 						fb_left <= nb;
 					end else begin
 						f_idx <= f_idx + 11'd1;
-						if (dbl && !f_rep) f_rep <= 1'b1;
-						else begin f_rep <= 1'b0; f_addr <= f_next; end
+						f_addr <= f_next;
 					end
 				end
 			end else if (vid_ack) begin
@@ -751,8 +873,7 @@ always @(posedge clk) begin
 					vid_req <= 1'b0;
 					f_busy <= 1'b0;
 					f_idx <= f_idx + 11'd1;
-					if (dbl && !f_rep) f_rep <= 1'b1;
-					else begin f_rep <= 1'b0; f_addr <= f_next; end
+					f_addr <= f_next;
 				end else begin
 					vid_addr <= {fb_addr, 2'b00};
 					fb_addr <= fb_addr + 19'd1;
@@ -797,7 +918,8 @@ wire [15:0] wf_head = wf[0];
 wire [15:0] rd_word = (rd_sel2 == 2'd0) ? lb_q[63:48] : (rd_sel2 == 2'd1) ? lb_q[47:32] :
                       (rd_sel2 == 2'd2) ? lb_q[31:16] : lb_q[15:0];
 wire       px_take = ce_pix_t && de_s;
-wire [10:0] go_idx = frame_start ? 11'd0 : go_cnt;
+wire [10:0] go_idx  = frame_start ? 11'd0 : go_cnt;
+wire [10:0] src_idx = fr_dbl ? {1'b0, go_idx[10:1]} : go_idx;   // source line of this output line
 
 // pixel index from the current group
 wire [3:0] bit_i = 4'd15 - bp;
@@ -826,10 +948,10 @@ always @(posedge clk) begin
 		if (frame_start) go_cnt <= 11'd0;
 		if (line_go) begin
 			// start of a display line: reset the reader to the line start
-			ln_buf  <= go_idx[0];
+			ln_buf  <= src_idx[0];
 			ln_bpl  <= lt_bpl;
 			ln_st   <= lt_st;
-			rp      <= {6'd0, (go_idx[0] ? lb_addr1[4:1] : lb_addr0[4:1])};
+			rp      <= {6'd0, (src_idx[0] ? lb_addr1[4:1] : lb_addr0[4:1])};
 			rd_pend <= 1'b0;
 			rd_pend2 <= 1'b0;
 			wf_cnt  <= 3'd0;
@@ -839,7 +961,8 @@ always @(posedge clk) begin
 			consumed <= 11'd0;
 			active_rd <= 1'b1;
 			go_cnt  <= go_idx + 11'd1;
-			if (!buf_ready[go_idx[0]] || go_idx >= f_idx) underrun <= 1'b1;
+			// real underrun: the source line has not completely arrived
+			if (!buf_ready[src_idx[0]] || src_idx >= f_idx) underrun <= 1'b1;
 		end else begin
 			// RAM read
 			rd_pend <= rd_issue;
@@ -899,7 +1022,8 @@ end
 
 // video counter readback
 wire [23:1] cur_line_addr = ln_buf ? lb_addr1 : lb_addr0;
-wire [23:1] nxt_line_addr = (f_idx == go_cnt) ? f_addr : (go_cnt[0] ? lb_addr1 : lb_addr0);
+wire [10:0] src_next = fr_dbl ? {1'b0, go_cnt[10:1]} : go_cnt;
+wire [23:1] nxt_line_addr = (f_idx == src_next) ? f_addr : (src_next[0] ? lb_addr1 : lb_addr0);
 assign vc_rd = de_s ? {cur_line_addr + {12'd0, consumed}, 1'b0} : {nxt_line_addr, 1'b0};
 
 //----------------------------------------------------------------------------
@@ -935,9 +1059,9 @@ always @(posedge clk) begin
 	s0_tcw  <= tc_word;
 	s0_de   <= de_vis;
 	s0_detb <= de_tb_vis;
-	s0_vis  <= ~(hblank_eff | vblank_s);
+	s0_vis  <= ~(hblank_eff | vblank_eff);
 	s0_hb   <= hblank_eff;
-	s0_vb   <= vblank_s;
+	s0_vb   <= vblank_eff;
 	s0_hs   <= hsync_s ^ ~lt_hsync_pol;
 	s0_vs   <= vsync_s ^ ~lt_vsync_pol;
 	s0_spal <= use_spal;

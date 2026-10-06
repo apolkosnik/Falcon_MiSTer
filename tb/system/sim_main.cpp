@@ -9,6 +9,7 @@
 //     --frame-every N   only every Nth frame (default 1)
 //     --monitor M       0 mono, 1 RGB, 2 VGA (default), 3 TV
 //     --ram MB          4 or 14 (default 14)
+//     --ramtos          the ROM image is a RAM TOS behind its loader (TOS 4.92)
 //     --pctrace N       print the PC every N clocks
 //     --berrtrace       print every bus error cycle
 //     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
@@ -35,7 +36,8 @@ struct Disk {
     int delay = 0;
     int idx = 0;
     uint32_t lba = 0;
-    uint8_t buf[512];
+    uint8_t buf[16384];
+    int nblk = 1;
 };
 
 struct Event { double t; int kind; int a, b, c; };
@@ -46,12 +48,13 @@ int main(int argc, char **argv) {
 
     double run_ms = 3000;
     std::string frames_dir;
-    int frame_every = 1, monitor = 2, ram = 14;
+    int frame_every = 1, monitor = 2, ram = 14, ramtos = 0;
     long pctrace = 0;
     bool berrtrace = false;
     unsigned io_lo = 1, io_hi = 0;
     double io_from = 0;
     Disk disk[7];
+    double wrlat_ms = 0, rdlat_ms = 0;
     std::vector<Event> events;
 
     for (int i = 1; i < argc; i++) {
@@ -64,7 +67,9 @@ int main(int argc, char **argv) {
             if (!disk[n].f) { fprintf(stderr, "cannot open %s\n", fn.c_str()); exit(1); }
             fseek(disk[n].f, 0, SEEK_END); disk[n].size = ftell(disk[n].f);
         };
-        if (a == "--ms") run_ms = atof(next().c_str());
+        if (a == "--wrlat") wrlat_ms = atof(next().c_str());
+        else if (a == "--rdlat") rdlat_ms = atof(next().c_str());
+        else if (a == "--ms") run_ms = atof(next().c_str());
         else if (a == "--fda") open_disk(0);
         else if (a == "--fdb") open_disk(1);
         else if (a == "--ide0") open_disk(2);
@@ -76,6 +81,7 @@ int main(int argc, char **argv) {
         else if (a == "--frame-every") frame_every = atoi(next().c_str());
         else if (a == "--monitor") monitor = atoi(next().c_str());
         else if (a == "--ram") ram = atoi(next().c_str());
+        else if (a == "--ramtos") ramtos = 1;
         else if (a == "--pctrace") pctrace = atol(next().c_str());
         else if (a == "--berrtrace") berrtrace = true;
         else if (a == "--iotrace") sscanf(next().c_str(), "%x:%x", &io_lo, &io_hi);
@@ -88,6 +94,7 @@ int main(int argc, char **argv) {
     static const int mon_map[4] = {0, 1, 2, 3};
     top->monitor = mon_map[monitor & 3];
     top->ram_mb = ram;
+    top->ram_tos = ramtos;
     top->joy0 = 0;
     top->ps2_key = 0;
     top->ps2_mouse = 0;
@@ -177,12 +184,14 @@ int main(int argc, char **argv) {
             bool rd = (top->sd_rd >> n) & 1, wr = (top->sd_wr >> n) & 1;
             if (d.phase == 0 && (rd || wr)) {
                 d.lba = lba[n];
+                d.nblk = (int)((top->sd_blk_cnt_f >> (6 * n)) & 63) + 1;
                 d.phase = 1; d.delay = 200 + (rand() & 255); d.idx = 0;
                 if (rd) {
-                    memset(d.buf, 0, 512);
-                    if (d.f && (uint64_t)d.lba * 512 < d.size) { fseek(d.f, (long)d.lba * 512, SEEK_SET); if (fread(d.buf, 1, 512, d.f) != 512) {} }
+                    memset(d.buf, 0, sizeof d.buf);
+                    if (d.f && (uint64_t)d.lba * 512 < d.size) { fseek(d.f, (long)d.lba * 512, SEEK_SET); if (fread(d.buf, 1, 512 * d.nblk, d.f) != 512u * d.nblk) {} }
                 }
                 d.idx = rd ? 0 : -1000;   // negative: write
+                if (n >= 4) d.delay += (int)((rd ? rdlat_ms : wrlat_ms) * 1e-3 * CLK_HZ);
             }
         }
         top->sd_buff_wr = 0;
@@ -195,14 +204,15 @@ int main(int argc, char **argv) {
             if (d.phase == 2) {           // HPS -> core
                 if (cyc & 1) {
                     top->sd_buff_addr = d.idx; top->sd_buff_dout = d.buf[d.idx]; top->sd_buff_wr = 1;
-                    if (++d.idx == 512) d.phase = 4;
+                    if (++d.idx == 512 * d.nblk) d.phase = 4;
                 }
                 break;
             }
             if (d.phase == 3) {           // core -> HPS: address now, data next clock
                 if (d.idx > 0) d.buf[d.idx - 1] = (uint8_t)(top->sd_buff_din_f >> (8 * n));
-                if (d.idx == 512) {
-                    if (d.f && !d.ro) { fseek(d.f, (long)d.lba * 512, SEEK_SET); fwrite(d.buf, 1, 512, d.f); fflush(d.f); }
+                if (d.idx == 512 * d.nblk) {
+                    if (n >= 4 && getenv("HPSLOG")) printf("[%9.3f ms] HPS WR slot %d lba %u n %d\n", cyc/CLK_HZ*1e3, n, d.lba, d.nblk);
+                    if (d.f && !d.ro) { fseek(d.f, (long)d.lba * 512, SEEK_SET); fwrite(d.buf, 1, 512 * d.nblk, d.f); fflush(d.f); }
                     d.phase = 4;
                 } else { top->sd_buff_addr = d.idx; d.idx++; }
                 break;
