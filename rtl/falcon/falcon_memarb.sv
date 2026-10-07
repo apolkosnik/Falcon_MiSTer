@@ -12,6 +12,8 @@
 //    d0   DMA port 0 (crossbar: DMA sound play/record)
 //    d1   DMA port 1 (FDC DMA)
 //    d2   DMA port 2 (blitter)
+//    d3   DMA port 3, only in measurement builds (FALCON_MBOX_TEST:
+//         falcon_mbox_test, the HPS mailbox latency probe)
 //    cpu  68030 data/instruction accesses, 32 bit with byte enables
 //
 //  One command is outstanding at a time.  DMA writes are reported on the
@@ -65,6 +67,16 @@ module falcon_memarb
 	output reg [15:0] d2_rdata,
 	output reg        d2_ack,
 
+`ifdef FALCON_MBOX_TEST
+	input             d3_req,
+	input             d3_we,
+	input      [23:1] d3_addr,
+	input       [1:0] d3_be,
+	input      [15:0] d3_wdata,
+	output reg [15:0] d3_rdata,
+	output reg        d3_ack,
+`endif
+
 	// CPU: 32 bit, level request, one-clock acknowledge
 	input             cpu_req,
 	input             cpu_we,
@@ -109,7 +121,13 @@ reg [23:0] ld_a;
 reg  [7:0] ld_d;
 assign ld_busy = ld_pend;
 
-localparam M_VID = 3'd0, M_LD = 3'd1, M_D0 = 3'd2, M_D1 = 3'd3, M_D2 = 3'd4, M_CPU = 3'd5;
+localparam M_VID = 3'd0, M_LD = 3'd1, M_D0 = 3'd2, M_D1 = 3'd3, M_D2 = 3'd4, M_CPU = 3'd5, M_D3 = 3'd6;
+
+`ifdef FALCON_MBOX_TEST
+wire d3_acked = d3_ack;
+`else
+wire d3_acked = 1'b0;
+`endif
 
 localparam S_IDLE = 2'd0, S_CMD = 2'd1, S_READ = 2'd2;
 reg  [1:0] st;
@@ -143,6 +161,11 @@ always @* begin
 	end else if (d2_req) begin
 		g_owner = M_D2; g_we = d2_we; g_addr = d2_addr[23:3]; g_sub = d2_addr[2:1];
 		g_wdata = {4{d2_wdata}}; g_be = {6'd0, d2_be} << (6 - 2 * d2_addr[2:1]);
+`ifdef FALCON_MBOX_TEST
+	end else if (d3_req) begin
+		g_owner = M_D3; g_we = d3_we; g_addr = d3_addr[23:3]; g_sub = d3_addr[2:1];
+		g_wdata = {4{d3_wdata}}; g_be = {6'd0, d3_be} << (6 - 2 * d3_addr[2:1]);
+`endif
 	end else if (cpu_req) begin
 		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_addr[23:3]; g_sub = {cpu_addr[2], 1'b0};
 		g_wdata = {2{cpu_wdata}}; g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
@@ -154,6 +177,9 @@ wire [63:0] rd_be = swap64(DDRAM_DOUT);      // guest order
 always @(posedge clk) begin
 	vid_ack <= 0; vid_valid <= 0;
 	d0_ack <= 0; d1_ack <= 0; d2_ack <= 0; cpu_ack <= 0;
+`ifdef FALCON_MBOX_TEST
+	d3_ack <= 0;
+`endif
 	snoop_we <= 0;
 
 	ld_take = 0;
@@ -167,7 +193,7 @@ always @(posedge clk) begin
 	S_IDLE:
 		// a master that was acknowledged last clock still shows its old
 		// request this clock, so never start right after an acknowledge
-		if (g_any && !(d0_ack | d1_ack | d2_ack | cpu_ack)) begin
+		if (g_any && !(d0_ack | d1_ack | d2_ack | d3_acked | cpu_ack)) begin
 			owner      <= g_owner;
 			sub        <= g_sub;
 			cmd_we     <= g_we;
@@ -197,6 +223,9 @@ always @(posedge clk) begin
 					M_D0:  d0_ack  <= 1;
 					M_D1:  d1_ack  <= 1;
 					M_D2:  d2_ack  <= 1;
+`ifdef FALCON_MBOX_TEST
+					M_D3:  d3_ack  <= 1;
+`endif
 					M_CPU: cpu_ack <= 1;
 					default: ;
 				endcase
@@ -216,6 +245,9 @@ always @(posedge clk) begin
 				M_D0:  begin d0_rdata <= rd_be[63 - 16 * sub -: 16]; d0_ack <= 1; st <= S_IDLE; end
 				M_D1:  begin d1_rdata <= rd_be[63 - 16 * sub -: 16]; d1_ack <= 1; st <= S_IDLE; end
 				M_D2:  begin d2_rdata <= rd_be[63 - 16 * sub -: 16]; d2_ack <= 1; st <= S_IDLE; end
+`ifdef FALCON_MBOX_TEST
+				M_D3:  begin d3_rdata <= rd_be[63 - 16 * sub -: 16]; d3_ack <= 1; st <= S_IDLE; end
+`endif
 				default: begin cpu_rdata <= sub[1] ? rd_be[31:0] : rd_be[63:32]; cpu_ack <= 1; st <= S_IDLE; end
 			endcase
 		end

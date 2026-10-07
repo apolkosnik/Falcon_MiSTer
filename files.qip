@@ -13,6 +13,7 @@ set_global_assignment -name SEARCH_PATH rtl/falcon
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_system.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_memarb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mbox_test.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_combel.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_videl.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_psg.sv

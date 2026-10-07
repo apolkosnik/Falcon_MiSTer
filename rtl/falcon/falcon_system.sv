@@ -181,6 +181,21 @@ wire [23:1] blt_addr;
 wire  [1:0] blt_be;
 wire [15:0] blt_wdata, blt_rdata;
 
+`ifdef FALCON_MBOX_TEST
+// measurement build: HPS mailbox round-trip probe on the arbiter's d3 port
+wire        mbx_req, mbx_we, mbx_ack;
+wire [23:1] mbx_addr;
+wire  [1:0] mbx_be;
+wire [15:0] mbx_wdata, mbx_rdata;
+
+falcon_mbox_test #(.CLK_HZ(CLK_HZ)) mbox_test
+(
+	.clk(clk), .reset(por),
+	.dma_req(mbx_req), .dma_we(mbx_we), .dma_addr(mbx_addr), .dma_be(mbx_be),
+	.dma_wdata(mbx_wdata), .dma_rdata(mbx_rdata), .dma_ack(mbx_ack)
+);
+`endif
+
 falcon_memarb memarb
 (
 	.clk(clk), .reset(por),
@@ -192,6 +207,10 @@ falcon_memarb memarb
 	.d1_rdata(fdc_drdata), .d1_ack(fdc_dack),
 	.d2_req(blt_req), .d2_we(blt_we), .d2_addr(blt_addr), .d2_be(blt_be), .d2_wdata(blt_wdata),
 	.d2_rdata(blt_rdata), .d2_ack(blt_ack),
+`ifdef FALCON_MBOX_TEST
+	.d3_req(mbx_req), .d3_we(mbx_we), .d3_addr(mbx_addr), .d3_be(mbx_be), .d3_wdata(mbx_wdata),
+	.d3_rdata(mbx_rdata), .d3_ack(mbx_ack),
+`endif
 	.cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
 	.cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_ack(cram_ack),
 	.snoop_we(snoop_we), .snoop_addr(snoop_addr),
