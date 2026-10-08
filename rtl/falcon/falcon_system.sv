@@ -141,6 +141,13 @@ reg         iack_done, iack_avec, iack_spur;
 reg   [7:0] iack_vector;
 wire        cpu_cycle_done;
 
+// coprocessor interface registers: the FPU bridge (docs/FPU_ARM.md)
+wire        cp_req, cp_we, cp_ack, cp_berr;
+wire  [2:0] cp_id;
+wire  [4:0] cp_off;
+wire  [1:0] cp_siz;
+wire [31:0] cp_wdata, cp_rdata;
+
 falcon_cpubus cpubus
 (
 	.clk(clk), .reset(reset),
@@ -155,8 +162,11 @@ falcon_cpubus cpubus
 	.dev_ack(dev_ack), .dev_berr(dev_berr), .dev_super(dev_super),
 	.iack_req(iack_req), .iack_level(iack_level), .iack_done(iack_done), .iack_avec(iack_avec),
 	.iack_spur(iack_spur), .iack_vector(iack_vector),
+	.cp_req(cp_req), .cp_we(cp_we), .cp_id(cp_id), .cp_off(cp_off), .cp_siz(cp_siz),
+	.cp_wdata(cp_wdata), .cp_ack(cp_ack), .cp_berr(cp_berr), .cp_rdata(cp_rdata),
 	.cycle_done(cpu_cycle_done)
 );
+
 
 //////////////////////////////////////////////////////////////////
 //  Memory arbiter
@@ -181,18 +191,45 @@ wire [23:1] blt_addr;
 wire  [1:0] blt_be;
 wire [15:0] blt_wdata, blt_rdata;
 
-`ifdef FALCON_MBOX_TEST
-// measurement build: HPS mailbox round-trip probe on the arbiter's d3 port
-wire        mbx_req, mbx_we, mbx_ack;
-wire [23:1] mbx_addr;
-wire  [1:0] mbx_be;
-wire [15:0] mbx_wdata, mbx_rdata;
+// the arbiter's d3 port: the FPU bridge's HPS mailbox, or in a measurement
+// build the mailbox latency probe (the bridge then never sees the ARM
+// service, so there is no FPU)
+wire        d3_req, d3_we, d3_ack;
+wire [23:1] d3_addr;
+wire  [1:0] d3_be;
+wire [15:0] d3_wdata, d3_rdata;
+wire        fpu_present;
 
+`ifdef FALCON_MBOX_TEST
 falcon_mbox_test #(.CLK_HZ(CLK_HZ)) mbox_test
 (
 	.clk(clk), .reset(por),
-	.dma_req(mbx_req), .dma_we(mbx_we), .dma_addr(mbx_addr), .dma_be(mbx_be),
-	.dma_wdata(mbx_wdata), .dma_rdata(mbx_rdata), .dma_ack(mbx_ack)
+	.dma_req(d3_req), .dma_we(d3_we), .dma_addr(d3_addr), .dma_be(d3_be),
+	.dma_wdata(d3_wdata), .dma_rdata(d3_rdata), .dma_ack(d3_ack)
+);
+`endif
+
+`ifdef FALCON_NO_FPU
+// no FPU: every coprocessor cycle ends in BERR (F-line), as before the bridge
+reg cp_ack_r;
+always @(posedge clk) cp_ack_r <= cp_req;
+assign cp_ack = cp_ack_r, cp_berr = 1'b1, cp_rdata = 32'hFFFF_FFFF, fpu_present = 1'b0;
+`ifndef FALCON_MBOX_TEST
+assign d3_req = 1'b0, d3_we = 1'b0, d3_addr = 23'd0, d3_be = 2'b00, d3_wdata = 16'd0;
+`endif
+`else
+falcon_fpu_bridge #(.CLK_HZ(CLK_HZ)) fpu
+(
+	.clk(clk), .reset(dev_reset), .por(por),
+	.cp_req(cp_req), .cp_we(cp_we), .cp_id(cp_id), .cp_off(cp_off), .cp_siz(cp_siz),
+	.cp_wdata(cp_wdata), .cp_ack(cp_ack), .cp_berr(cp_berr), .cp_rdata(cp_rdata),
+`ifdef FALCON_MBOX_TEST
+	.dma_req(), .dma_we(), .dma_addr(), .dma_be(), .dma_wdata(), .dma_rdata(16'd0), .dma_ack(1'b0),
+`else
+	.dma_req(d3_req), .dma_we(d3_we), .dma_addr(d3_addr), .dma_be(d3_be),
+	.dma_wdata(d3_wdata), .dma_rdata(d3_rdata), .dma_ack(d3_ack),
+`endif
+	.present(fpu_present)
 );
 `endif
 
@@ -207,10 +244,8 @@ falcon_memarb memarb
 	.d1_rdata(fdc_drdata), .d1_ack(fdc_dack),
 	.d2_req(blt_req), .d2_we(blt_we), .d2_addr(blt_addr), .d2_be(blt_be), .d2_wdata(blt_wdata),
 	.d2_rdata(blt_rdata), .d2_ack(blt_ack),
-`ifdef FALCON_MBOX_TEST
-	.d3_req(mbx_req), .d3_we(mbx_we), .d3_addr(mbx_addr), .d3_be(mbx_be), .d3_wdata(mbx_wdata),
-	.d3_rdata(mbx_rdata), .d3_ack(mbx_ack),
-`endif
+	.d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
+	.d3_rdata(d3_rdata), .d3_ack(d3_ack),
 	.cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
 	.cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_ack(cram_ack),
 	.snoop_we(snoop_we), .snoop_addr(snoop_addr),

@@ -59,7 +59,15 @@ module tb_top
 	output     [15:0] dbg_dev_din,
 	output            dbg_dev_ack,
 	output     [15:0] dbg_dev_dout,
-	output            dbg_mfp_irq
+	output            dbg_mfp_irq,
+	output            dbg_cp_req,
+	output            dbg_cp_we,
+	output      [4:0] dbg_cp_off,
+	output     [31:0] dbg_cp_wdata,
+	output            dbg_cp_ack,
+	output            dbg_cp_berr,
+	output     [31:0] dbg_cp_rdata,
+	output            dbg_fpu_present
 );
 
 assign dbg_pc     = system.dbg_pc;
@@ -79,6 +87,14 @@ assign dbg_dev_din  = system.dev_din;
 assign dbg_dev_ack  = system.dev_ack & system.dev_cs;
 assign dbg_dev_dout = system.dev_dout;
 assign dbg_mfp_irq  = system.mfp_irq;
+assign dbg_cp_req   = system.cp_req;
+assign dbg_cp_we    = system.cp_we;
+assign dbg_cp_off   = system.cp_off;
+assign dbg_cp_wdata = system.cp_wdata;
+assign dbg_cp_ack   = system.cp_ack;
+assign dbg_cp_berr  = system.cp_berr;
+assign dbg_cp_rdata = system.cp_rdata;
+assign dbg_fpu_present = system.fpu_present;
 
 wire        DDRAM_BUSY, DDRAM_DOUT_READY, DDRAM_RD, DDRAM_WE;
 wire  [7:0] DDRAM_BURSTCNT, DDRAM_BE;

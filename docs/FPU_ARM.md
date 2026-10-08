@@ -1,6 +1,7 @@
 # MC68882 FPU served by the ARM - design
 
-Status: proposal (branch `feature/fpu-arm`).  The core has no FPU today
+Status: milestone 1 in progress (branch `feature/fpu-arm`): `rtl/falcon/falcon_fpu_bridge.sv`,
+`falcon_cpubus` routing coprocessor cycles to it, `tools/falcon_fpu` (heartbeat only).  The core has no FPU today
 (README: "the 68881 does not fit"; `falcon_cpubus` ends every coprocessor
 cycle in a bus error, so the 68030 takes the F-line exception).  ~3,100 ALMs
 are free, far too few for an FPU, but enough for a protocol bridge: the
@@ -78,10 +79,17 @@ back to sleeping polls after ~1 ms idle so an idle FPU does not take a core
 (Linux's RT throttling caps it at 95% anyway).  To be confirmed by
 `mbox_ping -c 0 [-f]` measurements.
 
-**Mailbox.**  Guest $E80000 region (DDR3 0x30E80000), as the probe: request
-and reply slots with sequence numbers, one outstanding request at first.  The
-bridge takes `falcon_memarb`'s d3 port (between the blitter and the CPU),
-which the probe already proved.
+**Mailbox.**  Guest $E90000 (DDR3 0x30E90000), next to the probe's $E80000
+so the two never mix; 16-bit words, Falcon byte order.  +$000 MAGIC $4650
+("FP", written by the service, cleared when it stops), +$002 HEARTBEAT
+(incremented every 10 ms), +$004 VERSION; request and reply slots with
+sequence numbers follow in milestone 2 (one outstanding request at first).
+The bridge polls MAGIC/HEARTBEAT every 5 ms and reports an FPU while the
+heartbeat has moved within 100 ms.  It owns `falcon_memarb`'s d3 port
+(between the blitter and the CPU), which the probe proved; a measurement
+build (`FALCON_BRINGUP="MBOX_TEST"`) gives d3 to the probe and has no FPU,
+and `FALCON_BRINGUP="NO_FPU"` leaves the bridge out (coprocessor cycles end
+in BERR as before).
 
 ## Verification plan
 

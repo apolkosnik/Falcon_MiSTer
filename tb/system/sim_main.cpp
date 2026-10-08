@@ -14,8 +14,14 @@
 //     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
+//     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC and
+//                       a heartbeat every 10 ms in the mailbox at $E90000
+//     --cptrace         print every coprocessor (FPU) interface register access
+//     --cookies         print the TOS cookie jar at the end
 #include "Vtb_top.h"
+#include "Vtb_top__Dpi.h"
 #include "verilated.h"
+#include "svdpi.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +46,21 @@ struct Disk {
 
 struct Event { double t; int kind; int a, b, c; };
 
+// guest memory through the DDR3 model (DDR3 byte k = guest byte k)
+static uint8_t guest_rd8(uint32_t a)
+{
+    return (uint8_t)(ddr_peek(a >> 3) >> (8 * (a & 7)));
+}
+static uint32_t guest_rd32(uint32_t a)
+{
+    return (uint32_t)guest_rd8(a) << 24 | (uint32_t)guest_rd8(a + 1) << 16 | (uint32_t)guest_rd8(a + 2) << 8 | guest_rd8(a + 3);
+}
+static void guest_wr16(uint32_t a, uint16_t v)   // a even
+{
+    uint64_t d = ((uint64_t)(v >> 8) << (8 * (a & 7))) | ((uint64_t)(v & 0xFF) << (8 * ((a + 1) & 7)));
+    ddr_poke(a >> 3, d, (uint8_t)(3u << (a & 7)));
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     Vtb_top *top = new Vtb_top;
@@ -52,6 +73,7 @@ int main(int argc, char **argv) {
     unsigned io_lo = 1, io_hi = 0;
     double io_from = 0;
     Disk disk[7];
+    bool fpu_service = false, cptrace = false, cookies = false;
     std::vector<Event> events;
 
     for (int i = 1; i < argc; i++) {
@@ -82,8 +104,16 @@ int main(int argc, char **argv) {
         else if (a == "--iofrom") io_from = atof(next().c_str());
         else if (a == "--key") { double t; unsigned c; sscanf(next().c_str(), "%lf:%x", &t, &c); events.push_back({t, 0, (int)c, 0, 0}); }
         else if (a == "--mouse") { double t; int dx, dy, b; sscanf(next().c_str(), "%lf:%d:%d:%d", &t, &dx, &dy, &b); events.push_back({t, 1, dx, dy, b}); }
+        else if (a == "--fpu") fpu_service = true;
+        else if (a == "--cptrace") cptrace = true;
+        else if (a == "--cookies") cookies = true;
     }
     if (!frames_dir.empty()) mkdir(frames_dir.c_str(), 0755);
+    svSetScope(svGetScopeFromName("TOP.tb_top.ddr"));
+    uint16_t fpu_hb = 0;
+    bool cp_pend = false, cp_we = false;
+    unsigned cp_off = 0;
+    uint32_t cp_wd = 0;
 
     static const int mon_map[4] = {0, 1, 2, 3};
     top->monitor = mon_map[monitor & 3];
@@ -211,7 +241,26 @@ int main(int argc, char **argv) {
             if (d.phase == 5) { if (!(((top->sd_rd | top->sd_wr) >> n) & 1)) d.phase = 0; }
         }
 
+        bool fpu_was = top->dbg_fpu_present;
         tick();
+        // the service starts after the DDR3 model's initial block has cleared
+        // the memory (first evaluation)
+        if (fpu_service && cyc == 100) {
+            guest_wr16(0xE90004, 1);          // VERSION
+            guest_wr16(0xE90000, 0x4650);     // MAGIC "FP"
+        }
+        if (fpu_service && cyc % 320000 == 0) guest_wr16(0xE90002, ++fpu_hb);   // 10 ms
+        if (top->dbg_fpu_present != fpu_was)
+            printf("[%10.3f ms] FPU %s\n", cyc / CLK_HZ * 1e3, top->dbg_fpu_present ? "present" : "absent");
+        if (cptrace) {
+            if (top->dbg_cp_req) { cp_pend = true; cp_we = top->dbg_cp_we; cp_off = top->dbg_cp_off; cp_wd = top->dbg_cp_wdata; }
+            if (top->dbg_cp_ack && cp_pend) {
+                cp_pend = false;
+                if (top->dbg_cp_berr) printf("[%10.3f ms] CP %s CIR %02X  BERR  pc=%08x\n", cyc / CLK_HZ * 1e3, cp_we ? "W" : "R", cp_off, top->dbg_pc);
+                else if (cp_we) printf("[%10.3f ms] CP W CIR %02X = %08x  pc=%08x\n", cyc / CLK_HZ * 1e3, cp_off, cp_wd, top->dbg_pc);
+                else printf("[%10.3f ms] CP R CIR %02X -> %08x  pc=%08x\n", cyc / CLK_HZ * 1e3, cp_off, (uint32_t)top->dbg_cp_rdata, top->dbg_pc);
+            }
+        }
 
         // video
         if (top->ce_pix) {
@@ -265,6 +314,19 @@ int main(int argc, char **argv) {
         if (top->dbg_halted) { printf("[%9.3f ms] CPU HALTED (double bus fault) pc=%08x\n", now_ms, top->dbg_pc); break; }
     }
     printf("simulated %.3f ms, %llu clocks\n", cyc / CLK_HZ * 1e3, (unsigned long long)cyc);
+    if (fpu_service)
+        printf("FPU mailbox: MAGIC %04x HEARTBEAT %04x\n", guest_rd32(0xE90000) >> 16, guest_rd32(0xE90000) & 0xFFFF);
+    if (cookies) {
+        uint32_t jar = guest_rd32(0x5A0) & 0xFFFFFF;
+        printf("cookie jar at %06x\n", jar);
+        for (int i = 0; jar && i < 64; i++) {
+            uint32_t id = guest_rd32(jar + 8 * i), val = guest_rd32(jar + 8 * i + 4);
+            if (!id) break;
+            char n[5] = { (char)(id >> 24), (char)(id >> 16), (char)(id >> 8), (char)id, 0 };
+            for (int k = 0; k < 4; k++) if (n[k] < 32 || n[k] > 126) n[k] = '?';
+            printf("  %s = %08x\n", n, val);
+        }
+    }
     top->final();
     delete top;
     return 0;

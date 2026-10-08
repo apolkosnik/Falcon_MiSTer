@@ -32,3 +32,5 @@ tb/scsi/work/
 tb/scsi/main_src/
 tools/mbox_ping/mbox_ping
 tools/mbox_ping/mbox_ping_host
+tools/falcon_fpu/falcon_fpu
+tools/falcon_fpu/falcon_fpu_host

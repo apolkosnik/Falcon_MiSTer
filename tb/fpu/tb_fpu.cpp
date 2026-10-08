@@ -1,0 +1,1243 @@
+// tb_fpu.cpp - Verilator co-simulation of the MC68882 FPU bridge, milestone 1.
+//
+// The design under test is the real RTL: AP68030 CPU + falcon_cpubus +
+// falcon_memarb + falcon_fpu_bridge (tb_fpu_top.sv), running real 68k test
+// programs (asm/*.s) from a ROM image at $E00000.  The DDR3 behind the
+// arbiter is a C++ model with MiSTer DDRAM semantics (64-bit words, random
+// BUSY and read latency); the mailbox window $E90000..$E9FFFF is a MAP_SHARED
+// file, so the real ARM service (tools/falcon_fpu, built for the host) can
+// serve it as a child process.  Heartbeats come either from a deterministic
+// C++ writer or from that child.
+//
+// Time: the bridge parameter CLK_HZ is TB_CLK_HZ (200 kHz): the mailbox poll
+// is every CLK_HZ/200 = 1000 clocks, the alive window 20 polls = 20000
+// clocks, one simulated clock = 5 us.  Runs with the real child are paced
+// to wall time (1 clock = 1/CLK_HZ s) so its 10 ms heartbeat is 10 ms of
+// Falcon time as well.
+//
+// Expected values come from the manuals (cited at every check), never from
+// the RTL: MC68881/MC68882 User's Manual (UM), MC68030 UM, EmuTOS
+// bios/processor.S, and Hatari src/cpu/fpp.c as a cross-check.  A failing
+// check stays failing.
+
+#include <cerrno>
+#include <csignal>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <map>
+#include <random>
+#include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <vector>
+
+#include "Vtb_fpu_top.h"
+#include "verilated.h"
+
+#ifndef TB_CLK_HZ
+#define TB_CLK_HZ 200000
+#endif
+
+static const unsigned CLK_HZ = TB_CLK_HZ;
+static const unsigned POLL_CLKS = CLK_HZ / 200;        // bridge header: polls every CLK_HZ/200 clocks (5 ms)
+static const unsigned ALIVE_POLLS = 20;                // bridge header: absent after 20 polls without a new heartbeat
+static const unsigned HB_PERIOD = CLK_HZ / 100;        // the ARM service: 10 ms
+static const unsigned MB_G = 0xE90000, MB_SIZE = 0x10000;
+static const uint64_t DDR_BYTE0 = 0x30000000ull, DDR_SIZE = 0x1000000ull;
+static const uint16_t MAGIC = 0x4650;
+
+//------------------------------------------------------------------ reporting
+static int n_pass = 0, n_fail = 0;
+static std::string cur_test;
+static std::vector<std::string> failed_checks;
+
+static void report(bool ok, const char *grp, const std::string &what, const char *src)
+{
+	if (ok) n_pass++;
+	else {
+		n_fail++;
+		failed_checks.push_back(cur_test + " / " + what);
+	}
+	printf("  %s  [%s] %s  (%s)\n", ok ? "PASS" : "FAIL", grp, what.c_str(), src);
+}
+
+static std::string fmt(const char *f, ...)
+{
+	char b[1024];
+	va_list ap;
+	va_start(ap, f);
+	vsnprintf(b, sizeof b, f, ap);
+	va_end(ap);
+	return b;
+}
+
+// compare numbers: prints "expected X got Y"
+static bool check_eq(const char *grp, const std::string &what, uint64_t exp, uint64_t got, const char *src, int digits = 8)
+{
+	bool ok = exp == got;
+	report(ok, grp, fmt("%s: expected 0x%0*llx got 0x%0*llx", what.c_str(), digits, (unsigned long long)exp, digits,
+	                    (unsigned long long)got), src);
+	return ok;
+}
+static bool check_true(const char *grp, const std::string &what, bool cond, const char *src)
+{
+	report(cond, grp, what, src);
+	return cond;
+}
+
+//------------------------------------------------------------------ DUT, DDR3, mailbox
+static Vtb_fpu_top *T = nullptr;
+static uint64_t g_clk = 0;
+static bool g_por = true, g_reset = true;
+static std::vector<uint8_t> ddr;      // guest memory, offset = guest address (DDR3 byte k = guest byte k)
+static uint8_t *MB = nullptr;         // mapped mailbox file
+static std::string mb_path;
+static std::mt19937_64 rng;
+static uint32_t rnd(uint32_t n) { return n ? (uint32_t)(rng() % n) : 0; }
+
+static inline uint16_t mb16(unsigned off)
+{
+	return __builtin_bswap16(__atomic_load_n((uint16_t *)(MB + off), __ATOMIC_ACQUIRE));
+}
+static inline void mb_w16(unsigned off, uint16_t v)
+{
+	__atomic_store_n((uint16_t *)(MB + off), __builtin_bswap16(v), __ATOMIC_RELEASE);
+}
+
+static inline bool in_mb(uint32_t off) { return off >= MB_G && off < MB_G + MB_SIZE; }
+static inline uint8_t *ddr_ptr(uint32_t off) { return in_mb(off) ? MB + (off - MB_G) : &ddr[off]; }
+
+static uint64_t ddr_read64(uint32_t off)
+{
+	uint64_t w = 0;
+	if (in_mb(off)) {
+		for (int p = 0; p < 4; p++) {
+			uint16_t v = __atomic_load_n((uint16_t *)(ddr_ptr(off) + 2 * p), __ATOMIC_ACQUIRE);
+			w |= (uint64_t)v << (16 * p);
+		}
+	} else
+		memcpy(&w, ddr_ptr(off), 8);
+	return w;
+}
+static void ddr_write64(uint32_t off, uint64_t din, uint8_t be)
+{
+	for (int p = 0; p < 4; p++) {
+		unsigned m = (be >> (2 * p)) & 3;
+		uint8_t *q = ddr_ptr(off) + 2 * p;
+		uint16_t v = (uint16_t)(din >> (16 * p));
+		if (m == 3) {
+			if (in_mb(off)) __atomic_store_n((uint16_t *)q, v, __ATOMIC_RELEASE);
+			else memcpy(q, &v, 2);
+		} else if (m == 1) q[0] = (uint8_t)v;
+		else if (m == 2) q[1] = (uint8_t)(v >> 8);
+	}
+}
+
+// guest memory (big endian)
+static uint32_t gr32(uint32_t a)
+{
+	return ((uint32_t)ddr[a] << 24) | ((uint32_t)ddr[a + 1] << 16) | ((uint32_t)ddr[a + 2] << 8) | ddr[a + 3];
+}
+static void gw32(uint32_t a, uint32_t v)
+{
+	ddr[a] = v >> 24; ddr[a + 1] = v >> 16; ddr[a + 2] = v >> 8; ddr[a + 3] = (uint8_t)v;
+}
+
+// DDR3 command / data model
+static int rd_left = 0, rd_wait = 0;
+static uint32_t rd_off = 0;
+static int busy_run = 0;
+static uint64_t nxt_dout = 0;
+static bool nxt_ready = false, nxt_busy = false;
+static uint64_t ddr_proto_err = 0, n_ddr_rd = 0, n_ddr_wr = 0;
+static std::string ddr_first_err;
+
+static void ddr_pre()
+{
+	bool rd = T->DDRAM_RD, wr = T->DDRAM_WE;
+	if ((rd || wr) && !T->DDRAM_BUSY) {
+		uint64_t byte = (uint64_t)T->DDRAM_ADDR * 8;
+		bool inr = byte >= DDR_BYTE0 && byte < DDR_BYTE0 + DDR_SIZE;
+		int burst = T->DDRAM_BURSTCNT;
+		bool ok = !(rd && wr) && inr && rd_left == 0 && burst == 1;
+		if (!ok) {
+			ddr_proto_err++;
+			if (ddr_first_err.empty())
+				ddr_first_err = fmt("clk %llu rd=%d wr=%d byte=0x%llx burst=%d rd_left=%d", (unsigned long long)g_clk, rd, wr,
+				                    (unsigned long long)byte, burst, rd_left);
+		}
+		if (inr && !(rd && wr)) {
+			uint32_t off = (uint32_t)(byte - DDR_BYTE0);
+			if (wr) {
+				ddr_write64(off, T->DDRAM_DIN, T->DDRAM_BE);
+				n_ddr_wr++;
+			} else {
+				rd_off = off; rd_left = burst; rd_wait = 1 + rnd(30);
+				n_ddr_rd++;
+			}
+		}
+	}
+	nxt_ready = false;
+	nxt_dout = (uint64_t)rng();
+	if (rd_left > 0) {
+		if (rd_wait > 1) rd_wait--;
+		else if (rnd(6) == 0) { /* gap */ }
+		else {
+			nxt_dout = ddr_read64(rd_off);
+			nxt_ready = true;
+			rd_off += 8; rd_left--;
+		}
+	}
+	nxt_busy = false;
+	if (busy_run > 0) { busy_run--; nxt_busy = true; }
+	else if (rnd(100) < 30) nxt_busy = true;
+	if (rnd(300) == 0) busy_run = rnd(25);
+}
+
+//------------------------------------------------------------------ tags shared with the assembler
+static std::map<std::string, uint32_t> TAG;
+static void load_tags(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(2); }
+	char line[512];
+	while (fgets(line, sizeof line, f)) {
+		char name[128], val[64];
+		if (sscanf(line, "%127s equ %63s", name, val) == 2 && name[0] == 'T' && name[1] == '_') {
+			TAG[name] = (uint32_t)strtoul(val[0] == '$' ? val + 1 : val, nullptr, val[0] == '$' ? 16 : 10);
+		}
+	}
+	fclose(f);
+}
+static uint32_t Tg(const char *n)
+{
+	auto it = TAG.find(n);
+	if (it == TAG.end()) { fprintf(stderr, "unknown tag %s\n", n); exit(2); }
+	return it->second;
+}
+
+// guest control block (asm/common.i)
+enum { A_GO = 0x0F00, A_STOP = 0x0F04, A_DONE = 0x0F08, A_EXCNT = 0x0F0C, A_EXLOGP = 0x0F10, A_STATUS = 0x0F18,
+       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_EXLOG = 0x1000, A_RECLOG = 0x4000 };
+
+//------------------------------------------------------------------ monitors
+// CIR bus cycles (CPU space type 2) seen on the 68030 pins
+struct Cir {
+	uint64_t clk0, clk1, instr;
+	unsigned id, off, siz;
+	bool rw;            // read
+	uint32_t data;      // D31..D0 as moved (word CIRs: D31..D16)
+	bool berr, ds0, ds1, present;
+};
+static std::vector<Cir> cirs;
+static uint64_t instr_idx = 0, other_berr = 0, n_cycles = 0, n_halted_seen = 0;
+static bool prev_as = false, cur_term = false, cur_is_cir = false;
+static Cir cur;
+
+// mailbox polls seen on the arbiter's d3 port, and the presence scoreboard
+struct Poll { uint64_t clk; bool hb; uint16_t data; };
+static std::vector<Poll> polls;
+static std::vector<uint64_t> req_start_magic;   // clock of each MAGIC read request
+static bool prev_d3_req = false;
+static bool pr_prev = false;
+static uint64_t pr_fall = 0, pr_rise = 0;
+static std::vector<uint64_t> pr_falls, pr_rises;
+static std::vector<unsigned> pr_fall_unch;       // unchanged HB reads at each fall
+static unsigned sb_alive = 0, sb_unch = 0;
+static uint16_t sb_last_hb = 0;
+static bool sb_exp = false, sb_next = false;
+static uint64_t sb_eff = 0, sb_mismatch = 0;
+static std::string sb_first_mismatch;
+static int sb_last_was = 0;                      // 1 magic bad, 2 hb unchanged, 3 hb changed
+
+static void monitors_reset()
+{
+	cirs.clear(); instr_idx = 0; other_berr = 0; n_cycles = 0; prev_as = false; cur_term = false; cur_is_cir = false;
+	polls.clear(); req_start_magic.clear(); prev_d3_req = false;
+	pr_prev = false; pr_fall = pr_rise = 0; pr_falls.clear(); pr_rises.clear(); pr_fall_unch.clear();
+	sb_alive = 0; sb_unch = 0; sb_last_hb = 0; sb_exp = sb_next = false; sb_eff = 0; sb_mismatch = 0; sb_first_mismatch.clear();
+	sb_last_was = 0;
+	ddr_proto_err = 0; ddr_first_err.clear(); n_ddr_rd = n_ddr_wr = 0;
+}
+
+static void sample()
+{
+	if (T->o_dbg_inst) instr_idx++;
+	bool as = !T->o_as_n && T->o_bus_oe;
+	if (as && !prev_as) {
+		cur = Cir();
+		cur.clk0 = g_clk; cur.instr = instr_idx;
+		uint32_t a = T->o_a;
+		cur_is_cir = T->o_fc == 7 && ((a >> 16) & 0xF) == 2;
+		cur.id = (a >> 13) & 7; cur.off = a & 0x1F; cur.siz = T->o_siz; cur.rw = T->o_rw;
+		cur_term = false;
+		n_cycles++;
+	}
+	if (as) {
+		if (cur_is_cir && T->o_cp_req) cur.present = T->o_present;   // the value the bridge sees with cp_req
+		bool b = !T->o_berr_n, d0 = !T->o_dsack0_n, d1 = !T->o_dsack1_n;
+		if (!cur_term && (b || d0 || d1)) {
+			cur_term = true;
+			cur.clk1 = g_clk; cur.berr = b; cur.ds0 = d0; cur.ds1 = d1;
+			cur.data = cur.rw ? T->o_d_i : T->o_d_o;
+			if (cur_is_cir) cirs.push_back(cur);
+			else if (b) other_berr++;
+		}
+	}
+	prev_as = as;
+
+	// d3: mailbox polls
+	bool rq = T->o_d3_req;
+	if (rq && !prev_d3_req && !T->o_d3_we && T->o_d3_addr == (0xE90000 >> 1)) req_start_magic.push_back(g_clk);
+	prev_d3_req = rq;
+	if (g_clk >= sb_eff) sb_exp = sb_next;
+	if (g_por) { sb_alive = 0; sb_unch = 0; sb_exp = sb_next = false; }
+	else if (T->o_d3_ack && !T->o_d3_we) {
+		unsigned wa = T->o_d3_addr;
+		uint16_t d = T->o_d3_rdata;
+		if (wa == (0xE90000 >> 1)) {                 // MAGIC
+			polls.push_back({g_clk, false, d});
+			if (d != MAGIC) sb_alive = 0;
+		} else if (wa == (0xE90002 >> 1)) {          // HEARTBEAT
+			polls.push_back({g_clk, true, d});
+			if (d != sb_last_hb) { sb_alive = ALIVE_POLLS; sb_unch = 0; }
+			else { if (sb_alive) sb_alive--; sb_unch++; }
+			sb_last_hb = d;
+		}
+		sb_next = sb_alive != 0;
+		sb_eff = g_clk + 1;
+	}
+	bool pr = T->o_present;
+	if (!g_por && g_clk > sb_eff + 1 && pr != sb_exp) {
+		sb_mismatch++;
+		if (sb_first_mismatch.empty())
+			sb_first_mismatch = fmt("clk %llu present=%d expected=%d", (unsigned long long)g_clk, pr, sb_exp);
+	}
+	if (pr && !pr_prev) { pr_rise = g_clk; pr_rises.push_back(g_clk); }
+	if (!pr && pr_prev) { pr_fall = g_clk; pr_falls.push_back(g_clk); pr_fall_unch.push_back(sb_unch); }
+	pr_prev = pr;
+}
+
+//------------------------------------------------------------------ heartbeat sources
+static bool hb_on = false;
+static uint16_t hb_val = 0;
+static uint64_t hb_next = 0;
+static uint64_t mb_hb_change_clk = 0, mb_magic_zero_clk = 0;
+static uint16_t mb_prev_hb = 0, mb_prev_magic = 0;
+
+static pid_t child = -1;
+static bool child_exited = false;
+static uint64_t child_exit_clk = 0;
+static int child_status = 0;
+static std::string host_exe;
+static bool paced = false;
+static struct timespec pace_t0;
+static uint64_t pace_clk0 = 0;
+
+static void hb_start(uint16_t hb0 = 1)
+{
+	mb_w16(0x004, 1);
+	hb_val = hb0;
+	mb_w16(0x002, hb_val);
+	mb_w16(0x000, MAGIC);
+	hb_next = g_clk + HB_PERIOD;
+	hb_on = true;
+}
+
+static void child_poll()
+{
+	if (child > 0 && !child_exited) {
+		int st;
+		pid_t r = waitpid(child, &st, WNOHANG);
+		if (r == child) { child_exited = true; child_exit_clk = g_clk; child_status = st; }
+	}
+}
+
+static void pace()
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	double target = (double)(g_clk - pace_clk0) / CLK_HZ;
+	double have = (now.tv_sec - pace_t0.tv_sec) + (now.tv_nsec - pace_t0.tv_nsec) * 1e-9;
+	if (have < target) {
+		double d = target - have;
+		struct timespec ts;
+		ts.tv_sec = (time_t)d;
+		ts.tv_nsec = (long)((d - (double)ts.tv_sec) * 1e9);
+		nanosleep(&ts, nullptr);
+	}
+}
+
+static void tick()
+{
+	if (hb_on && g_clk >= hb_next) {
+		mb_w16(0x002, ++hb_val);
+		hb_next += HB_PERIOD;
+	}
+	uint16_t h = mb16(0x002), m = mb16(0x000);
+	if (h != mb_prev_hb) { mb_hb_change_clk = g_clk; mb_prev_hb = h; }
+	if (m != mb_prev_magic) { if (m == 0) mb_magic_zero_clk = g_clk; mb_prev_magic = m; }
+	if (child > 0 && (g_clk & 15) == 0) child_poll();
+	if (paced && (g_clk & 63) == 0) pace();
+}
+
+static void step()
+{
+	ddr_pre();
+	T->por = g_por; T->reset = g_reset;
+	T->clk = 1; T->eval();
+	T->DDRAM_DOUT = nxt_dout; T->DDRAM_DOUT_READY = nxt_ready; T->DDRAM_BUSY = nxt_busy;
+	T->clk = 0; T->eval();
+	g_clk++;
+	sample();
+	tick();
+}
+static void steps(uint64_t n) { while (n--) step(); }
+
+template <class F> static bool run_until(F cond, uint64_t max_clks)
+{
+	uint64_t end = g_clk + max_clks;
+	while (g_clk < end) {
+		step();
+		if (cond()) return true;
+	}
+	return cond();
+}
+static bool is_ready() { return gr32(A_READY) != 0; }
+static bool is_done() { return gr32(A_DONE) == 0xD0E0600D; }
+static bool present() { return T->o_present; }
+
+//------------------------------------------------------------------ test set-up
+static std::vector<uint8_t> read_file(const std::string &p)
+{
+	std::vector<uint8_t> v;
+	FILE *f = fopen(p.c_str(), "rb");
+	if (!f) { fprintf(stderr, "cannot open %s\n", p.c_str()); exit(2); }
+	uint8_t b[4096];
+	size_t n;
+	while ((n = fread(b, 1, sizeof b, f)) > 0) v.insert(v.end(), b, b + n);
+	fclose(f);
+	return v;
+}
+
+static unsigned test_no = 0;
+static std::string cir_log_dir = "obj";
+
+static void begin_test(const char *name, const char *prog)
+{
+	cur_test = name;
+	printf("\n== %s  (program %s) ==\n", name, prog);
+	if (child > 0) { fprintf(stderr, "child still running\n"); exit(2); }
+	delete T;
+	T = new Vtb_fpu_top;
+	rng.seed(0x46505531ull + 977 * (++test_no));
+	std::fill(ddr.begin(), ddr.end(), 0);
+	memset(MB, 0, MB_SIZE);
+	std::vector<uint8_t> img = read_file(std::string("obj/") + prog + ".bin");
+	memcpy(&ddr[0xE00000], img.data(), img.size());
+	rd_left = 0; busy_run = 0; nxt_ready = false; nxt_busy = false; nxt_dout = 0;
+	T->DDRAM_BUSY = 0; T->DDRAM_DOUT_READY = 0; T->DDRAM_DOUT = 0;
+	hb_on = false; hb_val = 0; paced = false;
+	mb_prev_hb = mb_prev_magic = 0; mb_hb_change_clk = mb_magic_zero_clk = 0;
+	child_exited = false; child_exit_clk = 0;
+	g_clk = 0;
+	monitors_reset();
+	g_por = true; g_reset = true;
+	steps(60);
+}
+static void release_reset()
+{
+	g_por = false; g_reset = false;
+	steps(2);
+}
+
+static void set_pacing(bool on)
+{
+	paced = on;
+	if (on) { clock_gettime(CLOCK_MONOTONIC, &pace_t0); pace_clk0 = g_clk; }
+}
+
+static void child_start()
+{
+	child_exited = false;
+	child = fork();
+	if (child == 0) {
+		int nul = open("/dev/null", O_WRONLY);
+		if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+		execl(host_exe.c_str(), host_exe.c_str(), "-m", mb_path.c_str(), (char *)nullptr);
+		_exit(127);
+	}
+	if (child < 0) { perror("fork"); exit(2); }
+}
+static void child_signal(int sig) { if (child > 0 && !child_exited) kill(child, sig); }
+static void child_reap()
+{
+	if (child <= 0) return;
+	if (!child_exited) {
+		kill(child, SIGCONT);
+		kill(child, SIGTERM);
+		for (int i = 0; i < 200 && !child_exited; i++) {
+			int st;
+			pid_t r = waitpid(child, &st, WNOHANG);
+			if (r == child) { child_exited = true; child_status = st; break; }
+			usleep(10000);
+		}
+		if (!child_exited) {
+			kill(child, SIGKILL);
+			int st;
+			waitpid(child, &st, 0);
+			child_exited = true;
+		}
+	}
+	child = -1;
+}
+
+//------------------------------------------------------------------ results
+static std::map<uint32_t, std::vector<uint32_t>> recs;
+static void collect()
+{
+	recs.clear();
+	for (uint32_t a = A_RECLOG; a < A_RECLOG + 0x4000; a += 8) {
+		uint32_t t = gr32(a);
+		if (!t) break;
+		recs[t].push_back(gr32(a + 4));
+	}
+}
+static bool expect(const char *grp, uint32_t tag, const std::string &what, uint32_t exp, const char *src, int digits = 8)
+{
+	auto it = recs.find(tag);
+	if (it == recs.end()) {
+		report(false, grp, fmt("%s: expected 0x%0*x got <no result recorded> (tag 0x%x)", what.c_str(), digits, exp, tag), src);
+		return false;
+	}
+	if (it->second.size() != 1) {
+		report(false, grp, fmt("%s: expected 0x%0*x got %zu results for one tag", what.c_str(), digits, exp, it->second.size()), src);
+		return false;
+	}
+	return check_eq(grp, what, exp, it->second[0], src, digits);
+}
+
+struct ExEnt { uint32_t vec, fmt, pc, ia, sr; };
+static std::vector<ExEnt> exlog()
+{
+	std::vector<ExEnt> v;
+	uint32_t n = gr32(A_EXCNT);
+	for (uint32_t i = 0; i < n && i < 256; i++) {
+		uint32_t a = A_EXLOG + 32 * i;
+		v.push_back({gr32(a), gr32(a + 4), gr32(a + 8), gr32(a + 12), gr32(a + 16)});
+	}
+	return v;
+}
+
+//------------------------------------------------------------------ common end-of-run checks
+// check 7: bus level
+static void bus_checks(const char *tag)
+{
+	char path[256];
+	snprintf(path, sizeof path, "%s/cir_%s.log", cir_log_dir.c_str(), tag);
+	FILE *lf = fopen(path, "w");
+	if (lf) fprintf(lf, "# clk0 clk1 instr cpid off dir data term(BERR|DSACK1|DSACK1+0) present_at_req\n");
+	unsigned n_berr = 0, n_wordbad = 0, n_longbad = 0, n_berr_notfirst = 0, n_berr_wrong = 0, n_nober_wrong = 0, n_term_odd = 0;
+	std::string first_bad;
+	for (size_t i = 0; i < cirs.size(); i++) {
+		const Cir &c = cirs[i];
+		bool first_in_instr = i == 0 || cirs[i - 1].instr != c.instr;
+		bool firsttype = (!c.rw && (c.off == 0x0A || c.off == 0x0E || c.off == 0x06)) || (c.rw && c.off == 0x04);
+		bool lng = c.off == 0x10 || c.off == 0x18 || c.off == 0x1C;
+		const char *term = c.berr ? "BERR" : (c.ds0 && c.ds1) ? "DSACK1+0" : c.ds1 ? "DSACK1" : "DSACK0";
+		if (lf)
+			fprintf(lf, "%llu %llu %llu cp%u $%02X %s %08X %s %d\n", (unsigned long long)c.clk0, (unsigned long long)c.clk1,
+			        (unsigned long long)c.instr, c.id, c.off, c.rw ? "R" : "W", c.data, term, c.present);
+		auto bad = [&](const char *why) {
+			if (first_bad.empty())
+				first_bad = fmt("%s: clk %llu cpid %u off $%02X %s data %08X term %s present %d", why, (unsigned long long)c.clk0, c.id,
+				                c.off, c.rw ? "read" : "write", c.data, term, c.present);
+		};
+		if (c.berr) {
+			n_berr++;
+			if (c.ds0 || c.ds1) { n_term_odd++; bad("BERR together with DSACK"); }
+			if (!first_in_instr) { n_berr_notfirst++; bad("BERR not on the first CIR access of the instruction"); }
+			if (c.id == 1 && !(firsttype && !c.present)) { n_berr_wrong++; bad("CpID 1 BERR although FPU present or access not a first-type access"); }
+		} else {
+			if (c.id != 1) { n_nober_wrong++; bad("CpID != 1 access not ended with BERR"); }
+			else if (firsttype && !c.present) { n_nober_wrong++; bad("first-type access completed although FPU absent"); }
+			if (lng && !(c.ds0 && c.ds1)) { n_longbad++; bad("long CIR not terminated with DSACK1+DSACK0"); }
+			if (!lng && !(c.ds1 && !c.ds0)) { n_wordbad++; bad("word CIR not terminated with DSACK1 only"); }
+		}
+	}
+	if (lf) fclose(lf);
+	printf("  bus log: %zu CIR cycles (%u BERR) in %s\n", cirs.size(), n_berr, path);
+	const char *S = "MC68030 UM 10 (CIR protocol) / MC68881 UM 7 (CIR sizes) / falcon_cpubus.sv header";
+	check_eq("bus", "CIR cycles ended in BERR anywhere but the first CIR access of an instruction", 0, n_berr_notfirst, S, 1);
+	check_eq("bus", "BERR together with DSACK on the same cycle", 0, n_term_odd, S, 1);
+	check_eq("bus", "CpID 1 cycles with BERR while the FPU is present (or not first-type)", 0, n_berr_wrong, S, 1);
+	check_eq("bus", "cycles whose BERR/DSACK outcome contradicts presence / CpID", 0, n_nober_wrong, S, 1);
+	check_eq("bus", "word CIR cycles not ended with DSACK1 only", 0, n_wordbad, "MC68881 UM 7.1 CIR widths: 16-bit except operand/IA/OA", 1);
+	check_eq("bus", "$10/$18/$1C CIR cycles not ended with DSACK1+DSACK0", 0, n_longbad, "MC68881 UM 7.1 CIR widths: operand, instruction address, operand address are 32-bit", 1);
+	check_eq("bus", "BERR on any non-CIR cycle (RAM/ROM)", 0, other_berr, "falcon_cpubus: RAM/ROM never ends in BERR here", 1);
+	if (!first_bad.empty()) printf("        first offender: %s\n", first_bad.c_str());
+
+	// frame transfers (MC68030 UM 10.5.4 / 10.5.5): after the save CIR read the
+	// processor moves the frame body, size = length byte of the format word,
+	// through the operand CIR in longs; cpRESTORE writes the same amount.
+	unsigned n_saves = 0, n_rests = 0, n_frm_bad = 0;
+	std::string frm_bad;
+	for (size_t i = 0; i < cirs.size();) {
+		size_t j = i;
+		while (j < cirs.size() && cirs[j].instr == cirs[i].instr) j++;
+		const Cir &f = cirs[i];
+		if (f.id == 1 && !f.berr && ((f.rw && f.off == 0x04) || (!f.rw && f.off == 0x06))) {
+			unsigned fmtw = (f.data >> 16) & 0xFFFF;
+			unsigned nops = 0;
+			for (size_t k = i + 1; k < j; k++)
+				if (cirs[k].off == 0x10 && cirs[k].rw == f.rw) nops++;
+			// valid frames: null (version 0): no body; $1F38: 56 bytes = 14 longs; others: refused, no body
+			unsigned exp_ops = (fmtw >> 8) == 0 ? 0 : fmtw == 0x1F38 ? 14 : 0;
+			if (f.rw) n_saves++; else n_rests++;
+			if (nops != exp_ops) {
+				n_frm_bad++;
+				if (frm_bad.empty())
+					frm_bad = fmt("clk %llu %s format word %04X: %u operand CIR transfers, expected %u", (unsigned long long)f.clk0,
+					              f.rw ? "FSAVE" : "FRESTORE", fmtw, nops, exp_ops);
+			}
+		}
+		i = j;
+	}
+	check_eq("bus", fmt("FSAVE/FRESTORE dialogues (%u saves, %u restores) whose operand CIR transfer count differs from the frame size", n_saves, n_rests), 0,
+	         n_frm_bad, "MC68030 UM 10.5.4/10.5.5: body = size byte of the format word ($38 = 14 longs, null = none)", 1);
+	if (!frm_bad.empty()) printf("        first: %s\n", frm_bad.c_str());
+}
+
+static void ddr_checks()
+{
+	check_eq("ddr", "DDRAM protocol violations (one command at a time, burst 1, guest window)", 0, ddr_proto_err,
+	         "MiSTer DDRAM semantics / falcon_memarb", 1);
+	if (ddr_proto_err) printf("        first: %s\n", ddr_first_err.c_str());
+}
+
+static void presence_checks(bool strict_polls)
+{
+	check_eq("presence", "cycles where `present` differs from the header's rule (MAGIC ok and HB changed within 20 polls)", 0, sb_mismatch,
+	         "falcon_fpu_bridge.sv header: present while HEARTBEAT changed within the last 20 polls", 1);
+	if (sb_mismatch) printf("        first: %s\n", sb_first_mismatch.c_str());
+	// poll period: CLK_HZ/200 clocks between the starts of successive polls
+	if (strict_polls && req_start_magic.size() > 2) {
+		uint64_t mn = ~0ull, mx = 0;
+		for (size_t i = 1; i < req_start_magic.size(); i++) {
+			uint64_t d = req_start_magic[i] - req_start_magic[i - 1];
+			if (d < mn) mn = d;
+			if (d > mx) mx = d;
+		}
+		check_true("presence", fmt("poll period min %llu max %llu clocks within [%u, %u] (CLK_HZ/200 = %u plus two DMA reads)",
+		                          (unsigned long long)mn, (unsigned long long)mx, POLL_CLKS, POLL_CLKS + 400, POLL_CLKS),
+		           mn >= POLL_CLKS && mx <= POLL_CLKS + 400, "bridge header: polled every 5 ms = CLK_HZ/200 clocks");
+	}
+}
+
+// standard end of a program run
+static bool finish_program(uint64_t max_clks, bool allow_unexp = false)
+{
+	bool ok = run_until(is_done, max_clks);
+	check_true("run", fmt("program reached its done marker within %llu clocks (clk %llu, %llu instructions)", (unsigned long long)max_clks,
+	                      (unsigned long long)g_clk, (unsigned long long)instr_idx), ok, "test harness");
+	if (T->o_halted) check_true("run", "CPU not halted (no double bus fault)", false, "MC68030 UM 8.1.3");
+	if (!allow_unexp) {
+		check_eq("run", "unexpected-vector exceptions taken (UNEXP flag)", 0, gr32(A_UNEXP), "test harness", 1);
+		if (gr32(A_UNEXP)) {
+			for (auto &e : exlog()) printf("        exception: vector %u fmt %u pc %08x ia %08x sr %04x\n", e.vec, e.fmt, e.pc, e.ia, e.sr);
+		}
+	}
+	collect();
+	return ok;
+}
+
+//------------------------------------------------------------------ the condition table
+// MC68881/MC68882 UM, "Conditional Tests" (table 3-21 predicates): with
+// N = Z = I = NAN = 0.  Written out from the formulas:
+//   $00 F 0   $01 EQ Z=0   $02 OGT !(NAN|Z|N)=1   $03 OGE Z|!(NAN|N)=1
+//   $04 OLT N&!(NAN|Z)=0   $05 OLE Z|(N&!NAN)=0   $06 OGL !(NAN|Z)=1   $07 OR !NAN=1
+//   $08 UN NAN=0   $09 UEQ NAN|Z=0   $0A UGT NAN|!(N|Z)=1   $0B UGE NAN|Z|!N=1
+//   $0C ULT NAN|(N&!Z)=0   $0D ULE NAN|Z|N=0   $0E NE !Z=1   $0F T 1
+//   $10-$1F: the IEEE-nonaware forms give the same results (BSUN only if NAN)
+static const int TF[32] = {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
+                           0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1};
+static const char *PRED_NAME[32] = {"F", "EQ", "OGT", "OGE", "OLT", "OLE", "OGL", "OR", "UN", "UEQ", "UGT", "UGE", "ULT", "ULE", "NE", "T",
+                                    "SF", "SEQ", "GT", "GE", "LT", "LE", "GL", "GLE", "NGLE", "NGL", "NLE", "NLT", "NGE", "NGT", "SNE", "ST"};
+
+// cross-check the table with Hatari's condition_table_6888x (first 32 entries = all cc clear)
+static void hatari_crosscheck()
+{
+	const char *p = getenv("HATARI_FPP");
+	std::string path = p ? p : "/home/pkilar/Devel/Atari/hatari/src/cpu/fpp.c";
+	FILE *f = fopen(path.c_str(), "r");
+	if (!f) { printf("  SKIP  [cond] Hatari cross-check: %s not readable\n", path.c_str()); return; }
+	char line[1024];
+	bool in = false;
+	std::vector<int> v;
+	while (fgets(line, sizeof line, f) && v.size() < 32) {
+		if (strstr(line, "condition_table_6888x[]")) { in = true; continue; }
+		if (!in) continue;
+		for (char *c = line; *c; c++)
+			if (*c == '0' || *c == '1') v.push_back(*c - '0');
+	}
+	fclose(f);
+	bool ok = v.size() >= 32;
+	std::string mine, theirs;
+	for (int i = 0; i < 32 && ok; i++) {
+		mine += char('0' + TF[i]);
+		theirs += char('0' + v[i]);
+		if (TF[i] != v[i]) ok = false;
+	}
+	report(ok, "cond", fmt("this bench's predicate table vs Hatari condition_table_6888x row 0: expected %s got %s", mine.c_str(), theirs.c_str()),
+	       "hatari/src/cpu/fpp.c fpp_cond");
+}
+
+//------------------------------------------------------------------ scenarios
+static const char *S_COOKIE = "EmuTOS bios/processor.S _detect_fpu header: 0x00060000 = 68882 for sure, 0 = no FPU";
+
+static void sc_detect(const char *name, const char *mode)
+{
+	begin_test(name, "t_detect");
+	bool real = !strcmp(mode, "real");
+	uint32_t exp = 0;
+	if (!strcmp(mode, "alive") || real) exp = 0x00060000;
+	if (!strcmp(mode, "alive")) hb_start();
+	else if (real) { set_pacing(true); child_start(); }
+	else if (!strcmp(mode, "badmagic")) { hb_start(); mb_w16(0x000, 0x4651); }
+	else if (!strcmp(mode, "hb0")) { mb_w16(0x004, 1); mb_w16(0x002, 0); mb_w16(0x000, MAGIC); }
+	release_reset();
+	if (exp) {
+		bool ok = run_until(present, 6 * POLL_CLKS + 5000);
+		check_true("presence", fmt("`present` rises within a few polls of the service starting (clk %llu)", (unsigned long long)g_clk), ok,
+		           "bridge header: polled every 5 ms");
+	} else
+		steps(5 * POLL_CLKS);
+	if (!exp) check_eq("presence", "`present` with no usable service", 0, present(), "bridge header: no MAGIC / heartbeat -> absent", 1);
+	steps(200);
+	gw32(A_GO, 1);
+	finish_program(300000);
+	expect("detect", Tg("T_COOKIE"), fmt("_detect_fpu cookie (%s)", mode), exp, S_COOKIE);
+	if (!exp) {
+		// no FPU: the very first CIR access (FRESTORE's restore CIR write) ends in BERR, and nothing follows it
+		check_eq("bus", "CIR cycles of the whole detection (just the failing FRESTORE access)", 1, cirs.size(),
+		         "MC68030 UM 10: BERR on the first CIR access = no coprocessor", 1);
+		if (cirs.size() >= 1) {
+			check_eq("bus", "that access is a write to the restore CIR ($06)", 0x106, (cirs[0].rw ? 0x200u : 0x100u) | cirs[0].off,
+			         "MC68881 UM 7.1.1 / MC68030 UM 10.5.5: cpRESTORE writes the restore CIR first", 3);
+			check_eq("bus", "that access ended in BERR (1 = BERR)", 1, cirs[0].berr, "bridge header: first CIR access without service -> BERR", 1);
+		}
+	}
+	if (real) {
+		check_eq("service", "MAGIC word the real falcon_fpu wrote at mailbox +0", MAGIC, mb16(0), "tools/falcon_fpu header: MAGIC $4650", 4);
+		check_eq("service", "VERSION word the real falcon_fpu wrote at mailbox +4", 1, mb16(4), "tools/falcon_fpu: FPU_VERSION 1", 4);
+		check_true("service", fmt("HEARTBEAT advanced (now %u)", mb16(2)), mb16(2) != 0, "tools/falcon_fpu: +2 incremented every 10 ms");
+		child_reap();
+		check_true("service", "falcon_fpu_host exited cleanly on SIGTERM", child_exited && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
+		           "tools/falcon_fpu: SIGTERM -> clears MAGIC, exit 0");
+		check_eq("service", "MAGIC after SIGTERM", 0, mb16(0), "tools/falcon_fpu: clears MAGIC on SIGTERM", 4);
+	}
+	bus_checks(fmt("detect_%s", mode).c_str());
+	ddr_checks();
+	presence_checks(false);
+}
+
+// FNOP watch loop: STATUS follows presence
+static uint32_t status_now() { return ddr[A_STATUS]; }
+
+struct Watch {
+	uint64_t t_status0 = 0;   // clock STATUS first became 0 after being 1
+};
+
+static void watch_begin(const char *name, bool real)
+{
+	begin_test(name, "t_watch");
+	if (real) { set_pacing(true); child_start(); }
+	else hb_start();
+	release_reset();
+	bool ok = run_until(present, 8 * POLL_CLKS);
+	check_true("presence", fmt("`present` rises at the first poll that sees MAGIC and a new heartbeat (clk %llu)", (unsigned long long)g_clk), ok,
+	           "bridge header: presence via mailbox heartbeat");
+	ok = run_until(is_ready, 100000);
+	check_true("run", fmt("program waiting for GO (clk %llu)", (unsigned long long)g_clk), ok, "test harness");
+	gw32(A_GO, 1);
+	ok = run_until([] { return status_now() == 1; }, 6000);
+	check_eq("watch", "FNOP loop STATUS while the service is alive (1 = FNOP completes)", 1, status_now(), "MC68882 UM: FNOP completes", 1);
+}
+
+// run until `present` falls (or timeout); return clock of the fall, 0 if none
+static uint64_t wait_fall(uint64_t max)
+{
+	size_t n = pr_falls.size();
+	run_until([&] { return pr_falls.size() > n; }, max);
+	return pr_falls.size() > n ? pr_falls.back() : 0;
+}
+static uint64_t wait_rise(uint64_t max)
+{
+	size_t n = pr_rises.size();
+	run_until([&] { return pr_rises.size() > n; }, max);
+	return pr_rises.size() > n ? pr_rises.back() : 0;
+}
+
+static void watch_after_fall(uint64_t fall, const char *why)
+{
+	// the CPU-visible result follows: STATUS goes to 0 (Line-F), never before presence fell
+	uint64_t st1 = 0;
+	for (int i = 0; i < 4000 && status_now() == 1; i++) step();
+	st1 = g_clk;
+	check_eq("watch", fmt("FNOP loop STATUS after `present` fell (%s): 0 = Line-F", why), 0, status_now(), "MC68030 UM 10: BERR on first CIR access = no coprocessor", 1);
+	check_true("watch", fmt("STATUS became 0 %lld clocks after `present` fell (not before)", (long long)(st1 - fall)), st1 >= fall,
+	           "no premature absence");
+}
+
+static void sc_watch_cpp_freeze()
+{
+	watch_begin("presence/C++ heartbeat frozen", false);
+	steps(3 * HB_PERIOD);
+	check_eq("presence", "`present` while the heartbeat runs", 1, present(), "bridge header", 1);
+	size_t nf = pr_falls.size();
+	hb_on = false;                                  // freeze: the last value stays in the mailbox
+	uint64_t t_frozen = mb_hb_change_clk;           // clock of the last heartbeat write
+	// still present until the alive window expires
+	uint64_t fall = wait_fall(40 * POLL_CLKS);
+	check_true("presence", fmt("`present` falls after the freeze (fall at clk %llu)", (unsigned long long)fall), pr_falls.size() > nf, "bridge header: absent after 20 polls");
+	if (fall) {
+		double ms = (double)(fall - t_frozen) * 1000.0 / CLK_HZ;
+		// the first poll after the last write (<= 1 period) sees the new value, then 20 polls without change
+		check_true("presence", fmt("freeze -> absent took %.1f ms (%llu clocks); expected 100..110 ms (20 polls of 5 ms, plus up to one poll and the DMA reads)", ms,
+		                          (unsigned long long)(fall - t_frozen)),
+		           fall - t_frozen >= 19 * POLL_CLKS && fall - t_frozen <= 22 * POLL_CLKS, "bridge header: 5 ms polls, absent after 20 polls without a new heartbeat");
+		check_eq("presence", "HEARTBEAT polls without change when `present` fell", ALIVE_POLLS, pr_fall_unch.back(), "bridge header: absent after 20 polls", 2);
+		// it was present just before
+		watch_after_fall(fall, "heartbeat frozen");
+	}
+	// heartbeat resumes: present again at the next poll that sees a change
+	hb_on = true; hb_next = g_clk + HB_PERIOD;
+	uint64_t t_resume = g_clk;
+	uint64_t rise = wait_rise(6 * POLL_CLKS + HB_PERIOD);
+	check_true("presence", fmt("`present` rises again %llu clocks after the heartbeat resumed", (unsigned long long)(rise - t_resume)), rise != 0 && rise - t_resume <= 3 * POLL_CLKS,
+	           "bridge header: HEARTBEAT changed -> present");
+	run_until([] { return status_now() == 1; }, 6000);
+	check_eq("watch", "FNOP loop STATUS after the heartbeat resumed", 1, status_now(), "MC68882 UM: FNOP completes", 1);
+	gw32(A_STOP, 1);
+	finish_program(30000);
+	bus_checks("watch_freeze");
+	ddr_checks();
+	presence_checks(true);
+}
+
+static void sc_watch_cpp_magic()
+{
+	watch_begin("presence/C++ MAGIC cleared", false);
+	steps(2 * HB_PERIOD);
+	size_t nf = pr_falls.size();
+	mb_w16(0x000, 0);                                // what falcon_fpu does on SIGTERM
+	uint64_t t0 = g_clk;
+	uint64_t fall = wait_fall(3 * POLL_CLKS);
+	check_true("presence", fmt("`present` falls on the next poll after MAGIC is cleared (%llu clocks later; limit %u)", (unsigned long long)(fall - t0), POLL_CLKS + 400),
+	           pr_falls.size() > nf && fall - t0 <= POLL_CLKS + 400, "bridge header: polls every 5 ms; no MAGIC -> absent");
+	if (fall) watch_after_fall(fall, "MAGIC cleared");
+	mb_w16(0x000, MAGIC);
+	uint64_t t1 = g_clk;
+	uint64_t rise = wait_rise(3 * HB_PERIOD);
+	check_true("presence", fmt("`present` returns %llu clocks after MAGIC is back (heartbeat still running)", (unsigned long long)(rise - t1)), rise != 0 && rise - t1 <= POLL_CLKS + 400,
+	           "bridge header: MAGIC ok and HEARTBEAT changed -> present");
+	run_until([] { return status_now() == 1; }, 6000);
+	check_eq("watch", "FNOP loop STATUS after MAGIC returned", 1, status_now(), "MC68882 UM: FNOP completes", 1);
+	gw32(A_STOP, 1);
+	finish_program(30000);
+	bus_checks("watch_magic");
+	ddr_checks();
+	presence_checks(true);
+}
+
+static void sc_watch_real()
+{
+	watch_begin("presence/real falcon_fpu_host: SIGSTOP, SIGCONT, SIGTERM", true);
+	steps(2 * HB_PERIOD);
+	check_eq("presence", "`present` while the real service runs", 1, present(), "tools/falcon_fpu: heartbeat every 10 ms", 1);
+	// --- freeze with SIGSTOP
+	size_t nf = pr_falls.size();
+	child_signal(SIGSTOP);
+	steps(4);
+	uint64_t t_frozen = mb_hb_change_clk;           // last heartbeat the ARM program wrote
+	uint64_t fall = wait_fall(40 * POLL_CLKS);
+	check_true("presence", fmt("`present` falls after SIGSTOP (fall at clk %llu)", (unsigned long long)fall), pr_falls.size() > nf, "bridge header: absent after 20 polls");
+	if (fall) {
+		double ms = (double)(fall - t_frozen) * 1000.0 / CLK_HZ;
+		check_true("presence", fmt("last heartbeat -> absent took %.1f ms (%llu clocks); expected 100..110 ms", ms, (unsigned long long)(fall - t_frozen)),
+		           fall - t_frozen >= 19 * POLL_CLKS && fall - t_frozen <= 22 * POLL_CLKS, "bridge header: absent after 20 polls without a new heartbeat");
+		check_eq("presence", "HEARTBEAT polls without change when `present` fell", ALIVE_POLLS, pr_fall_unch.back(), "bridge header", 2);
+		watch_after_fall(fall, "SIGSTOP");
+	}
+	// --- SIGCONT: the heartbeat moves again
+	child_signal(SIGCONT);
+	uint64_t t_cont = g_clk;
+	uint64_t rise = wait_rise(6 * POLL_CLKS + HB_PERIOD);
+	check_true("presence", fmt("`present` rises %llu clocks after SIGCONT", (unsigned long long)(rise - t_cont)), rise != 0 && rise - t_cont <= 4 * POLL_CLKS,
+	           "bridge header: HEARTBEAT changed -> present");
+	run_until([] { return status_now() == 1; }, 6000);
+	check_eq("watch", "FNOP loop STATUS after SIGCONT", 1, status_now(), "MC68882 UM: FNOP completes", 1);
+	steps(2 * HB_PERIOD);
+	// --- SIGTERM: MAGIC is cleared at once, the FPU disappears at the next poll
+	nf = pr_falls.size();
+	child_signal(SIGTERM);
+	uint64_t te = g_clk;
+	run_until([] { return child_exited; }, 4 * POLL_CLKS);
+	check_true("service", "falcon_fpu_host exited after SIGTERM", child_exited && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0, "tools/falcon_fpu");
+	check_eq("service", "MAGIC after SIGTERM", 0, mb16(0), "tools/falcon_fpu: SIGTERM -> MAGIC cleared", 4);
+	uint64_t tz = mb_magic_zero_clk;
+	fall = wait_fall(3 * POLL_CLKS);
+	check_true("presence", fmt("`present` falls %lld clocks after MAGIC was cleared (SIGTERM at clk %llu); limit one poll = %u",
+	                          (long long)(fall - tz), (unsigned long long)te, POLL_CLKS + 400),
+	           pr_falls.size() > nf && fall >= tz && fall - tz <= POLL_CLKS + 400, "bridge header: absent at the next poll");
+	if (fall) watch_after_fall(fall, "SIGTERM");
+	child_reap();
+	gw32(A_STOP, 1);
+	finish_program(30000);
+	bus_checks("watch_real");
+	ddr_checks();
+	presence_checks(true);
+}
+
+static void run_alive_program(const char *name, const char *prog, uint64_t max_clks)
+{
+	begin_test(name, prog);
+	hb_start();
+	release_reset();
+	run_until(present, 6 * POLL_CLKS);
+	run_until(is_ready, 100000);
+	steps(100);
+	gw32(A_GO, 1);
+	finish_program(max_clks);
+}
+
+static void sc_frames()
+{
+	run_alive_program("frames/FSAVE FRESTORE", "t_frames", 400000);
+	const char *G = "frame";
+	const char *UM_NULL = "MC68881/2 UM 6.4.2: null state frame is one longword, format word $0000";
+	const char *UM_IDLE = "MC68882 UM 6.4.2: idle frame format $1F38 (version $1F, size $38) = 4 + 56 = 60 bytes; EmuTOS processor.S tests byte 1 = $38";
+	expect(G, Tg("T_FS_NULL_DELTA"), "FSAVE -(a0) after reset: bytes pushed", 4, UM_NULL);
+	expect(G, Tg("T_FS_NULL_FMT"), "FSAVE after reset: format word", 0x0000, UM_NULL, 4);
+	expect(G, Tg("T_FS_NULL_BEYOND"), "memory above the null frame untouched (pre-fill $AAAAAAAA)", 0xAAAAAAAA, UM_NULL);
+	expect(G, Tg("T_FS_IDLE_DELTA"), "FNOP; FSAVE -(a0): bytes pushed", 60, UM_IDLE);
+	expect(G, Tg("T_FS_IDLE_FMT"), "FNOP; FSAVE -(a0): format word (version $1F, size $38)", 0x1F38, UM_IDLE, 4);
+	expect(G, Tg("T_FS_IDLE_LEN"), "FNOP; FSAVE -(a0): byte at offset 1 (EmuTOS 68882 test)", 0x38, UM_IDLE, 2);
+	expect(G, Tg("T_FS_IDLE_BODY"), "idle frame body: the 14 longs OR-ed (pre-fill was $AAAAAAAA; body carries no state)", 0, "falcon_fpu_bridge.sv header: idle frame body carries no state in milestone 1");
+	expect(G, Tg("T_FS_IDLE_BEYOND"), "memory above the 60-byte idle frame untouched", 0xAAAAAAAA, UM_IDLE);
+	expect(G, Tg("T_FS_CTRL_FMT"), "FNOP; FSAVE (a0): format word", 0x1F38, UM_IDLE, 4);
+	expect(G, Tg("T_FS_CTRL_A0"), "FSAVE (a0) leaves a0 unchanged (1 = yes)", 1, "MC68030 UM 10.5.4 (control addressing mode)", 1);
+	expect(G, Tg("T_FS_CTRL_BEYOND"), "memory 60 bytes above a0 untouched after FSAVE (a0)", 0xAAAAAAAA, UM_IDLE);
+	expect(G, Tg("T_FR_NULL_FMT"), "FNOP; FRESTORE null; FSAVE: format word (null again)", 0x0000, "MC68882 UM 6.4.2: FRESTORE of a null frame resets the FPU to the null state; EmuTOS processor.S", 4);
+	expect(G, Tg("T_FR_NULL_DELTA"), "... and the null frame is 4 bytes", 4, UM_NULL);
+	expect(G, Tg("T_FR_NULL_A1"), "FRESTORE (a1) leaves a1 unchanged (1 = yes)", 1, "MC68030 UM 10.5.5", 1);
+	expect(G, Tg("T_FR_NULL_ADV"), "FRESTORE (a1)+ of a null frame advances a1 by", 4, "MC68881 UM 6.4.2 null frame length; Hatari fpuop_restore");
+	expect(G, Tg("T_FR_NZ_CNT"), "FRESTORE of $0012 (version 0 = null): exceptions taken", 0, "Hatari fpp.c fpuop_restore: frame_version 0 is a null frame");
+	expect(G, Tg("T_FR_NZ_FMT"), "... FSAVE afterwards: format word", 0x0000, UM_NULL, 4);
+	expect(G, Tg("T_FR_IDLE_ADV"), "FRESTORE (a1)+ of an idle 68882 frame: bytes consumed", 60, UM_IDLE);
+	expect(G, Tg("T_FR_IDLE_CNT"), "... exceptions taken", 0, "MC68882 UM 6.4.2: a valid idle frame restores");
+	expect(G, Tg("T_FR_IDLE_FMT"), "... FSAVE afterwards (from null): format word", 0x1F38, "MC68882 UM 6.4.2: restore of an idle frame leaves the FPU idle", 4);
+	expect(G, Tg("T_FR_IDLE_DELTA"), "... and its size", 60, UM_IDLE);
+	const char *bn[3] = {"$1F18 (68881 idle)", "$1FD4 (68882 busy)", "$1234"};
+	for (unsigned i = 0; i < 3; i++) {
+		uint32_t b = Tg("T_BADF") + 8 * i;
+		const char *S = i == 0 ? "task spec: invalid -> format error (NOTE Hatari fpp.c fpuop_restore accepts $1F18 idle frames)"
+		                       : i == 1 ? "task spec: busy frame not restorable -> format error (NOTE Hatari accepts and skips busy $B4/$D4 frames)"
+		                                : "MC68030 UM 10.5.5 / Table 8-1: invalid format word -> format error, vector 14";
+		expect(G, b + 0, fmt("FRESTORE of frame %s: exceptions taken", bn[i]), 1, S, 1);
+		expect(G, b + 1, fmt("FRESTORE of frame %s: exception vector (format error)", bn[i]), 14, "MC68030 UM Table 8-1: vector 14 = format error", 2);
+		expect(G, b + 2, fmt("FRESTORE of frame %s: stack frame format (pre-instruction = 0)", bn[i]), 0, "MC68030 UM 10.4.2: pre-instruction exception, format 0", 1);
+		expect(G, b + 3, fmt("FRESTORE of frame %s: stacked PC is the FRESTORE (1 = yes)", bn[i]), 1, "MC68030 UM 10.4.2", 1);
+		expect(G, b + 4, fmt("FRESTORE of frame %s: execution continued after the handler (1 = yes)", bn[i]), 1, "test harness", 1);
+	}
+	expect(G, Tg("T_FR_AFTERBAD"), "FNOP after the format errors: exceptions taken", 0, "MC68882 UM: FNOP completes");
+	// the exception log must hold exactly the three vector-14 entries
+	auto ex = exlog();
+	check_eq(G, "exceptions in the whole program (the three format errors)", 3, ex.size(), "test harness", 1);
+	bus_checks("frames");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void sc_cond()
+{
+	run_alive_program("conditionals/FScc FBcc FDBcc FTRAPcc", "t_cond", 3000000);
+	const char *G = "cond";
+	hatari_crosscheck();
+	const char *UM = "MC68881/2 UM conditional tests (table in sec. 3); FPSR cc = 0 after reset, cross-checked with Hatari fpp_cond";
+	expect(G, Tg("T_FNOP_CNT"), "3 x FNOP: exceptions taken", 0, "MC68882 UM: FNOP = FBF.W #0, completes");
+	expect(G, Tg("T_FNOP_DONE"), "code after FNOP ran (1 = yes)", 1, "MC68882 UM", 1);
+	for (unsigned p = 0; p < 32; p++) {
+		int tf = TF[p];
+		expect(G, Tg("T_FSCC") + p, fmt("FScc D1, predicate $%02X (%s) -> byte", p, PRED_NAME[p]), tf ? 0xFF : 0x00, UM, 2);
+		expect(G, Tg("T_FBCC") + p, fmt("FBcc.W, predicate $%02X (%s): taken (1) / not taken (0)", p, PRED_NAME[p]), tf, UM, 1);
+		expect(G, Tg("T_FDB_TAKEN") + p, fmt("FDBcc D3, predicate $%02X (%s): looped (1 = branch, i.e. condition false)", p, PRED_NAME[p]), !tf, UM, 1);
+		expect(G, Tg("T_FDB_COUNT") + p, fmt("FDBcc D3 (=5), predicate $%02X (%s): D3 afterwards (5 if true, 4 if false)", p, PRED_NAME[p]), tf ? 5 : 4, UM, 1);
+		expect(G, Tg("T_FTRAP") + p, fmt("FTRAPcc, predicate $%02X (%s): TRAPcc exceptions (1 = trapped)", p, PRED_NAME[p]), tf, UM, 1);
+	}
+	const char *U2 = "MC68881/2 UM FScc/FBcc/FTRAPcc; MC68030 UM 10.4 (cpScc/cpBcc/cpTRAPcc)";
+	expect(G, Tg("T_FSCC_MEM_T"), "FST (a0): byte stored", 0xFF, U2, 2);
+	expect(G, Tg("T_FSCC_MEM_F"), "FSF (a0): byte stored (pre-set $55)", 0x00, U2, 2);
+	expect(G, Tg("T_FBCC_L_T"), "FBT.L: taken (1)", 1, U2, 1);
+	expect(G, Tg("T_FBCC_L_F"), "FBF.L: taken (0 = not)", 0, U2, 1);
+	expect(G, Tg("T_FTW_T"), "FTRAPT.W #imm: exceptions", 1, U2, 1);
+	expect(G, Tg("T_FTW_VEC"), "FTRAPT.W: vector (TRAPcc)", 7, "MC68030 UM Table 8-1: vector 7 = cpTRAPcc", 2);
+	expect(G, Tg("T_FTW_FMT"), "FTRAPT.W: stack frame format (post-instruction, six-word)", 2, "MC68030 UM 8.2.x: format $2", 1);
+	expect(G, Tg("T_FTW_PC"), "FTRAPT.W: stacked PC is the next instruction, after the operand (1 = yes)", 1, "MC68030 UM 10.4.3", 1);
+	expect(G, Tg("T_FTW_IA"), "FTRAPT.W: frame instruction address is the FTRAPT (1 = yes)", 1, "MC68030 UM 8.2.x format $2", 1);
+	expect(G, Tg("T_FTW_F"), "FTRAPF.W #imm: exceptions (operand skipped)", 0, U2, 1);
+	expect(G, Tg("T_FTL_T"), "FTRAPT.L #imm: exceptions", 1, U2, 1);
+	expect(G, Tg("T_FTL_PC"), "FTRAPT.L: stacked PC after the long operand (1 = yes)", 1, "MC68030 UM 10.4.3", 1);
+	expect(G, Tg("T_FTL_F"), "FTRAPF.L #imm: exceptions (operand skipped)", 0, U2, 1);
+	check_eq(G, "exceptions in the whole program (TRAPcc taken: predicates true + 2 operand forms)", [] { int n = 0; for (int i = 0; i < 32; i++) n += TF[i]; return n + 2; }(),
+	         exlog().size(), "predicate table + test harness", 2);
+	for (auto &e : exlog())
+		if (e.vec != 7) { check_true(G, fmt("unexpected exception vector %u", e.vec), false, "test harness"); break; }
+	bus_checks("cond");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void sc_gen()
+{
+	run_alive_program("cpGEN/F-line", "t_gen", 600000);
+	const char *G = "gen";
+	const char *S = "bridge header: cpGEN not implemented -> pre-instruction exception, vector 11; MC68030 UM 10.4.2";
+	const char *names[14] = {"FMOVE.L D0,FP0", "FADD.X FP1,FP0", "FMOVEM.X FP0-FP3,(A0)", "FMOVE.L #imm,FP0", "FMOVEM.L D0,FPCR", "FMOVE.X FP0,-(A7)",
+	                         "FMOVECR #0,FP0", "FMOVE.X (abs).L,FP1", "FSQRT.X FP0,FP1", "FCMP.X FP1,FP0", "FTST.X FP0", "FMOVE.S FP0,D1",
+	                         "FMOVEM.L FPCR/FPSR/FPIAR,(A0)", "FMOVE.D (8,A0),FP7"};
+	for (unsigned i = 0; i < 14; i++) {
+		uint32_t b = Tg("T_GEN") + 4 * i;
+		expect(G, b + 0, fmt("%s: exception vector (F-line)", names[i]), 11, S, 2);
+		expect(G, b + 1, fmt("%s: stack frame format (pre-instruction)", names[i]), 0, S, 1);
+		expect(G, b + 2, fmt("%s: stacked PC is the FPU instruction (1 = yes)", names[i]), 1, S, 1);
+		expect(G, b + 3, fmt("%s: execution continued after the handler skipped it (1 = yes)", names[i]), 1, "test harness", 1);
+	}
+	expect(G, Tg("T_GEN_COUNT"), "exceptions taken in all", 14, S, 2);
+	bus_checks("gen");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void cpid_checks(unsigned k, const char *G, const char *S)
+{
+	const char *kn[7] = {"cpGEN", "cpBcc", "cpScc", "cpDBcc", "cpTRAPcc.W", "cpSAVE (a0)", "cpRESTORE (a0)"};
+	for (unsigned j = 0; j < 7; j++) {
+		uint32_t b = Tg("T_CPID") + 32 * k + 4 * j;
+		expect(G, b + 0, fmt("CpID %u %s: exception vector (F-line)", k, kn[j]), 11, S, 2);
+		expect(G, b + 1, fmt("CpID %u %s: stack frame format (pre-instruction)", k, kn[j]), 0, S, 1);
+		expect(G, b + 2, fmt("CpID %u %s: stacked PC is the instruction (1 = yes)", k, kn[j]), 1, S, 1);
+		expect(G, b + 3, fmt("CpID %u %s: exactly one exception", k, kn[j]), 1, S, 1);
+	}
+}
+
+static void sc_cpid(bool alive)
+{
+	if (alive) {
+		begin_test("CpID 2..7 with the FPU present", "t_cpid");
+		hb_start();
+		release_reset();
+		run_until(present, 6 * POLL_CLKS);
+		check_eq("presence", "`present` (FPU alive, other CpIDs must still fail)", 1, present(), "bridge header", 1);
+	} else {
+		begin_test("CpID 2..7 with no service", "t_cpid");
+		release_reset();
+		steps(4 * POLL_CLKS);
+		check_eq("presence", "`present` (no service)", 0, present(), "bridge header", 1);
+	}
+	run_until(is_ready, 100000);
+	steps(100);
+	gw32(A_GO, 1);
+	finish_program(1200000);
+	const char *S = "bridge header: CpID != 1 -> BERR on the first CIR access -> F-line (MC68030 UM 10.4 / 7.1.4)";
+	for (unsigned k = 2; k <= 7; k++) cpid_checks(k, "cpid", S);
+	// 6 CpIDs x 7 instructions -> 42 CIR cycles, all BERR
+	check_eq("cpid", "CIR cycles in the run (one per instruction, each a BERR)", 42, cirs.size(), "bridge header: BERR on the first access ends the instruction", 2);
+	unsigned nb = 0;
+	for (auto &c : cirs) nb += c.berr;
+	check_eq("cpid", "of which ended in BERR", 42, nb, "bridge header", 2);
+	check_eq("cpid", "exceptions taken (42 F-line)", 42, exlog().size(), "test harness", 2);
+	bus_checks(alive ? "cpid_alive" : "cpid_absent");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void sc_absent()
+{
+	begin_test("CpID 1 instructions with no service", "t_absent");
+	release_reset();
+	steps(4 * POLL_CLKS);
+	check_eq("presence", "`present` (no service)", 0, present(), "bridge header", 1);
+	gw32(A_GO, 1);
+	finish_program(600000);
+	cpid_checks(1, "absent", "bridge header: first CIR access without service -> BERR -> F-line; same as before the bridge (docs/FPU_ARM.md)");
+	check_eq("absent", "CIR cycles in the run (one per instruction, each a BERR)", 7, cirs.size(), "bridge header", 1);
+	bus_checks("absent");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void sc_reset()
+{
+	run_alive_program("RESET instruction", "t_reset", 400000);
+	const char *G = "reset";
+	const char *UM = "MC68881/2 UM 6.4.2: the FPU is in the null state after reset (RESET asserts the coprocessor reset)";
+	expect(G, Tg("T_RS_BEFORE"), "FNOP; FSAVE: format word (idle)", 0x1F38, "MC68882 UM 6.4.2", 4);
+	expect(G, Tg("T_RS_AFTER"), "FSAVE after the RESET instruction: format word (null)", 0x0000, UM, 4);
+	expect(G, Tg("T_RS_SIZE"), "... frame size", 4, UM);
+	expect(G, Tg("T_RS_FNOP"), "FNOP after RESET (service still present): exceptions", 0, "bridge header: reset does not clear presence");
+	bus_checks("reset");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void sc_raw()
+{
+	run_alive_program("raw CIR accesses (MOVES, DFC=7), FPU present", "t_raw", 600000);
+	const char *G = "raw";
+	const char *H = "bridge header: response primitives (MC68881/2 UM table 7-7): null/PF = $0802, null with TF = $08xT, take pre-instruction exception = $1Cvv";
+	expect(G, Tg("T_RAW_RESP0"), "response CIR after reset: null, processing finished", 0x0802, H, 4);
+	expect(G, Tg("T_RAW_SAVE"), "save CIR in the null state: format word", 0x0000, "MC68881/2 UM 6.4.2: null state frame $0000", 4);
+	expect(G, Tg("T_RAW_TF1"), "response after condition word $000F (T): primitive high byte (null, CA=0)", 0x08, H, 2);
+	expect(G, Tg("T_RAW_TF1B"), "... TF bit", 1, "MC68881/2 UM conditional tests: T is true", 1);
+	expect(G, Tg("T_RAW_TF0H"), "response after condition word $0000 (F): primitive high byte (null, CA=0)", 0x08, H, 2);
+	expect(G, Tg("T_RAW_TF0"), "... TF bit", 0, "MC68881/2 UM conditional tests: F is false", 1);
+	expect(G, Tg("T_RAW_CMD"), "response after a command word (cpGEN not implemented): take pre-instruction exception, vector 11", 0x1C0B, H, 4);
+	expect(G, Tg("T_RAW_CMD2"), "... read once more: the exception primitive is not repeated, null/PF", 0x0802, "bridge header: a non-null primitive reads once", 4);
+	expect(G, Tg("T_RAW_DONE"), "program ran to its end", 1, "test harness", 1);
+	check_eq(G, "exceptions taken by raw accesses", 0, exlog().size(), "test harness", 1);
+	check_eq(G, "CIR cycles with BERR (service present)", 0, [] { unsigned n = 0; for (auto &c : cirs) n += c.berr; return n; }(), "bridge header", 1);
+	bus_checks("raw");
+	ddr_checks();
+	presence_checks(false);
+}
+
+static void sc_rawna()
+{
+	begin_test("raw CIR accesses (MOVES, DFC=7), no service", "t_rawna");
+	release_reset();
+	steps(4 * POLL_CLKS);
+	run_until(is_ready, 100000);
+	gw32(A_GO, 1);
+	finish_program(600000);
+	const char *G = "rawna";
+	expect(G, Tg("T_RAW_DONE"), "program ran to its end", 1, "test harness", 1);
+	check_eq(G, "CIR cycles (7 reads + 6 writes of non-refused CIRs)", 13, cirs.size(), "test harness", 2);
+	unsigned nb = 0;
+	for (auto &c : cirs) nb += c.berr;
+	check_eq(G, "CIR cycles ended in BERR (only command/condition/restore writes and the save read may)", 0, nb,
+	         "bridge header: BERR only on an instruction's first CIR access types; MC68030 UM 10", 1);
+	bus_checks("rawna");
+	ddr_checks();
+	presence_checks(false);
+}
+
+// the service disappears (MAGIC cleared) at many different moments while the
+// CPU runs FSAVE/FRESTORE back to back
+static void sc_straddle()
+{
+	begin_test("presence lost in the middle of FPU instructions", "t_straddle");
+	hb_start();
+	release_reset();
+	run_until(present, 6 * POLL_CLKS);
+	run_until(is_ready, 100000);
+	gw32(A_GO, 1);
+	steps(3000);
+	unsigned reps = 0;
+	for (; reps < 300; reps++) {
+		if (!present() && !run_until(present, 3 * POLL_CLKS)) break;
+		steps(rnd(1200) + 50);
+		mb_w16(0x000, 0);                              // service gone
+		if (!wait_fall(3 * POLL_CLKS)) break;
+		steps(rnd(250) + 10);
+		mb_w16(0x000, MAGIC);                          // service back
+		if (!wait_rise(4 * POLL_CLKS)) break;
+	}
+	check_eq("straddle", "presence loss/return cycles completed", 300, reps, "test harness", 3);
+	gw32(A_STOP, 1);
+	finish_program(60000);
+	// instructions whose CIR dialogue was cut by the loss of presence
+	unsigned straddled = 0, refused = 0, completed_after = 0;
+	for (size_t i = 0; i < cirs.size();) {
+		size_t j = i;
+		while (j < cirs.size() && cirs[j].instr == cirs[i].instr) j++;
+		if (j - i >= 2 && !cirs[i].berr && cirs[i].present) {
+			for (uint64_t f : pr_falls)
+				if (f > cirs[i].clk0 && f < cirs[j - 1].clk1) { straddled++; if (!cirs[j - 1].berr) completed_after++; break; }
+		}
+		if (cirs[i].berr) refused++;
+		i = j;
+	}
+	check_true("straddle", fmt("FPU instructions whose dialogue straddled the loss of presence: %u (all %u completed without BERR); refused at their first access: %u",
+	                          straddled, completed_after, refused),
+	           straddled >= 5 && completed_after == straddled && refused >= 5,
+	           "MC68030 UM 10: BERR only on the first CIR access means 'no coprocessor'; bridge header");
+	bus_checks("straddle");
+	ddr_checks();
+	presence_checks(false);
+}
+
+//------------------------------------------------------------------ main
+int main(int argc, char **argv)
+{
+	Verilated::commandArgs(argc, argv);
+	setvbuf(stdout, nullptr, _IOLBF, 0);
+	std::string only;
+	for (int i = 1; i < argc; i++) {
+		if (!strncmp(argv[i], "--host=", 7)) host_exe = argv[i] + 7;
+		else if (!strncmp(argv[i], "--only=", 7)) only = argv[i] + 7;
+	}
+	if (host_exe.empty()) host_exe = "obj/falcon_fpu_host";
+	char abs[4096];
+	if (host_exe[0] != '/' && getcwd(abs, sizeof abs)) host_exe = std::string(abs) + "/" + host_exe;
+	load_tags("asm/tags.i");
+	ddr.assign(DDR_SIZE, 0);
+
+	char cwd[4096];
+	if (!getcwd(cwd, sizeof cwd)) return 2;
+	mb_path = std::string(cwd) + "/obj/mailbox.bin";
+	int fd = open(mb_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0 || ftruncate(fd, MB_SIZE) != 0) { perror("mailbox file"); return 2; }
+	void *p = mmap(nullptr, MB_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) { perror("mmap"); return 2; }
+	MB = (uint8_t *)p;
+	signal(SIGPIPE, SIG_IGN);
+
+	printf("FPU bridge milestone 1 co-simulation: CLK_HZ=%u poll=%u clocks alive window=%u polls heartbeat=%u clocks\n", CLK_HZ, POLL_CLKS,
+	       ALIVE_POLLS, HB_PERIOD);
+	struct { const char *name; void (*fn)(); } sc[] = {
+	    {"detect_alive", [] { sc_detect("EmuTOS detect/service alive (C++ heartbeat)", "alive"); }},
+	    {"detect_nosvc", [] { sc_detect("EmuTOS detect/no service", "none"); }},
+	    {"detect_badmagic", [] { sc_detect("EmuTOS detect/wrong MAGIC $4651", "badmagic"); }},
+	    {"detect_hb0", [] { sc_detect("EmuTOS detect/MAGIC ok, heartbeat stuck at 0", "hb0"); }},
+	    {"detect_real", [] { sc_detect("EmuTOS detect/real falcon_fpu_host", "real"); }},
+	    {"watch_freeze", sc_watch_cpp_freeze},
+	    {"watch_magic", sc_watch_cpp_magic},
+	    {"watch_real", sc_watch_real},
+	    {"frames", sc_frames},
+	    {"cond", sc_cond},
+	    {"gen", sc_gen},
+	    {"cpid_alive", [] { sc_cpid(true); }},
+	    {"cpid_absent", [] { sc_cpid(false); }},
+	    {"absent", sc_absent},
+	    {"reset", sc_reset},
+	    {"raw", sc_raw},
+	    {"rawna", sc_rawna},
+	    {"straddle", sc_straddle},
+	};
+	for (auto &s : sc) {
+		if (!only.empty() && only != s.name) continue;
+		s.fn();
+		child_reap();
+	}
+	printf("\n== summary ==\n  checks: %d passed, %d failed\n", n_pass, n_fail);
+	for (auto &f : failed_checks) printf("  FAILED: %s\n", f.c_str());
+	printf("RESULT: %s\n", n_fail == 0 && n_pass > 0 ? "PASS" : "FAIL");
+	return n_fail == 0 && n_pass > 0 ? 0 : 1;
+}

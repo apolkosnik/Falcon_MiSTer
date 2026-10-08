@@ -34,6 +34,9 @@ read that sees the echo, and the time of one FPGA read of the mailbox.
 `-m FILE` maps a file instead of `/dev/mem`; `tb/mbox` uses it to run this
 program against the simulated RTL.
 
+The probe shares falcon_memarb's d3 port with the FPU bridge: the
+measurement core has no FPU (its bridge never sees the ARM service).
+
 ## Results (DE10-Nano, 2026-10-07, measurement core built with Quartus 17.0 Lite)
 
 10000 round trips each, microseconds:
