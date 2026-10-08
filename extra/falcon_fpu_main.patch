@@ -1,4 +1,4 @@
-From 459bdb0602e84118df269308d892c890d712715a Mon Sep 17 00:00:00 2001
+From 1c242ccdd877394fbf2e6a0cc92878ffc49999bc Mon Sep 17 00:00:00 2001
 From: Paul Kilar <pkilar@gmail.com>
 Date: Thu, 8 Oct 2026 00:01:17 -0400
 Subject: [PATCH] Falcon: run the 68882 FPU service falcon_fpu with the core
@@ -159,7 +159,7 @@ index 0000000..c786d88
 +
 +#endif
 diff --git a/user_io.cpp b/user_io.cpp
-index fc4f674..e8187eb 100644
+index 8f41625..3b5e81e 100644
 --- a/user_io.cpp
 +++ b/user_io.cpp
 @@ -28,6 +28,7 @@
@@ -170,7 +170,7 @@ index fc4f674..e8187eb 100644
  #include "game_docs.h"
  #include "video.h"
  #include "audio.h"
-@@ -1770,6 +1771,7 @@ void user_io_init(const char *path, const char *xml)
+@@ -1774,6 +1775,7 @@ void user_io_init(const char *path, const char *xml)
  
  		send_rtc(3);
  		if (is_marty() && xml && isXmlName(xml) == 2) marty_mgl_premount();

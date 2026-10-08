@@ -19,7 +19,12 @@
 //    other CPU space         bus error (breakpoint, MMU access level)
 //
 //  Decoding follows the Falcon's 24-bit address bus (A31..A24 ignored):
-//    000000-000007  reads: ROM (reset vectors), writes: RAM
+//    000000-000007  reads: ROM (reset vectors), writes: bus error.  A RAM TOS
+//                   (TOS 4.92: a 34-byte loader, then an image linked for
+//                   ST-RAM, Hatari tos.c) has loader code where the vectors
+//                   would be; for it the vectors read SSP $8000 and PC
+//                   $E00000, so the real loader copies the image to its RAM
+//                   address and jumps to it, as when booted from disk.
 //    000008-ram_top ST-RAM, above: bus error
 //    E00000-E7FFFF  ROM, read only
 //    FA0000-FBFFFF  cartridge, read only
@@ -39,6 +44,7 @@ module falcon_cpubus
 	input             reset,
 
 	input       [3:0] ram_mb,      // ST-RAM size in MB (4 or 14)
+	input             ram_tos,     // the TOS image is a RAM TOS behind its loader (TOS 4.92)
 
 	// 68030 pins
 	input      [31:0] a,
@@ -176,6 +182,13 @@ always @(posedge clk) begin
 				else finish_berr;          // breakpoint, MMU access level
 			end
 			else if (is_prot && !is_super) finish_berr;
+			else if (is_vec && !rw) finish_berr;   // SysMem_*put: the reset vectors are ROM
+			else if (is_vec && rw && ram_tos) begin
+				d_i      <= la[2] ? 32'h00E00000 : 32'h00008000;
+				dsack0_n <= 0;
+				dsack1_n <= 0;
+				st       <= S_HOLD;
+			end
 			else if ((is_vec && rw) || is_ram || ((is_rom || is_cart) && rw)) begin
 				ram_req   <= 1;
 				ram_we    <= !rw;

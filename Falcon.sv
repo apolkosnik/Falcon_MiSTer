@@ -60,6 +60,7 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[5:4]  aspect ratio
 //   status[6]    MIDI on the user port UART
 //   status[7]    cold reset (clears the warm start flag)
+//   status[8]    reset NVRAM to defaults for the selected monitor
 `include "build_id.v"
 localparam CONF_STR = {
 	"Falcon;;",
@@ -80,7 +81,13 @@ localparam CONF_STR = {
 	"-;",
 	"T[0],Reset;",
 	"T[7],Cold Reset;",
+	"T[8],Reset NVRAM;",
 	"R[0],Reset and close OSD;",
+	// Button names after every selectable entry: Main's menu counts these
+	// lines when it maps a selection back to CONF_STR but does not display
+	// them, so above an entry they shift its selection by two
+	"J,Fire/A,B,C,Pause,Option,1,2,3,4,5,6,7,8,9,*,0,#;",
+	"jn,A,B,X,Start,Select;",
 	"v,0;",
 	"V,v",`BUILD_DATE
 };
@@ -91,9 +98,14 @@ wire [127:0] status;
 wire  [10:0] ps2_key;
 wire  [24:0] ps2_mouse;
 wire  [31:0] joy0, joy1;
+wire  [15:0] ana0, ana1;
 wire  [64:0] rtc;
 
-wire        ioctl_download;
+wire        ioctl_download, ioctl_upload;
+wire  [7:0] ioctl_din;
+wire        nv_save_req, nv_busy, nv_init, nv_wr, nv_changed, nv_ready;
+wire  [5:0] nv_addr;
+wire  [7:0] nv_dout, nv_din;
 wire [15:0] ioctl_index;
 wire        ioctl_wr;
 wire [26:0] ioctl_addr;
@@ -107,6 +119,7 @@ wire        img_readonly;
 wire [63:0] img_size;
 wire [31:0] sd_lba[7];
 wire  [6:0] sd_rd, sd_wr, sd_ack;
+wire  [5:0] sd_blk_cnt[7];
 wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_dout;
 wire  [7:0] sd_buff_din[7];
@@ -126,6 +139,10 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 	.status_menumask(0),
 
 	.ioctl_download(ioctl_download),
+	.ioctl_upload(ioctl_upload),
+	.ioctl_din(ioctl_din),
+	.ioctl_upload_req(nv_save_req),
+	.ioctl_upload_index(8'd3),
 	.ioctl_index(ioctl_index),
 	.ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr),
@@ -139,6 +156,7 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
+	.sd_blk_cnt(sd_blk_cnt),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
@@ -147,6 +165,8 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 	.RTC(rtc),
 	.joystick_0(joy0),
 	.joystick_1(joy1),
+	.joystick_l_analog_0(ana0),
+	.joystick_l_analog_1(ana1),
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse)
 );
@@ -173,16 +193,38 @@ wire cart_download = ioctl_download && (ioctl_index[5:0] == 6'd2);
 reg  rom_loaded = 0;
 always @(posedge clk_sys) if (rom_download) rom_loaded <= 1;
 
+// A RAM TOS (TOS 4.92) starts with its loader: move #$2700,sr ($46FC2700).
+// Remember the first longword of the TOS download to recognise it.
+reg [31:0] rom_head = 0;
+always @(posedge clk_sys)
+	if (rom_download && ioctl_wr && ioctl_addr < 27'd4)
+		rom_head <= {rom_head[23:0], ioctl_dout};
+wire ram_tos = (rom_head == 32'h46FC2700);
+
 reg [7:0] por_cnt = 0;
 wire      por = ~&por_cnt;
 always @(posedge clk_sys) if (por && pll_locked) por_cnt <= por_cnt + 1'd1;
 
 wire cold_reset = por | status[7] | rom_download;
-wire reset      = cold_reset | RESET | status[0] | buttons[1] | ioctl_download | ~rom_loaded;
+wire reset      = cold_reset | RESET | status[0] | status[8] | buttons[1] |
+                  rom_download | cart_download | nv_busy | ~rom_loaded;
 
 wire [23:0] ld_addr = rom_download ? {5'b11100, ioctl_addr[18:0]} : {7'b1111101, ioctl_addr[16:0]};
 wire        ld_busy;
 assign ioctl_wait = ld_busy;
+
+// The controller survives machine resets and saves after one quiet second.
+// Restores hold the CPU in reset until all 50 NVRAM bytes have been applied.
+falcon_nvram_store nvram_store
+(
+	.clk(clk_sys), .defaults(status[8]),
+	.ioctl_download(ioctl_download), .ioctl_upload(ioctl_upload),
+	.ioctl_index(ioctl_index), .ioctl_addr(ioctl_addr),
+	.ioctl_wr(ioctl_wr), .ioctl_dout(ioctl_dout), .ioctl_din(ioctl_din),
+	.save_req(nv_save_req), .busy(nv_busy),
+	.nv_init(nv_init), .nv_ready(nv_ready), .nv_addr(nv_addr),
+	.nv_dout(nv_dout), .nv_din(nv_din), .nv_wr(nv_wr), .nv_changed(nv_changed)
+);
 
 ///////////////////////   SYSTEM    //////////////////////////////
 
@@ -200,6 +242,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.por(por),
 
 	.ram_mb(status[3] ? 4'd4 : 4'd14),
+	.ram_tos(ram_tos),
 	.monitor(status[2:1] == 2'd0 ? 2'b10 : status[2:1] == 2'd1 ? 2'b01 : status[2:1] == 2'd2 ? 2'b11 : 2'b00),
 
 	.ld_wr(ioctl_wr & (rom_download | cart_download)),
@@ -211,7 +254,11 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.ps2_mouse(ps2_mouse),
 	.joy0(joy0),
 	.joy1(joy1),
+	.ana0(ana0),
+	.ana1(ana1),
 	.rtc(rtc),
+	.nv_init(nv_init), .nv_ready(nv_ready), .nv_addr(nv_addr),
+	.nv_dout(nv_dout), .nv_din(nv_din), .nv_wr(nv_wr), .nv_changed(nv_changed),
 
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
@@ -220,7 +267,8 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
-	.sd_buff_addr(sd_buff_addr[8:0]),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_blk_cnt(sd_blk_cnt),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr),

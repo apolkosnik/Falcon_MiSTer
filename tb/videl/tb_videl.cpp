@@ -124,12 +124,15 @@ struct FrameRec {
 	int tb_falls, detb_diff;
 	uint64_t first_de_rise, last_de_fall;
 	std::vector<uint64_t> hbl_t, tbf_t;   // hbl pulses, de_tb falling edges
+	std::vector<int> run_pos;            // pixel clocks from hsync start to each DE run
 	int max_de, min_de, max_vis, min_vis;
 	int vruns, vrun_min, vrun_max;      // visible (non blank) runs
 	int border_err, blank_err, border_n;
 	uint64_t hs_clk; int hs_ce;         // last hsync pulse width
 	uint64_t vs_clk;                    // vsync pulse width
 	std::vector<std::vector<uint32_t>> img;
+	std::vector<std::vector<uint8_t>> msk;   // 1 = not blanked, per DE pixel
+	int vis_de_lines;                       // DE runs with at least one visible pixel
 };
 
 struct Monitor {
@@ -143,6 +146,7 @@ struct Monitor {
 	int de_rises = 0;
 	bool in_run = false;
 	std::vector<uint32_t> run;
+	std::vector<uint8_t> runv;
 	uint32_t border_rgb = 0;
 	bool in_vrun = false; int vrun = 0;
 	uint64_t hs_t0 = 0, vs_t0 = 0; int hs_ce0 = 0; bool hs_on = false, vs_on = false;
@@ -162,7 +166,10 @@ struct Monitor {
 		int n = run.size();
 		fr.max_de = std::max(fr.max_de, n);
 		fr.min_de = std::min(fr.min_de, n);
-		if (capture) fr.img.push_back(run);
+		bool any = false;
+		for (uint8_t v : runv) if (v) any = true;
+		if (any) fr.vis_de_lines++;
+		if (capture) { fr.img.push_back(run); fr.msk.push_back(runv); }
 	}
 	void reset() {
 		prev_hs = prev_vs = prev_de = false; in_line = in_frame = false; in_run = false; in_vrun = false;
@@ -230,8 +237,9 @@ struct Monitor {
 		// DE runs (one per display line), sampled on the pixel clock
 		if (top->ce_pix) {
 			if (top->de) {
-				if (!in_run) { in_run = true; run.clear(); }
+				if (!in_run) { in_run = true; run.clear(); runv.clear(); if (in_frame) fr.run_pos.push_back(in_line ? ln.ce : -1); }
 				run.push_back(((uint32_t)top->r << 16) | ((uint32_t)top->g << 8) | top->b);
+				runv.push_back(!top->hblank && !top->vblank);
 			} else end_run();
 		}
 		if (top->ce_pix && in_line) {
@@ -382,6 +390,7 @@ static const Mode modes[] = {
 	  0x0080, 0x0000, 0x0028, 0x0000, 2,   896, 32000000, 1002, 640, 400, 1, true, 0, 0 },
 };
 
+static int cyc_of(int monitor, uint16_t vco, uint16_t vmd, int bpp);
 static uint32_t g_base = 0x100000;
 static uint32_t fpal[256];      // as written (long)
 static uint16_t spal[16];
@@ -462,6 +471,7 @@ static uint32_t expect_px(const Mode &m, uint32_t la, int x, int hs, int bank)
 }
 
 // compare a captured field image with the framebuffer
+static int g_blanked;   // DE pixels found blanked by the last compare_image
 static int compare_image(const Mode &m, const FrameRec &f, uint32_t base, int hs, int bank,
                          int *checked)
 {
@@ -469,6 +479,7 @@ static int compare_image(const Mode &m, const FrameRec &f, uint32_t base, int hs
 	uint32_t stride = 2 * words;
 	int errs = 0;
 	*checked = 0;
+	g_blanked = 0;
 	for (size_t j = 0; j < f.img.size(); j++) {
 		int src = (int)j;
 		if (m.dbl) src = j / 2;
@@ -476,8 +487,17 @@ static int compare_image(const Mode &m, const FrameRec &f, uint32_t base, int hs
 		uint32_t la = base + src * stride;
 		const std::vector<uint32_t> &px = f.img[j];
 		for (size_t x = 0; x < px.size(); x++) {
-			uint32_t e = expect_px(m, la, x, (m.bpp == 16) ? 0 : hs, bank);
 			(*checked)++;
+			if (j < f.msk.size() && x < f.msk[j].size() && !f.msk[j][x]) {
+				// blanked by HBE/HBB/VBE/VBB: black
+				g_blanked++;
+				if (px[x] != 0) {
+					if (errs < 5) printf("    blanked pixel line %zu x %zu not black: %06x\n", j, x, px[x]);
+					errs++;
+				}
+				continue;
+			}
+			uint32_t e = expect_px(m, la, x, (m.bpp == 16) ? 0 : hs, bank);
 			if (px[x] != e) {
 				if (errs < 5)
 					printf("    pixel mismatch line %zu x %zu: got %06x expected %06x\n", j, x, px[x], e);
@@ -529,7 +549,7 @@ static void test_mode(const Mode &m, bool worst_latency = false)
 
 	double clk_per_base = 32000000.0 / m.base_hz;
 	double exp_line_clk = m.line_base_clocks * clk_per_base;
-	int cyc = m.monitor == MON_MONO ? 1 : ((m.vmd >> 2) & 3) == 0 ? 4 : ((m.vmd >> 2) & 3) == 1 ? 2 : 1;
+	int cyc = cyc_of(m.monitor, m.vco, m.vmd, m.bpp);
 	int exp_ce = (int)m.line_base_clocks / cyc;
 
 	size_t f0 = mon.frames.size() - nf;
@@ -649,7 +669,7 @@ static void test_registers()
 	ww(0xFF8264, 0x0A05);
 	check(rw(0xFF8264) == 0x0A05, "$8264/$8265 read back: %04x", rw(0xFF8264));
 	ww(0xFF82C0, 0x0184);
-	check(rw(0xFF82C0) == 0x0186, "VCO bits 1:0 read the monitor type (VGA=10): %04x", rw(0xFF82C0));
+	check(rw(0xFF82C0) == 0x0184, "VCO reads back the written value incl. bits 1:0 (Hatari): %04x", rw(0xFF82C0));
 	static const uint32_t regs[] = {0xFF8282,0xFF8284,0xFF8286,0xFF8288,0xFF828A,0xFF828C,0xFF828E,0xFF8290,
 	                                0xFF82A2,0xFF82A4,0xFF82A6,0xFF82A8,0xFF82AA,0xFF82AC,0xFF82C2,0xFF8266};
 	bool ok = true;
@@ -806,6 +826,84 @@ static void test_hscroll(int mi, int hs, int bank)
 	check(errs0 > 0, "image differs from the unscrolled decode (%d differences)", errs0);
 }
 
+// "1600 x 600" (Archangel, 1993; the user's hardware report): XBIOS
+// Vsetmode($00A2) (RGB ST low), then the program's own writes, in its order
+// (disassembly at text+$2E2): VMD |= $0A (interlace, one dot per pixel),
+// $8210 = 400 words, VFT $270, VSS $26A, VBB $26C, VBE $F, VDB $F,
+// VDE $26A, HDB $23D, HDE $2E.  Screen base $027B54 (Hatari trace): four
+// bytes into a 64-bit word.  Hatari shows 1602x605 at 4 bitplanes with the
+// ST palette; every DE pixel must decode from its own line.
+static void test_1600x600(bool worst_latency)
+{
+	printf("\n== 1600 x 600 demo mode (RGB, ST low + VMD $0A, $8210 = 400)%s ==\n",
+	       worst_latency ? " [40-clock bursts]" : "");
+	const Mode &st = modes[7];          // RGB ST low 320x200 (Vsetmode $00A2)
+	do_reset(st.monitor);
+	mem.fixed_worst = worst_latency;
+	mon.hs_pol = false; mon.vs_pol = false;
+	uint32_t base = 0x027B54;
+	fill_ram(base & ~0xFFFu, 520000, 1600);
+	set_palettes(600);
+	program_mode(st, base);
+	ww(0xFF82C2, rw(0xFF82C2) | 0x000A);
+	ww(0xFF8210, 400);
+	ww(0xFF82A2, 0x0270); ww(0xFF82AC, 0x026A); ww(0xFF82A4, 0x026C); ww(0xFF82A6, 0x000F);
+	ww(0xFF82A8, 0x000F); ww(0xFF82AA, 0x026A); ww(0xFF8288, 0x023D); ww(0xFF828A, 0x002E);
+	mon.border_rgb = ste_rgb(spal[0]);
+	mon.capture = true;
+	bool ok = run_frames(1, 8000000) && run_frames(4, 32000000);
+	check(ok, "frames produced");
+	if (!ok) return;
+	Mode m = st;
+	m.lwd = 400; m.vmd = 0x000A; m.ilace = 1; m.width = 1600;
+	for (size_t k = mon.frames.size() - 4; k < mon.frames.size(); k++) {
+		const FrameRec &f = mon.frames[k];
+		check(f.min_de == 1600 && f.max_de == 1600, "field %zu: active pixels per line %d..%d, expected 1600",
+		      k, f.min_de, f.max_de);
+		check(f.de_lines >= 300 && f.de_lines <= 303, "field %zu: %d active lines (Hatari: 605 per frame)",
+		      k, f.de_lines);
+		check(f.underruns == 0, "field %zu: no line buffer underrun (%d)", k, f.underruns);
+		if (getenv("DIAG1600") && f.img.size() > 2) {
+			for (int j = 0; j < 2; j++) {
+				int best = -1, bsrc = 0, boff = 0;
+				for (int src = 0; src < 6; src++)
+					for (int off = -16; off <= 16; off++) {
+						int match = 0;
+						uint32_t la = base + src * 800 + 2 * off;
+						for (int x = 0; x < 1600; x++) if (f.img[j][x] == expect_px(m, la, x, 0, 0)) match++;
+						if (match > best) { best = match; bsrc = src; boff = off; }
+					}
+				printf("    DIAG field %zu line %d: best source line %d, word offset %d, %d of 1600 match\n", k, j, bsrc, boff, best);
+				// where along the line does the best fit hold
+				uint32_t la = base + bsrc * 800 + 2 * boff;
+				int first_ok = -1, last_bad = -1;
+				for (int x = 0; x < 1600; x++) { bool ok = f.img[j][x] == expect_px(m, la, x, 0, 0); if (ok && first_ok < 0) first_ok = x; if (!ok) last_bad = x; }
+				printf("    DIAG   first match x %d, last mismatch x %d\n", first_ok, last_bad);
+			}
+			int par = -1;
+			for (int pp = 0; pp < 2; pp++) {
+				uint32_t la = base + pp * 800;
+				int mt = 0; for (int x = 0; x < 1600; x++) if (f.img[1][x] == expect_px(m, la, x, 0, 0)) mt++;
+				if (mt == 1600) par = pp;
+			}
+			long bad = 0; int badlines = 0, minx = 1600, maxx = -1;
+			for (size_t j = 1; j < f.img.size(); j++) {
+				uint32_t la = base + (2 * (j - 1) + par) * 800;
+				int lb = 0;
+				for (int x = 0; x < 1600; x++) if (f.img[j][x] != expect_px(m, la, x, 0, 0)) { lb++; minx = std::min(minx, x); maxx = std::max(maxx, x); }
+				bad += lb; if (lb) badlines++;
+			}
+			printf("    DIAG field %zu parity %d: lines 1..%zu shifted by one: %ld bad pixels in %d lines (x %d..%d)\n",
+			       k, par, f.img.size() - 1, bad, badlines, minx, maxx);
+		}
+		int checked = 0;
+		int errs = compare_image(m, f, base, 0, 0, &checked);
+		check(errs == 0 && checked == 1600 * f.de_lines,
+		      "field %zu (%s): pixel colours match the framebuffer (%d pixels checked, %d errors)",
+		      k, f.field ? "odd" : "even", checked, errs);
+	}
+}
+
 // register writes in the middle of a frame / line are latched
 static void test_latching()
 {
@@ -826,16 +924,22 @@ static void test_latching()
 	while (mon.de_rises < 100) tick();
 	ticks(300);    // inside DE
 	size_t fidx = mon.frames.size();
-	ww(0xFF828A, m.t[4] - 16);          // HDE - 16 units = 32 pixels less
+	ww(0xFF8288, m.t[3] - 16);          // HDB - 16 units = DE 32 pixels earlier
 	wb(0xFF8201, (base2 >> 16) & 0xFF); wb(0xFF8203, (base2 >> 8) & 0xFF); wb(0xFF820D, base2 & 0xFF);
 	run_frames(1, 3000000);
 	const FrameRec &f = mon.frames[fidx];
-	int full = 0, cut = 0, other = 0;
-	for (size_t j = 0; j < f.img.size(); j++) {
-		if (f.img[j].size() == 640) full++; else if (f.img[j].size() == 608) cut++; else other++;
+	// The horizontal registers are latched at the start of each output line;
+	// the DE start position comes from the parameters of the output line it
+	// lands in, so the write made inside the line of display line 100 moves
+	// display line 101 on by 32 pixel clocks.  The width stays $8210 (640).
+	int p0 = f.run_pos.size() ? f.run_pos[0] : -1, same = 0, moved = 0, other = 0, w640 = 0;
+	for (size_t j = 0; j < f.run_pos.size(); j++) {
+		if (f.run_pos[j] == p0) same++; else if (f.run_pos[j] == p0 - 32) moved++; else other++;
+		if (j < f.img.size() && f.img[j].size() == 640) w640++;
 	}
-	check(full == 100 && cut == 380 && other == 0,
-	      "HDE write inside line 100 takes effect from line 101: %d lines of 640, %d of 608, %d other", full, cut, other);
+	check(same == 100 && moved == 380 && other == 0 && w640 == 480,
+	      "HDB write inside line 100 moves DE from line 101 on: %d lines at %d, %d at %d, %d other, %d of width 640",
+	      same, p0, moved, p0 - 32, other, w640);
 	// the rest of this frame still shows the old base
 	int checked = 0;
 	Mode m2 = m;
@@ -845,26 +949,31 @@ static void test_latching()
 	check(errs == 0, "lines before the change from the old base (%d errors)", errs);
 	FrameRec rest = f;
 	rest.img.erase(rest.img.begin(), rest.img.begin() + 100);
-	int errs_old = 0, n = 0;
+	// the moved DE starts 32 dots before HBE: those pixels are blanked (black)
+	int errs_old = 0, n = 0, nblank = 0;
 	for (size_t j = 0; j < rest.img.size(); j++) {
 		uint32_t la = base + (100 + j) * 2 * m.lwd;
 		for (size_t x = 0; x < rest.img[j].size(); x++) {
 			n++;
+			if (!rest.msk[100 + j][x]) { nblank++; if (rest.img[j][x] != 0) errs_old++; continue; }
 			if (rest.img[j][x] != expect_px(m, la, x, 0, 0)) errs_old++;
 		}
 	}
-	check(errs_old == 0 && n > 0, "screen base change does not affect the current frame (%d errors in %d px)", errs_old, n);
+	check(errs_old == 0 && n > 0 && nblank == 32 * 380,
+	      "screen base change does not affect the current frame (%d errors in %d px, %d blanked before HBE)", errs_old, n, nblank);
 	run_frames(1, 3000000);
 	const FrameRec &g = mon.frames.back();
-	int errs2 = 0; n = 0;
+	int errs2 = 0; n = 0; nblank = 0;
 	for (size_t j = 0; j < g.img.size(); j++) {
 		uint32_t la = base2 + j * 2 * m.lwd;
 		for (size_t x = 0; x < g.img[j].size(); x++) {
 			n++;
+			if (!g.msk[j][x]) { nblank++; if (g.img[j][x] != 0) errs2++; continue; }
 			if (g.img[j][x] != expect_px(m, la, x, 0, 0)) errs2++;
 		}
 	}
-	check(errs2 == 0 && n == 608 * 480, "next frame uses the new base (%d errors in %d px)", errs2, n);
+	check(errs2 == 0 && n == 640 * 480 && nblank == 32 * 480,
+	      "next frame uses the new base (%d errors in %d px, %d blanked before HBE)", errs2, n, nblank);
 }
 
 // mid-line timing writes must not glitch hsync inside the line
@@ -1001,6 +1110,390 @@ static void test_timerb()
 	check(bad == 0 && k >= 199, "COLOR00 written at the k-th de_tb fall first shows on output line 2k (%d wrong of 400, %d events)", bad, k);
 }
 
+//---------------------------------------------------------------------------
+// Register sets replayed from Hatari (TOS 4.04 Vsetmode modes)
+//---------------------------------------------------------------------------
+struct HSet {
+	const char *name; int monitor, stpal, s8260; uint16_t spshift, lwd, vco, vmd; uint16_t t[12];
+	int hw, hh, hbpp;
+};
+static const HSet hsets[] = {
+#include "hatari_modes.inc"
+};
+
+// dots per pixel (the RTL rule): VMD bits 3:2 4/2/1; one on a mono
+// monitor; VGA true colour 2 unless VMD bit 3 (124 Beers Later, VMD=1)
+static int cyc_of(int monitor, uint16_t vco, uint16_t vmd, int bpp)
+{
+	if (monitor == MON_MONO) return 1;
+	bool vga = monitor == MON_VGA || (vco & 3) == 2;
+	if (bpp == 16 && vga) return (vmd & 8) ? 1 : 2;
+	int v = (vmd >> 2) & 3;
+	return v == 0 ? 4 : v == 1 ? 2 : 1;
+}
+// Hatari VIDEL_getScreenBpp
+static int bpp_of(uint16_t spshift, int stpal, int s8260)
+{
+	if (spshift & 0x400) return 1;
+	if (spshift & 0x100) return 16;
+	if (spshift & 0x010) return 8;
+	if (!stpal) return 4;
+	return (s8260 & 3) == 0 ? 4 : (s8260 & 3) == 1 ? 2 : 1;
+}
+
+// horizontal unit in base clocks (dots), the RTL rule: 16 in ST mode with
+// ST timing; true colour counts pixel periods (prescaler 1); VGA bitplanes
+// 4 (VMD[3:2]=00) or 2; otherwise the cycles per pixel
+static int unit_of(int monitor, uint16_t vco, uint16_t vmd, int bpp, int stpal, uint16_t hht)
+{
+	if (stpal && (hht & 0x1ff) < 0x50) return 16;
+	int cyc = cyc_of(monitor, vco, vmd, bpp);
+	bool vga = monitor == MON_VGA || (vco & 3) == 2;
+	if (bpp == 16) return cyc;
+	return vga ? (((vmd >> 2) & 3) == 0 ? 4 : 2) : cyc;
+}
+
+// program a register set in the order TOS (EmuTOS Vsetmode, traced in
+// Hatari) writes it: timing, $820E, $8210, $82C2, $82C0, $8266, $8260
+static void program_set(const uint16_t *t, uint16_t lwd, uint16_t vmd, uint16_t vco, uint16_t spshift,
+                        int s8260, uint32_t base)
+{
+	static const uint32_t ta[12] = {0xFF8282,0xFF8284,0xFF8286,0xFF8288,0xFF828A,0xFF828C,
+	                                0xFF82A2,0xFF82A4,0xFF82A6,0xFF82A8,0xFF82AA,0xFF82AC};
+	for (int i = 0; i < 12; i++) ww(ta[i], t[i]);
+	ww(0xFF820E, 0);
+	ww(0xFF8210, lwd);
+	ww(0xFF82C2, vmd);
+	ww(0xFF82C0, vco);
+	ww(0xFF8266, spshift);
+	if (s8260 >= 0) {
+		wb(0xFF8260, s8260);
+		ww(0xFF8210, lwd);      // final values as Hatari holds them
+		ww(0xFF82C2, vmd);
+	}
+	wb(0xFF8201, (base >> 16) & 0xFF);
+	wb(0xFF8203, (base >> 8) & 0xFF);
+	wb(0xFF820D, base & 0xFF);
+}
+
+// measure two fields and check DE size, lines, Timer B, VBL and pixels
+// against Hatari's XSize/YSize; returns the number of failed checks
+// DE start of a display line in dots from the line start, as the header
+// documents it (HDB position + base + body + D), before the modulo
+static int de_start_raw(const uint16_t *t, int bpp, int stpal, int cyc, int D, uint16_t vco, uint16_t vmd, int *L)
+{
+	int H = (t[0] & 0x1ff) + 2;
+	*L = 2 * H * D;
+	int hdb = t[3];
+	int pos_hdb = ((hdb & 0x200) ? H * D : 0) + (hdb & 0x1ff) * D;
+	bool tc1 = bpp == 16 && cyc == 1 && !stpal;
+	int base = stpal ? ((vco & 0x100) ? 128 : 192) : tc1 ? 0 : ((vco & 0x100) ? 64 : 128);
+	int body = stpal ? (128 / bpp + 2) * cyc : (bpp == 16 ? 16 * cyc : (128 / bpp + 18) * cyc);
+	(void)vmd;
+	return pos_hdb + base + body + D;
+}
+
+// display and visible lines of a field from the register semantics: output
+// line j starts at VFC v = 2j + ph; it holds a display line when the HDB
+// that starts it (second half line if HDB bit 9, the previous line if the DE
+// start wraps) saw VDB <= VFC < VDE; it is blanked when v >= VBB or v < VBE
+// (VBE 11-bit signed, sampled at the line start)
+static void expect_lines(const uint16_t *t, int wrap, int ph, int *de_lines, int *vis_lines)
+{
+	int vft = t[6] & 0x7ff, vbb = t[7] & 0x7ff, vbe = t[8] & 0x7ff, vdb = t[9] & 0x7ff, vde = t[10] & 0x7ff;
+	bool vbe_neg = vbe & 0x400;
+	int b9 = (t[3] & 0x200) ? 1 : 0;
+	*de_lines = 0; *vis_lines = 0;
+	for (int v = ph; v <= vft; v += 2) {
+		int h = v + b9 - 2 * wrap;
+		if (h < vdb || h >= vde) continue;
+		(*de_lines)++;
+		bool blank = (v >= vbb) || (!vbe_neg && v < vbe);
+		if (!blank) (*vis_lines)++;
+	}
+}
+
+static int check_fields(const char *name, int monitor, const uint16_t *t,
+                        uint16_t lwd, uint16_t vmd, uint16_t spshift, int stpal, int s8260,
+                        uint32_t base, int D, double *frame_clk, uint16_t vco)
+{
+	int fails0 = n_fail;
+	uint16_t hht = t[0], vdb = t[9], vde = t[10], vft = t[6];
+	// field period: (VFT+1) half lines of (HHT+2)*D dots at the VCO clock
+	double exp_frame = vft ? (vft + 1) * (double)((hht & 0x1ff) + 2) * D * (32000000.0 / ((vco & 4) ? 25175000.0 : 32000000.0)) : 0;
+	int bpp = bpp_of(spshift, stpal, s8260);
+	int cyc = cyc_of(monitor, vco, vmd, bpp);
+	int xs = (lwd & 0x3ff) * 16 / bpp;                  // Hatari XSize
+	int Lx, raw = de_start_raw(t, bpp, stpal, cyc, D, vco, vmd, &Lx);
+	int wrap = raw >= Lx ? 1 : 0;
+	int del0, vis0, del1, vis1;
+	expect_lines(t, wrap, 0, &del0, &vis0);
+	expect_lines(t, wrap, 1, &del1, &vis1);
+	bool two_ph = ((vft & 0x7ff) + 1) & 1;             // odd number of half lines: fields alternate
+	if (monitor == MON_MONO) { vis0 = del0; vis1 = del1; }   // SM124: no blank, the display window is the visible line
+	int ysh = (vde & 0x7ff) - (vdb & 0x7ff);
+	int ys = ysh; if (!(vmd & 2)) ys >>= 1; if (vmd & 1) ys >>= 1;   // Hatari YSize
+	bool il = vmd & 2, dbl = vmd & 1;
+	int exp_lines = il ? ys / 2 : ys * (dbl ? 2 : 1);   // DE lines per field
+	int exp_tb = il ? ys / 2 : ys;                      // Timer B events per field
+	// width clipped to the line length (RTL rule): L = 2*(HHT+2)*D base clocks
+	int L = 2 * ((hht & 0x1ff) + 2) * D;
+	int px_max = (L - cyc) / cyc;
+	int exp_w = std::min(xs, px_max);
+	mon.capture = true;
+	size_t f0 = mon.frames.size();
+	bool ok = run_frames(1, 6000000) && run_frames(2, 12000000);
+	check(ok, "%s: fields produced", name);
+	if (!ok) return n_fail - fails0;
+	Mode m = {};
+	m.name = name; m.lwd = lwd & 0x3ff; m.bpp = bpp; m.stpal = stpal && bpp != 16; m.dbl = dbl; m.ilace = il;
+	for (size_t k = f0 + 1; k < mon.frames.size(); k++) {
+		const FrameRec &f = mon.frames[k];
+		int checked = 0;
+		int errs = compare_image(m, f, base, 0, (bpp == 4 && !stpal) ? (spshift & 15) : 0, &checked);
+		bool okw = f.min_de == exp_w && f.max_de == exp_w;
+		bool vis_ok = two_ph ? (f.vis_de_lines == vis0 || f.vis_de_lines == vis1) : (f.vis_de_lines == vis0);
+		bool del_ok = two_ph ? (del0 == exp_lines || del1 == exp_lines) : (del0 == exp_lines);
+		check(okw && f.de_lines == exp_lines && f.tb_falls == exp_tb && f.vbl == 1 && errs == 0 &&
+		      checked == exp_w * exp_lines && f.underruns == 0 && vis_ok && del_ok,
+		      "%s field %zu: DE %d..%d px x %d lines (Hatari %dx%d%s -> expected %d x %d), %d unblanked lines (exp %d%s), Timer B %d (exp %d), VBL %d, %d px checked (%d blanked), %d errors",
+		      name, k - f0 - 1, f.min_de, f.max_de, f.de_lines, xs, ys, exp_w < xs ? ", clipped to the line" : "",
+		      exp_w, exp_lines, f.vis_de_lines, vis0, two_ph ? "/alt field" : "", f.tb_falls, exp_tb, f.vbl, checked, g_blanked, errs);
+		if (frame_clk) *frame_clk = (double)f.clocks;
+		if (exp_frame > 0)
+			check(std::fabs((double)f.clocks - exp_frame) <= 1.0, "%s field %zu: period %llu clocks, expected %.2f",
+			      name, k - f0 - 1, (unsigned long long)f.clocks, exp_frame);
+	}
+	return n_fail - fails0;
+}
+
+static void test_hatari_sets(bool worst)
+{
+	printf("\n== Hatari register sets of all TOS 4.04 Vsetmode modes + 124 Beers Later sets%s ==\n",
+	       worst ? " [every burst 40 clocks]" : " [bursts 6..36 clocks random]");
+	int nfail = 0;
+	for (const HSet &h : hsets) {
+		do_reset(h.monitor);
+		mem.fixed_worst = worst;
+		mon.hs_pol = (h.vco >> 6) & 1; mon.vs_pol = (h.vco >> 5) & 1;
+		uint32_t base = 0x100000;
+		fill_ram(base, 1000000, 5000 + h.vmd + h.lwd);
+		set_palettes(6000 + h.lwd);
+		program_set(h.t, h.lwd, h.vmd, h.vco, h.spshift, h.stpal ? h.s8260 : -1, base);
+		uint16_t lw = rw(0xFF8210), vm = rw(0xFF82C2), vc = rw(0xFF82C0);
+		bool regs_ok = lw == h.lwd && vm == h.vmd && vc == h.vco;
+		if (!regs_ok) {
+			check(false, "%s: registers after the TOS write order $8210 %04x $82C2 %04x $82C0 %04x (Hatari %04x %04x %04x)",
+			      h.name, lw, vm, vc, h.lwd, h.vmd, h.vco);
+			nfail++;
+		}
+		// horizontal unit (RTL rule): 16 for ST mode with ST timing, else
+		// VGA divider (VGA monitor or VCO=VGA) 4/2, else cycles per pixel
+		int D = unit_of(h.monitor, h.vco, h.vmd, bpp_of(h.spshift, h.stpal, h.s8260), h.stpal, h.t[0]);
+		nfail += check_fields(h.name, h.monitor, h.t, h.lwd, h.vmd, h.spshift, h.stpal,
+		                      h.s8260, base, D, nullptr, h.vco) ? 1 : 0;
+	}
+	check(nfail == 0, "all %zu register sets: DE size = Hatari XSize x YSize, period, pixels, no underrun (%d sets failing)",
+	      sizeof(hsets) / sizeof(hsets[0]), nfail);
+	mem.fixed_worst = false;
+}
+
+// the demo's 640x240 true colour set: DE position [HBE, HBB) and the
+// visible line
+static void test_beers_tc640()
+{
+	printf("\n== 124 Beers Later 640x240 true colour: DE position ==\n");
+	const HSet *h = nullptr;
+	for (const HSet &x : hsets) if (!strcmp(x.name, "beers_tc640")) h = &x;
+	do_reset(h->monitor);
+	mon.hs_pol = mon.vs_pol = false;
+	program_set(h->t, h->lwd, h->vmd, h->vco, h->spshift, -1, 0x100000);
+	mon.capture = true;
+	run_frames(1, 6000000);
+	run_frames(1, 6000000);
+	const FrameRec &f = mon.frames.back();
+	// DE begins HBE dots after the hsync end = line start: (HBE+1)... the
+	// line record counts pixel clocks (1 dot) from the hsync start (HSS,
+	// second half): HSS -> line end = 800 - (400 + 0x12E) = 98 dots
+	int exp_pos = 98 + 0x2D;
+	int bad = 0;
+	for (int p : f.run_pos) if (p != exp_pos) bad++;
+	check(f.run_pos.size() == 480 && bad == 0, "DE starts %d dots after hsync start on all %zu lines (expected %d = 98 + HBE)",
+	      f.run_pos.size() ? f.run_pos[0] : -1, f.run_pos.size(), exp_pos);
+	check(f.vrun_min == 640 && f.vrun_max == 640 && f.vruns == 480,
+	      "visible line %d..%d px x %d lines = HBB - HBE = 640 (DE inside the blank window)", f.vrun_min, f.vrun_max, f.vruns);
+	check(f.hs_ce == 98, "hsync width %d dots, expected 98", f.hs_ce);
+}
+
+// $8260 written while a Falcon mode is active (Hatari: only $8210, $82C2
+// and the palette change): the line/frame timing stays, the picture is the
+// ST resolution with the ST palette
+static void test_8260_from_falcon()
+{
+	printf("\n== $8260 written in a Falcon mode ==\n");
+	// TOS 4.04 register sets (EmuTOS tables, see the header)
+	static const Mode rgb320x16 = { "RGB 320x200x16 (Vsetmode $0022)", MON_RGB, 0x0022,
+	  {0x00fe,0x00cb,0x0027,0x000c,0x006d,0x00d8, 0x0271,0x0265,0x002f,0x007f,0x020f,0x026b},
+	  0x0181, 0x0000, 0x0050, 0x0000, -1, 2048, 32000000, 626, 320, 200, 4, false, 0, 0 };
+	static const Mode rgb640x16 = { "RGB 640x200x16 (Vsetmode $002A)", MON_RGB, 0x002A,
+	  {0x01fe,0x0199,0x0050,0x004d,0x00fe,0x01b2, 0x0271,0x0265,0x002f,0x007f,0x020f,0x026b},
+	  0x0181, 0x0004, 0x00A0, 0x0000, -1, 2048, 32000000, 626, 640, 200, 4, false, 0, 0 };
+	// true colour stays true colour: Hatari keeps $8266 and bpp from it
+	// takes priority (VIDEL_getScreenBpp), so the width is $8210 = 80 px
+	const Mode *list[5] = {&rgb320x16, &modes[0], &rgb640x16, &modes[5], &modes[8]};
+	for (const Mode *mp : list) {
+		const Mode &m = *mp;
+		for (int st = 0; st <= 2; st++) {
+			do_reset(m.monitor);
+			mon.hs_pol = mon.vs_pol = false;
+			uint32_t base = 0x100000;
+			fill_ram(base, 700000, 700 + st);
+			set_palettes(800 + st);
+			program_mode(m, base);
+			run_frames(2, 6000000);
+			double before = (double)mon.frames.back().clocks;
+			wb(0xFF8260, st);
+			uint16_t lwd = rw(0xFF8210), vmd = rw(0xFF82C2);
+			char name[96];
+			snprintf(name, sizeof name, "%s + $8260=%d ($8210=%04x $82C2=%04x)", m.name, st, lwd, vmd);
+			double after = 0;
+			// the unit stays the one of the Falcon mode
+			int D = unit_of(m.monitor, m.vco, m.vmd, m.bpp, 0, m.t[0]);
+			check_fields(name, m.monitor, m.t, lwd, vmd, m.spshift, 1, st, base, D, &after, m.vco);
+			check(std::fabs(after - before) <= 1.0, "%s: field period %.0f clocks unchanged (was %.0f)", name, after, before);
+		}
+	}
+}
+
+// VBL exactly once per field whatever VBB/VBE/VDE say
+static void test_vbl_edge()
+{
+	printf("\n== VBL without a vertical blank edge ==\n");
+	struct { const char *name; int mon; uint16_t t[12]; uint16_t lwd, vco, vmd; int st; } sets[] = {
+		{ "RGB 320x200x16, VBE=0 VBB=$300 (> VFT)", MON_RGB,
+		  {0x00fe,0x00cb,0x0027,0x000c,0x006d,0x00d8, 0x0271,0x0300,0x0000,0x007f,0x020f,0x026b}, 0x50, 0x181, 0, -1 },
+		{ "RGB 320x200x16, VBB=VBE=0", MON_RGB,
+		  {0x00fe,0x00cb,0x0027,0x000c,0x006d,0x00d8, 0x0271,0x0000,0x0000,0x007f,0x020f,0x026b}, 0x50, 0x181, 0, -1 },
+		{ "RGB 320x200x16, VBE=$10 VBB=$300", MON_RGB,
+		  {0x00fe,0x00cb,0x0027,0x000c,0x006d,0x00d8, 0x0271,0x0300,0x0010,0x007f,0x020f,0x026b}, 0x50, 0x181, 0, -1 },
+		{ "SM124, VDE=$3FF (> VFT)", MON_MONO,
+		  {0x001a,0x0000,0x0000,0x020f,0x000c,0x0014, 0x03e9,0x0000,0x0000,0x0043,0x03ff,0x03e7}, 0x28, 0x080, 0, 2 },
+	};
+	for (auto &s : sets) {
+		do_reset(s.mon);
+		mon.hs_pol = mon.vs_pol = false;
+		program_set(s.t, s.lwd, s.vmd, s.vco, 0, s.st, 0x100000);
+		run_frames(1, 6000000);
+		run_frames(4, 24000000);
+		int bad = 0;
+		for (size_t k = mon.frames.size() - 4; k < mon.frames.size(); k++) if (mon.frames[k].vbl != 1) bad++;
+		check(bad == 0 && mon.frames.size() >= 5, "%s: one VBL per field over 4 fields (%d fields wrong)", s.name, bad);
+	}
+}
+
+// 124 Beers Later curtain scene (320x240 true colour, VDB $3F, VDE $3FF,
+// VFT $419): per frame VBB/VBE pairs cut the picture vertically, VBE
+// 'negative' (bit 10 set) leaves the top fully open; HBE/HBB cut it
+// horizontally.  Blanked pixels are black, DE and Timer B run the full
+// window.
+static void test_curtain()
+{
+	printf("\n== 124 Beers Later curtain: VBB/VBE and HBE/HBB cut the picture ==\n");
+	const HSet *h = nullptr;
+	for (const HSet &x : hsets) if (!strcmp(x.name, "beers_tc320v1")) h = &x;
+	struct { uint16_t vbb, vbe; const char *what; } vs[] = {
+		{ 0x243, 0x4D, "closing" }, { 0x1D9, 0xB7, "nearly closed" }, { 0x239, 0x57, "opening" },
+		{ 0x3CD, 0xFEC3, "open past the top, bottom cut" }, { 0x3FF, 0xFE91, "fully open" },
+	};
+	int bpp = 16, cyc = cyc_of(h->monitor, h->vco, h->vmd, bpp), D = unit_of(h->monitor, h->vco, h->vmd, bpp, 0, h->t[0]);
+	for (auto &c : vs) {
+		do_reset(h->monitor);
+		mon.hs_pol = mon.vs_pol = false;
+		uint32_t base = 0x100000;
+		fill_ram(base, 400000, 4242);
+		set_palettes(4343);
+		uint16_t t[12]; memcpy(t, h->t, sizeof t);
+		t[7] = c.vbb; t[8] = c.vbe;
+		program_set(t, h->lwd, h->vmd, h->vco, h->spshift, -1, base);
+		mon.capture = true;
+		run_frames(1, 6000000);
+		run_frames(1, 6000000);
+		const FrameRec &f = mon.frames.back();
+		// expected: display line k is in the output line starting at VFC
+		// VDB+1+2k (HDB in the second half line, DE in the next line)
+		int Lx, raw = de_start_raw(t, bpp, 0, cyc, D, h->vco, h->vmd, &Lx);
+		int wrap = raw >= Lx;
+		int del, vis; expect_lines(t, wrap, 0, &del, &vis);
+		int vbe_s = (c.vbe & 0x400) ? (int)(c.vbe & 0x7ff) - 0x800 : (c.vbe & 0x7ff);
+		int first = -1, last = -1, partial = 0;
+		for (size_t j = 0; j < f.msk.size(); j++) {
+			int nv = 0; for (uint8_t v : f.msk[j]) nv += v;
+			if (nv && first < 0) first = j;
+			if (nv) last = j;
+		}
+		int v0 = (t[9] & 0x7ff) + 1;     // VFC at the start of display line 0's output line
+		int exp_first = 0; while (exp_first < del && v0 + 2 * exp_first < vbe_s) exp_first++;
+		int exp_last = del - 1; while (exp_last >= 0 && v0 + 2 * exp_last >= (int)c.vbb) exp_last--;
+		// horizontally the set's HDB ($2BA, 14 past TOS's $2AC) puts the DE
+		// 28 dots right of HBE, so the last 14 pixels of every line are
+		// past HBB: a visible line shows hvis pixels, a blanked line none
+		int deon = raw % Lx, H = (t[0] & 0x1ff) + 2;
+		int pos_hbe = t[2] * D, pos_hbb = H * D + t[1] * D;
+		int hf = 0; while (hf < 320 && deon + cyc * hf < pos_hbe) hf++;
+		int hl = 319; while (hl >= 0 && deon + cyc * hl >= pos_hbb) hl--;
+		int hvis = hl - hf + 1;
+		for (size_t j = 0; j < f.msk.size(); j++) {
+			int nv = 0; for (uint8_t v : f.msk[j]) nv += v;
+			int exp_nv = ((int)j >= exp_first && (int)j <= exp_last) ? hvis : 0;
+			if (nv != exp_nv) partial++;
+		}
+		int checked = 0;
+		Mode m = {}; m.lwd = h->lwd; m.bpp = 16; m.dbl = 1;
+		int errs = compare_image(m, f, base, 0, 0, &checked);
+		check(f.de_lines == del && f.tb_falls == 240 && first == exp_first && last == exp_last && partial == 0 &&
+		      f.vis_de_lines == vis && errs == 0,
+		      "VBB=$%03X VBE=$%04X (%s): %d DE lines, Timer B %d, display lines %d..%d visible (expected %d..%d = VFC %d..%d, %d lines, %d px each), %d lines with another count, %d px (%d blanked, %d errors)",
+		      c.vbb, c.vbe, c.what, f.de_lines, f.tb_falls, first, last, exp_first, exp_last,
+		      v0 + 2 * exp_first, v0 + 2 * exp_last, vis, hvis, partial, checked, g_blanked, errs);
+	}
+	// horizontal curtain: HBE/HBB sweep midpoint $53/$53 vs TOS $15/$8D
+	struct { uint16_t hbe, hbb; } hs2[] = { {0x15, 0x8D}, {0x53, 0x53}, {0x18, 0x96} };
+	for (auto &c : hs2) {
+		do_reset(h->monitor);
+		mon.hs_pol = mon.vs_pol = false;
+		uint32_t base = 0x100000;
+		fill_ram(base, 400000, 4545);
+		set_palettes(4646);
+		uint16_t t[12]; memcpy(t, h->t, sizeof t);
+		t[2] = c.hbe; t[1] = c.hbb;
+		program_set(t, h->lwd, h->vmd, h->vco, h->spshift, -1, base);
+		mon.capture = true;
+		run_frames(1, 6000000);
+		run_frames(1, 6000000);
+		const FrameRec &f = mon.frames.back();
+		int Lx, raw = de_start_raw(t, bpp, 0, cyc, D, h->vco, h->vmd, &Lx);
+		int deon = raw % Lx;                       // DE start dot (register positions)
+		int H = (t[0] & 0x1ff) + 2;
+		int pos_hbe = c.hbe * D, pos_hbb = H * D + c.hbb * D;
+		// pixel i is at dot deon + cyc*i; visible when pos_hbe <= dot < pos_hbb
+		int exp_first = 0; while (exp_first < 320 && deon + cyc * exp_first < pos_hbe) exp_first++;
+		int exp_last = 319; while (exp_last >= 0 && deon + cyc * exp_last >= pos_hbb) exp_last--;
+		int bad = 0, first = -1, last = -1;
+		for (size_t j = 0; j < f.msk.size(); j++) {
+			int fi = -1, la = -1;
+			for (size_t x = 0; x < f.msk[j].size(); x++) if (f.msk[j][x]) { if (fi < 0) fi = x; la = x; }
+			if (j == 0) { first = fi; last = la; }
+			if (fi != exp_first || la != exp_last) bad++;
+		}
+		int checked = 0;
+		Mode m = {}; m.lwd = h->lwd; m.bpp = 16; m.dbl = 1;
+		int errs = compare_image(m, f, base, 0, 0, &checked);
+		check(f.de_lines == 480 && f.min_de == 320 && f.max_de == 320 && bad == 0 && errs == 0,
+		      "HBE=$%02X HBB=$%02X: DE %d px x %d lines, visible pixels %d..%d on all lines (expected %d..%d from dots %d..%d, DE from %d), %d lines off, %d px (%d blanked, %d errors)",
+		      c.hbe, c.hbb, f.min_de, f.de_lines, first, last, exp_first, exp_last, pos_hbe, pos_hbb - 1, deon, bad, checked, g_blanked, errs);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	Verilated::commandArgs(argc, argv);
@@ -1015,6 +1508,8 @@ int main(int argc, char **argv)
 	test_mode(modes[8], true);      // RGB 640x200 TC, every burst 40 clocks
 	test_mode(modes[2], true);      // VGA 640x480x256, every burst 40 clocks
 	test_counters();
+	test_1600x600(false);           // \"1600 x 600\" demo mode, random latency
+	test_1600x600(true);            // the same, every burst 40 clocks
 	test_hscroll(0, 3, 0);          // VGA 640x480x16
 	test_hscroll(0, 11, 2);         // VGA 640x480x16, colour bank 2
 	test_hscroll(2, 5, 0);          // VGA 640x480x256
@@ -1024,6 +1519,12 @@ int main(int argc, char **argv)
 	test_sync_stability();
 	test_polarity();
 	test_timerb();
+	test_vbl_edge();
+	test_8260_from_falcon();
+	test_hatari_sets(false);
+	test_hatari_sets(true);
+	test_beers_tc640();
+	test_curtain();
 
 	printf("\n%d checks passed, %d failed\n", n_pass, n_fail);
 	printf("%s\n", n_fail ? "FAIL" : "PASS");

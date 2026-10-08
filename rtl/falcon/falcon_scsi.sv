@@ -154,8 +154,9 @@ module falcon_scsi #(
 	output     [31:0] sd_lba2,
 	output reg  [2:0] sd_rd,
 	output reg  [2:0] sd_wr,
+	output      [5:0] sd_blk_cnt,     // blocks - 1 of the pending HPS request (all slots)
 	input       [2:0] sd_ack,
-	input       [8:0] sd_buff_addr,
+	input      [13:0] sd_buff_addr,
 	input       [7:0] sd_buff_dout,
 	output      [7:0] sd_buff_din0,
 	output      [7:0] sd_buff_din1,
@@ -237,7 +238,8 @@ reg  [7:0] rs_asc;
 reg        rs_short;
 
 // data path
-reg  [9:0] pos, lim;
+reg [13:0] pos;
+reg [14:0] lim;
 reg        bp, hp;           // bus side / HPS side buffer half
 reg  [1:0] hv;               // half holds data (read) / is full (write)
 reg [17:0] b_cnt, h_cnt;     // 512 byte chunks left (bus side / HPS side)
@@ -248,6 +250,7 @@ reg  [1:0] h_unit;
 reg [31:0] h_lba;
 reg  [7:0] wl_hi, wl_lo;
 reg  [3:0] fcnt;
+reg  [5:0] h_n;              // blocks in the pending / running HPS request
 
 wire       is_cd = (tid == 2'd2);
 wire [2:0] present = mnt | {CD_ALWAYS != 0, 2'b00};
@@ -256,19 +259,28 @@ assign sd_lba0 = h_lba;
 assign sd_lba1 = h_lba;
 assign sd_lba2 = h_lba;
 assign led = h_act | (bst != B_FREE);
+assign sd_blk_cnt = h_n - 6'd1;
+
+// Sector data moves in buffer halves of up to 32 blocks (16 KB, the hps_io /
+// Main limit), one HPS request per half: Main does one image write per 16 KB
+// instead of one synchronous (O_SYNC) write per 512 bytes.  CD-ROM data stays
+// one block per request (Main translates cue/bin images per 512 byte block).
+function [5:0] chunk(input [17:0] n, input cd);
+	chunk = (cd || n <= 18'd1) ? 6'd1 : (n >= 18'd32) ? 6'd32 : n[5:0];
+endfunction
 
 // ===========================================================================
-// Buffer: 1024 x 8 (two 512 byte halves), simple dual port, registered read
-reg  [7:0] buf_m [0:1023];
+// Buffer: 32768 x 8 (two 16 KB halves), simple dual port, registered read
+reg  [7:0] buf_m [0:32767];
 reg        bw_e;
-reg  [9:0] bw_a;
+reg [14:0] bw_a;
 reg  [7:0] bw_d;
 reg  [7:0] m_q;
 wire       hw_e = h_act & ~h_wr & ~h_drop & sd_ack[h_unit] & sd_buff_wr;
 wire       m_we = hw_e | bw_e;
-wire [9:0] m_wa = hw_e ? {hp, sd_buff_addr} : bw_a;
+wire [14:0] m_wa = hw_e ? {hp, sd_buff_addr} : bw_a;
 wire [7:0] m_wd = hw_e ? sd_buff_dout : bw_d;
-wire [9:0] m_ra = (h_act & h_wr) ? {hp, sd_buff_addr} : {bp, pos[8:0]};
+wire [14:0] m_ra = (h_act & h_wr) ? {hp, sd_buff_addr} : {bp, pos};
 always @(posedge clk) begin
 	if (m_we) buf_m[m_wa] <= m_wd;
 	m_q <= buf_m[m_ra];
@@ -521,7 +533,7 @@ always @(posedge clk) begin
 		hv <= 2'b00; bp <= 1'b0; hp <= 1'b0; pos <= 10'd0; lim <= 10'd0;
 		b_cnt <= 18'd0; h_cnt <= 18'd0; dk_sect <= 1'b0; dk_gen <= 1'b0; gsel <= G_NONE;
 		h_wr <= 1'b0; h_disc <= 1'b0; h_act <= 1'b0; h_seen <= 1'b0; h_drop <= 1'b0; h_unit <= 2'd0;
-		h_lba <= 32'd0; sd_rd <= 3'b000; sd_wr <= 3'b000; wl_hi <= 8'h00; wl_lo <= 8'h00;
+		h_lba <= 32'd0; h_n <= 6'd1; sd_rd <= 3'b000; sd_wr <= 3'b000; wl_hi <= 8'h00; wl_lo <= 8'h00;
 		pm_d <= 1'b0; bsy_d <= 1'b0; di_d <= 1'b0;
 	end else begin
 		hv_set = 2'b00;
@@ -531,8 +543,8 @@ always @(posedge clk) begin
 
 		// ------------------------------------------------------------------
 		// HPS engine: one 512 byte block per request
-		if (hw_e && sd_buff_addr == 9'd510) wl_hi <= sd_buff_dout;
-		if (hw_e && sd_buff_addr == 9'd511) wl_lo <= sd_buff_dout;
+		if (hw_e && sd_buff_addr == 14'd510) wl_hi <= sd_buff_dout;
+		if (hw_e && sd_buff_addr == 14'd511) wl_lo <= sd_buff_dout;
 		if (h_act) begin
 			if (sd_ack[h_unit]) begin
 				h_seen <= 1'b1;
@@ -547,8 +559,8 @@ always @(posedge clk) begin
 					if (h_wr) hv_clr[hp] = 1'b1;
 					else hv_set[hp] = 1'b1;
 					hp <= ~hp;
-					h_lba <= h_lba + 32'd1;
-					h_cnt <= h_cnt - 18'd1;
+					h_lba <= h_lba + {26'd0, h_n};
+					h_cnt <= h_cnt - {12'd0, h_n};
 				end
 			end
 		end else if (h_cnt != 18'd0 && !h_drop && sd_ack == 3'b000) begin
@@ -558,11 +570,12 @@ always @(posedge clk) begin
 				if (hv[hp]) begin
 					hv_clr[hp] = 1'b1;
 					hp <= ~hp;
-					h_cnt <= h_cnt - 18'd1;
+					h_cnt <= h_cnt - {12'd0, chunk(h_cnt, tid == 2'd2)};
 				end
 			end else if (h_wr ? hv[hp] : ~hv[hp]) begin
 				h_act <= 1'b1;
 				h_unit <= tid;
+				h_n <= chunk(h_cnt, tid == 2'd2);
 				if (h_wr) sd_wr[tid] <= 1'b1;
 				else sd_rd[tid] <= 1'b1;
 			end
@@ -746,7 +759,7 @@ always @(posedge clk) begin
 						h_cnt <= is_cd ? {cnt, 2'b00} : {2'b00, cnt};
 						b_cnt <= is_cd ? {cnt, 2'b00} : {2'b00, cnt};
 						h_lba <= is_cd ? {lba[29:0], 2'b00} : lba;
-						lim <= 10'd512;
+						lim <= {chunk(is_cd ? {cnt, 2'b00} : {2'b00, cnt}, is_cd), 9'd0};
 						dk_sect <= 1'b1;
 						if (kind == K_RD) begin
 							h_wr <= 1'b0;
@@ -792,8 +805,9 @@ always @(posedge clk) begin
 							if (dk_sect) begin
 								hv_clr[bp] = 1'b1;
 								bp <= ~bp;
-								b_cnt <= b_cnt - 18'd1;
-								if (b_cnt == 18'd1) status(8'h00);
+								b_cnt <= b_cnt - {12'd0, lim[14:9]};
+								lim <= {chunk(b_cnt - {12'd0, lim[14:9]}, is_cd), 9'd0};
+								if (b_cnt == {12'd0, lim[14:9]}) status(8'h00);
 							end else
 								status(8'h00);
 						end else
@@ -812,15 +826,16 @@ always @(posedge clk) begin
 					if (x_out) begin
 						t_req <= 1'b0;
 						bw_e <= 1'b1;
-						bw_a <= {bp, pos[8:0]};
+						bw_a <= {bp, pos};
 						bw_d <= x_byte;
 						if (pos == lim - 10'd1) begin
 							pos <= 10'd0;
 							if (dk_sect) begin
 								hv_set[bp] = 1'b1;
 								bp <= ~bp;
-								b_cnt <= b_cnt - 18'd1;
-								if (b_cnt == 18'd1) st <= T_WAITW;
+								b_cnt <= b_cnt - {12'd0, lim[14:9]};
+								lim <= {chunk(b_cnt - {12'd0, lim[14:9]}, is_cd), 9'd0};
+								if (b_cnt == {12'd0, lim[14:9]}) st <= T_WAITW;
 							end else
 								st <= T_FILL;
 						end else
@@ -832,7 +847,7 @@ always @(posedge clk) begin
 				// forwarded command: CDB into bytes 496..505, then the block write
 				T_FILL: begin
 					bw_e <= 1'b1;
-					bw_a <= {bp, 5'b11111, fcnt};       // 496 + fcnt
+					bw_a <= {bp, 5'b00000, 5'b11111, fcnt};   // 496 + fcnt
 					case (fcnt)
 						4'd0: bw_d <= c0;
 						4'd1: bw_d <= c1;

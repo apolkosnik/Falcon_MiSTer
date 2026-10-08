@@ -81,12 +81,10 @@ FNOP_		macro
 
 	org	$E00400
 start:
-	lea	$E00000,a0		; copy the vector table (1 KB) to RAM at 0
-	lea	0,a1
-	moveq	#31,d2
-cpv:	movem.l	(a0)+,d0-d1/d3-d7/a2	; 8 longs per pass
-	movem.l	d0-d1/d3-d7/a2,(a1)
-	lea	32(a1),a1
+	lea	$E00008,a0		; copy the vector table to RAM from vector 2 on: the reset
+	lea	8,a1			; vectors at 0-7 read the ROM and a write there ends in a
+	move.w	#253,d2			; bus error (falcon_cpubus, Hatari SysMem_*put)
+cpv:	move.l	(a0)+,(a1)+
 	dbra	d2,cpv
 	move.l	#EXLOG,EXLOGP
 	move.l	#RECLOG,a5

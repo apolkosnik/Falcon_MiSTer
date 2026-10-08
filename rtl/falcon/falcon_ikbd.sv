@@ -12,8 +12,28 @@
 //   ps2_key[10:0]   bit 10 toggles per event, bit 9 pressed, bit 8 E0, 7:0 code
 //   ps2_mouse[24:0] bit 24 toggles per packet, 23:16 dy, 15:8 dx,
 //                   7:0 status (0 left, 1 right, 4 X sign, 5 Y sign)
-//   joystick_0/1    bit 0 right, 1 left, 2 down, 3 up, 4 fire
+//   joystick_0/1    bit 0 right, 1 left, 2 down, 3 up, 4 fire (button 1),
+//                   5 button 2, 6 button 3
 // joystick_0 is ST port 0 (shared with the mouse), joystick_1 is port 1.
+//
+// Joystick buttons 2 and 3 follow Hatari joy.c Joy_GetStickData with its
+// default configuration (bEnableJumpOnFire2 = false, bEnableAutoFire = off):
+//  - button 2 presses the Space key: Hatari's JoystickSpaceBar state machine
+//    (NULL -> DOWN on press, DOWN -> DOWNED when the make code $39 is sent,
+//    DOWNED -> UP on release, UP -> NULL when the break code $B9 is sent).
+//    The button is sampled whenever the port is read (autosend pass, $14
+//    report, $16 interrogation; port 0 only while the IKBD reads it, i.e.
+//    mouse off or the reset-time mouse+joystick mode), and the key code is
+//    sent at the end of an autosend pass, after the mouse/joystick packets,
+//    except in joystick monitoring modes (IKBD_SendAutoKeyboardCommands).
+//    Hatari keeps a single state machine for both ports and updates it once
+//    per port read, so a press on one port and none on the other would make
+//    it alternate; here the two buttons are ORed (one Space key).
+//  - button 3 is autofire for that port's fire button: while it is held the
+//    fire bit is forced on for 4 VBLs and off for 4 VBLs ((nVBLs & 7) < 4
+//    -> off), whatever button 1 does, wherever the stick is read.  The VBL
+//    count is a free running counter at VBL_HZ (default 50 Hz: 80 ms on,
+//    80 ms off, 6.25 Hz).
 //
 // Hatari functions followed: IKBD_Boot_ROM, IKBD_InterruptHandler_ResetTimer,
 // IKBD_RunKeyboardCommand and all IKBD_Cmd_* handlers, IKBD_SCI_Get_Line_RX,
@@ -91,7 +111,8 @@
 
 module falcon_ikbd #(
     parameter CLK_HZ      = 32000000,
-    parameter AUTOSEND_HZ = 1000
+    parameter AUTOSEND_HZ = 1000,
+    parameter VBL_HZ      = 50       // autofire time base (Hatari counts VBLs)
 )(
     input             clk,
     input             reset,
@@ -193,13 +214,15 @@ localparam [5:0]
     ST_ML1     = 6'd50,
     ST_LD2     = 6'd51,
     ST_LD3     = 6'd52,
-    ST_LD4     = 6'd53;
+    ST_LD4     = 6'd53,
+    ST_SPC     = 6'd54;
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-function [7:0] jmap(input [31:0] j);   // MiSTer -> ST joystick byte
-    jmap = {j[4], 3'b000, j[0], j[1], j[2], j[3]};
+// MiSTer -> ST joystick byte; button 3 (bit 6) is autofire (af = on phase)
+function [7:0] jmap(input [31:0] j, input af);
+    jmap = {j[6] ? af : j[4], 3'b000, j[0], j[1], j[2], j[3]};
 endfunction
 
 // command ROM contents: {length, id}
@@ -380,7 +403,16 @@ reg        ck_leap;             // leap year test of the IKBD ROM, done when the
 
 // timers / events
 reg [AUTO_W-1:0] auto_cnt;
-reg  [3:0] tenms_cnt;
+reg [10:0] mon_x;               // 10 ms = 1250 ticks, restarted by $17
+// autofire time base: VBL counter (free running from power up)
+localparam integer VBL_MS = 1000 / VBL_HZ;
+reg  [4:0] vbl_ms  = 5'd0;
+reg  [2:0] vbl_cnt = 3'd0;
+wire       af_on   = vbl_cnt[2];   // Hatari: fire removed while (nVBLs & 7) < 4
+// joystick button 2 = Space key (Hatari JoystickSpaceBar), not reset by
+// the IKBD reset, as in Hatari
+localparam [1:0] SPC_NULL = 2'd0, SPC_DOWN = 2'd1, SPC_DOWNED = 2'd2, SPC_UP = 2'd3;
+reg  [1:0] spc = SPC_NULL;
 reg  [4:0] fire_cnt;            // 20 ticks = 160 us = 1/8 byte time
 reg        auto_pend, mon_pend, fire_pend, boot_pend;
 reg  [7:0] fire_sh;
@@ -403,8 +435,8 @@ reg        ph;                  // ALU states: 0 = read, 1 = execute
 // joystick bytes of an autosend pass: IKBD_GetJoystickData and (not for
 // the immediate report of command $14) IKBD_DuplicateMouseFireButtons
 wire       m_off = (mouse_mode == M_OFF);
-wire [7:0] jm0   = jmap(joystick_0);
-wire [7:0] jm1   = jmap(joystick_1);
+wire [7:0] jm0   = jmap(joystick_0, af_on);
+wire [7:0] jm1   = jmap(joystick_1, af_on);
 wire [7:0] cj0   = (m_off || (both && mouse_mode == M_REL))
                    ? (jm0 | {!joy_only && m_off && ml, 7'd0}) : 8'd0;
 wire [7:0] cj1   = joy_only ? jm1 : {m_off ? (jm1[7] | mr) : 1'b0, jm1[6:0]};
@@ -715,6 +747,14 @@ task automatic f6(input [7:0] code);
     end
 endtask
 
+// Joy_ButtonSpaceJump: button 2 sampled on a port read
+task automatic spc_read(input press);
+    begin
+        if (press && spc == SPC_NULL)        spc <= SPC_DOWN;
+        else if (!press && spc == SPC_DOWNED) spc <= SPC_UP;
+    end
+endtask
+
 task automatic copy(input [4:0] base, input [2:0] n, input bcd);
     begin
         cp_base <= base;
@@ -747,21 +787,29 @@ always @(posedge clk) begin
             end else begin
                 sec_cnt <= sec_cnt + 10'd1;
             end
-            if (tenms_cnt == 4'd9) begin
-                tenms_cnt <= 4'd0;
-                if (joy_mode == J_MON) begin
-                    if (mon_div + 8'd1 >= mon_rate) begin
-                        mon_div  <= 8'd0;
-                        mon_pend <= 1'b1;
-                    end else begin
-                        mon_div <= mon_div + 8'd1;
-                    end
-                end
+            if (vbl_ms == VBL_MS - 1) begin
+                vbl_ms  <= 5'd0;
+                vbl_cnt <= vbl_cnt + 3'd1;
             end else begin
-                tenms_cnt <= tenms_cnt + 4'd1;
+                vbl_ms <= vbl_ms + 5'd1;
             end
         end else begin
             ms_cnt <= ms_cnt + 7'd1;
+        end
+
+        // joystick monitoring period (rate x 10 ms from the $17 command)
+        if (mon_x == 11'd1249) begin
+            mon_x <= 11'd0;
+            if (joy_mode == J_MON) begin
+                if (mon_div + 8'd1 >= mon_rate) begin
+                    mon_div  <= 8'd0;
+                    mon_pend <= 1'b1;
+                end else begin
+                    mon_div <= mon_div + 8'd1;
+                end
+            end
+        end else begin
+            mon_x <= mon_x + 11'd1;
         end
 
         if (AUTO_X16 == 125) begin
@@ -776,7 +824,7 @@ always @(posedge clk) begin
         if (fire_cnt == 5'd19) begin
             fire_cnt <= 5'd0;
             if (joy_mode == J_FIRE) begin
-                fire_sh <= {fire_sh[6:0], joystick_1[4] | mr};
+                fire_sh <= {fire_sh[6:0], jm1[7] | mr};
                 fire_n  <= fire_n + 3'd1;
                 if (fire_n == 3'd7)
                     fire_pend <= 1'b1;      // fire_sh complete for 160 us
@@ -912,8 +960,8 @@ always @(posedge clk) begin
             // IKBD_SendAutoJoysticksMonitoring
             mon_pend <= 1'b0;
             if (joy_mode == J_MON && !resetting) begin
-                j0t = jmap(joystick_0) | {ml, 7'd0};
-                j1t = jmap(joystick_1) | {mr, 7'd0};
+                j0t = jm0 | {ml, 7'd0};
+                j1t = jm1 | {mr, 7'd0};
                 v0 <= {6'd0, j0t[7], j1t[7]};
                 v1 <= {j0t[3:0], j1t[3:0]};
                 snd(PT_V, 3'd2, 4'd0, R_IDLE);
@@ -1024,8 +1072,9 @@ always @(posedge clk) begin
         if (oh[C_JINT]) joy_mode <= J_OFF;
         if (oh[C_JRD]) begin
             v0 <= 8'hFD;
-            v1 <= jmap(joystick_0);
-            v2 <= jmap(joystick_1);
+            v1 <= jm0;
+            v2 <= jm1;
+            spc_read(joystick_0[5] | joystick_1[5]);      // both ports are read
             snd(PT_V, 3'd3, 4'd8, R_IDLE);
         end
         if (oh[C_JMON]) begin
@@ -1034,6 +1083,7 @@ always @(posedge clk) begin
             mon_rate   <= (ib1 == 8'd0) ? 8'd1 : ib1;
             mon_div    <= 8'd0;
             mon_pend   <= 1'b0;
+            mon_x      <= 11'd0;   // first report rate x 10 ms after the command (Hatari)
         end
         if (oh[C_JFIRE]) begin
             joy_mode   <= J_FIRE;
@@ -1194,13 +1244,15 @@ always @(posedge clk) begin
     // the modes cannot change during a pass)
     ST_A_START: begin
         ax <= 1'b0;
+        // ports read by IKBD_GetJoystickData: 1 always, 0 when not the mouse
+        spc_read(joystick_1[5] | ((m_off || (both && mouse_mode == M_REL)) && joystick_0[5]));
         if (joy_only) begin
             st  <= ST_A_JOY0;
         end else begin
             cl  <= ml;
             // IKBD_DuplicateMouseFireButtons: joystick 1 fire is the right
             // button while the mouse is on
-            crb <= mr | (mouse_mode != M_OFF && joystick_1[4]);
+            crb <= mr | (mouse_mode != M_OFF && jm1[7]);
             st  <= ST_A_ACT;
         end
     end
@@ -1450,7 +1502,7 @@ always @(posedge clk) begin
 
     // other modes: relative accumulators are not kept
     ST_A_END: begin
-        st <= ST_IDLE;
+        st <= ST_SPC;
         if (mouse_mode != M_REL && mouse_mode != M_CUR) begin
             or_l  <= cl;
             or_r  <= crb;
@@ -1462,7 +1514,24 @@ always @(posedge clk) begin
     ST_END1: begin
         rf_we = 1'b1;
         rf_wa = RF_RX + 3'd1;
-        st    <= ST_IDLE;
+        st    <= ST_SPC;
+    end
+
+    // joystick button 2 as Space, after the mouse/joystick packets
+    // (not in the monitoring modes)
+    ST_SPC: begin
+        st <= ST_IDLE;
+        if (joy_mode == J_MON || joy_mode == J_FIRE) begin
+            // IKBD_SendAutoJoysticksMonitoring path returns before the key
+        end else if (spc == SPC_DOWN) begin
+            spc <= SPC_DOWNED;
+            v0  <= 8'h39;
+            snd(PT_V, 3'd1, 4'd0, R_IDLE);
+        end else if (spc == SPC_UP) begin
+            spc <= SPC_NULL;
+            v0  <= 8'hB9;
+            snd(PT_V, 3'd1, 4'd0, R_IDLE);
+        end
     end
 
     default: st <= ST_IDLE;
@@ -1545,7 +1614,7 @@ always @(posedge clk) begin
         mr        <= 1'b0;
         auto_cnt  <= {AUTO_W{1'b0}};
         auto_pend <= 1'b0;
-        tenms_cnt <= 4'd0;
+        mon_x     <= 11'd0;
         fire_cnt  <= 5'd0;
         fire_n    <= 3'd0;
         joy_only  <= 1'b0;

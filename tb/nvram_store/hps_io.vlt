@@ -1,0 +1,5 @@
+`verilator_config
+// MiSTer hps_io refers to PS/2 serial-generator locals outside their generate
+// scope. These assignments are inactive for this core (PS2DIV=0). Limit this
+// compatibility waiver to the unmodified upstream file, not the tested RTL.
+lint_off -rule PROCASSWIRE -file "*/sys/hps_io.sv"

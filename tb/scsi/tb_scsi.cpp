@@ -58,7 +58,7 @@ static void tick() {
 	    dut->sd_buff_din0 != dut->sd_buff_din1 || dut->sd_buff_din0 != dut->sd_buff_din2) {
 		printf("FAIL: sd_lba0..2 or sd_buff_din0..2 differ\n"); fails++;
 	}
-	hps->step(dut->sd_rd, dut->sd_wr, dut->sd_lba0, dut->sd_buff_din0);
+	hps->step(dut->sd_rd, dut->sd_wr, dut->sd_lba0, dut->sd_buff_din0, dut->sd_blk_cnt);
 	bool ack = false;
 	uint16_t rdata = 0;
 	if (dut->dma_req && !dma_busy) { dma_busy = true; dma_lat = rnd(6, 20); }
@@ -1112,6 +1112,7 @@ int main(int argc, char **argv) {
 
 	CHECKEQ(hps->errors, 0, "hps protocol errors");
 	CHECKEQ(g_spi_errors, 0, "Main SPI shim protocol errors");
+	printf("HPS multi-block requests: %llu\n", (unsigned long long)hps->multi);
 	printf("\nSCSI: %d checks, %d failures, %llu cycles (%.2f s simulated)\n", checks, fails,
 	       (unsigned long long)cycle, cycle / 32e6);
 	printf(fails ? "SCSI TEST FAIL\n" : "SCSI TEST PASS\n");

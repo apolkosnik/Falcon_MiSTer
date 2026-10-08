@@ -11,6 +11,7 @@ module tb_top
 	input             cold_reset,
 	input             por,
 	input       [3:0] ram_mb,
+	input             ram_tos,
 	input       [1:0] monitor,
 
 	input      [10:0] ps2_key,
@@ -25,7 +26,8 @@ module tb_top
 	output      [6:0] sd_rd,
 	output      [6:0] sd_wr,
 	input       [6:0] sd_ack,
-	input       [8:0] sd_buff_addr,
+	input      [13:0] sd_buff_addr,
+	output     [41:0] sd_blk_cnt_f,
 	input       [7:0] sd_buff_dout,
 	output     [55:0] sd_buff_din_f,
 	input             sd_buff_wr,
@@ -103,17 +105,21 @@ wire [63:0] DDRAM_DOUT, DDRAM_DIN;
 
 wire [31:0] sd_lba[7];
 wire  [7:0] sd_buff_din[7];
+wire  [5:0] sd_blk_cnt[7];
+assign sd_blk_cnt_f = {sd_blk_cnt[6], sd_blk_cnt[5], sd_blk_cnt[4], sd_blk_cnt[3], sd_blk_cnt[2], sd_blk_cnt[1], sd_blk_cnt[0]};
 assign sd_lba_f      = {sd_lba[6], sd_lba[5], sd_lba[4], sd_lba[3], sd_lba[2], sd_lba[1], sd_lba[0]};
 assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_din[3], sd_buff_din[2], sd_buff_din[1], sd_buff_din[0]};
 
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk), .reset(reset), .cold_reset(cold_reset), .por(por),
-	.ram_mb(ram_mb), .monitor(monitor),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
-	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .rtc(rtc),
+	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
+	.nv_init(1'b0), .nv_addr(6'd0), .nv_din(8'd0), .nv_wr(1'b0),
+	.nv_dout(), .nv_changed(), .nv_ready(),
 	.img_mounted(img_mounted), .img_readonly(img_readonly), .img_size(img_size),
-	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
+	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack), .sd_blk_cnt(sd_blk_cnt),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
 	.r(r), .g(g), .b(b), .hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank), .ce_pix(ce_pix),
 	.audio_l(audio_l), .audio_r(audio_r),

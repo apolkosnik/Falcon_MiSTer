@@ -139,7 +139,9 @@ in BERR as before).
 
 ## Running it (milestone 5)
 
-- **Start/stop** (`main_patch/0003`, Main_MiSTer `support/falcon/falcon_fpu.cpp`):
+- **Start/stop** (`extra/falcon_fpu_main.patch`, on top of `extra/falcon_config_main.patch`
+  or on a stock Main; Main_MiSTer `support/falcon/falcon_fpu.cpp`; built:
+  `releases/MiSTer_falcon_fpu.bin`):
   at core start, before the reset is released, Main runs `falcon_fpu -c 0 -f -d`
   from the directory of its own binary (output to `/tmp/falcon_fpu.log`);
   `fpga_load_rbf` stops it (SIGTERM, wait, SIGKILL after 200 ms) before the
@@ -166,7 +168,7 @@ in BERR as before).
 ### Measured speed
 
 Mailbox VERSION 3 (milestone 5 as committed): DE10-Nano, 2026-10-08,
-`releases/Falcon_20261008.rbf` with the service started by Main (CPU 0,
+the core of commit 068438e with the service started by Main (CPU 0,
 SCHED_FIFO), FPUBENCH.TOS, 100,000 instructions each:
 
 | Instruction | us each | per second |

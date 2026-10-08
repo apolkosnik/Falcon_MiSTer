@@ -129,7 +129,7 @@ end
 falcon_cpubus cpubus
 (
     .clk(clk), .reset(reset),
-    .ram_mb(4'd4),
+    .ram_mb(4'd4), .ram_tos(1'b0),
     .a(cpu_a), .fc(cpu_fc), .siz(cpu_siz), .rw(cpu_rw), .as_n(cpu_as_n), .ds_n(cpu_ds_n),
     .bus_oe(cpu_bus_oe), .d_o(cpu_do), .d_i(cpu_di),
     .dsack0_n(dsack0_n), .dsack1_n(dsack1_n), .berr_n(berr_n), .avec_n(avec_n), .ciin_n(ciin_n),
@@ -165,7 +165,7 @@ falcon_fpu_bridge #(.CLK_HZ(CLK_HZ)) fpu
 // ---------------------------------------------------------------- memory arbiter
 falcon_memarb memarb
 (
-    .clk(clk), .reset(por),
+    .clk(clk), .reset(por), .ram_mb(4'd4),
     .vid_req(1'b0), .vid_addr(21'd0), .vid_ack(), .vid_data(), .vid_valid(),
     .ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
     .d0_req(1'b0), .d0_we(1'b0), .d0_addr(23'd0), .d0_be(2'b00), .d0_wdata(16'd0),

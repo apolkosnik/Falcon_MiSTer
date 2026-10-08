@@ -26,7 +26,9 @@ struct HpsMain {
 	uint32_t lba = 0;
 	int      wait = 0, cnt = 0;
 	unsigned b_wr = 0;
-	uint8_t  buf[512];
+	uint8_t  buf[16384];
+	int      nblk = 1;
+	uint64_t multi = 0;           // requests of more than one block
 	int      errors = 0;
 	uint64_t ops_rd = 0, ops_wr = 0;
 	std::vector<uint32_t> lba_log[4];
@@ -38,9 +40,9 @@ struct HpsMain {
 	bool busy() const { return st != IDLE; }
 	void clear_log() { for (int u = 0; u < 4; u++) { lba_log[u].clear(); wr_log[u].clear(); } }
 
-	void step(uint32_t sd_rd, uint32_t sd_wr, uint32_t sd_lba, uint32_t sd_buff_din) {
+	void step(uint32_t sd_rd, uint32_t sd_wr, uint32_t sd_lba, uint32_t sd_buff_din, uint32_t blk_cnt = 0) {
 		uint32_t n_wr = (b_wr & 1) ? 1 : 0;
-		if ((b_wr & 4) && sd_buff_addr != 511) sd_buff_addr++;
+		if ((b_wr & 4) && sd_buff_addr != 16383) sd_buff_addr++;
 		b_wr = (b_wr << 1) & 7;
 		sd_buff_wr = n_wr;
 
@@ -63,9 +65,15 @@ struct HpsMain {
 				if ((sd_rd | sd_wr) & ~(1u << unit) & 7) { printf("HPS: more than one slot requested\n"); errors++; }
 				is_wr = w;
 				lba = sd_lba;
-				lba_log[unit].push_back(lba);
-				wr_log[unit].push_back(is_wr);
-				if (!is_wr) main->read_block(slot0 + unit, lba, buf);
+				nblk = (int)(blk_cnt & 63) + 1;
+				if (nblk > 1) multi++;
+				// Main: sz = 512 * nblk; falcon_sd_service passes sz != 512 to the generic path,
+				// which moves the blocks in one transfer (same data as one block at a time)
+				for (int k = 0; k < nblk; k++) {
+					lba_log[unit].push_back(lba + k);
+					wr_log[unit].push_back(is_wr);
+					if (!is_wr) main->read_block(slot0 + unit, lba + k, buf + 512 * k);
+				}
 				wait = rnd(10, 100);
 				st = XFER_START;
 			}
@@ -86,17 +94,17 @@ struct HpsMain {
 					b_wr = 1;
 				} else {
 					buf[cnt] = (uint8_t)sd_buff_din;
-					if (sd_buff_addr != 511) sd_buff_addr++;
+					if (sd_buff_addr != 16383) sd_buff_addr++;
 				}
 				cnt++;
 				wait = rnd(3, 8);
-				if (cnt == 512) { wait = rnd(4, 12); st = XFER_END; }
+				if (cnt == 512 * nblk) { wait = rnd(4, 12); st = XFER_END; }
 			}
 			break;
 		case XFER_END:
 			if (--wait <= 0) {
 				sd_ack = 0;
-				if (is_wr) { main->write_block(slot0 + unit, lba, buf); ops_wr++; }
+				if (is_wr) { for (int k = 0; k < nblk; k++) main->write_block(slot0 + unit, lba + k, buf + 512 * k); ops_wr++; }
 				else ops_rd++;
 				st = IDLE;
 			}

@@ -79,7 +79,8 @@ MFP GPIP inputs (Falcon):
 - I0 printer BUSY (1 = no printer)
 - I1 Centronics ACK on the Falcon (idle: 1)
 - I2 RS232 CTS (inverted: 1)
-- I3 blitter busy (0 while the blitter runs - inverted "done" line).  Hatari
+- I3 blitter busy (1 while the blitter runs, 0 when it finishes, so the
+  default falling-edge interrupt fires at completion; blitter.c).  Hatari
   wires the blitter here for the Falcon too and delivers the DSP's HREQ
   directly on IPL6 (dsp.c notes the real board may use GPIP3); we follow Hatari.
 - I4 ACIA IRQ (0 when either ACIA requests)
@@ -87,8 +88,11 @@ MFP GPIP inputs (Falcon):
 - I6 RS232 RI (1)
 - I7 DMA sound SNDINT (Falcon: the DMA sound "play" signal)
 - TAI (timer A input): DMA sound SOUNDINT (frame end event)
-- TBI (timer B input): Videl `de_tb`, the display enable once per SOURCE line
-  (line-doubled modes count the repeat copy only, as Hatari counts ST lines)
+- TBI (timer B input): Videl `de_tb`, the display enable once per displayed
+  SOURCE line (line-doubled modes count the repeat copy only).  This matches
+  Hatari for 200-line modes and mono (400); in 240/480-line modes it counts
+  every source line, where Hatari always counts 200 per frame - per-line
+  counting is the closer model of the hardware.
 
 ## Common device register bus
 
@@ -140,6 +144,16 @@ input             dma_ack      // one clock; the next request may follow at once
 
 Latency is variable (DDR3, typically 6..20 clocks).  A device that needs a
 guaranteed rate keeps its own FIFO.
+
+The arbiter applies the memory types to every DMA access, as Hatari's
+STMemory_DMA_ReadWord/WriteWord and Hatari's memory banks do: ST-RAM is read
+and written directly, except that DMA sound and blitter writes to
+$000000-$000007 are dropped (SysMem_wput; the disk DMA copies straight into
+ST-RAM and may write there), ROM and cartridge are read only (writes
+dropped), and a bus-error region reads $0000 and drops writes.  The
+system routes blitter accesses to $F00000-$F0FFFF and $FF8000-$FFFFFF to the
+device bus instead (put_word/get_word reach the I/O handlers); a device
+address that bus errors reads $0000 and drops the write there too.
 
 ## Video fetch port (Videl only)
 
