@@ -23,7 +23,7 @@
  *   bits 15..12 RSEQ[3:0], 11..8 FPSR condition codes {N, Z, I, NAN},
  *   7..5 vector - 48, 4..0 FLAGS bits 4..0
  *
- * Reply FLAGS (mailbox +$202, informational):
+ * Reply FLAGS (mailbox +$202, written with STATUS, informational):
  *   bit 0      the instruction is not implemented (F-line)
  *   bit 1      EXC PEND: an enabled exception is pending; the next opclass
  *              000/010/011 instruction or conditional takes it (pre-instruction)

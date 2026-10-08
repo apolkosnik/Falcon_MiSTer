@@ -578,6 +578,26 @@ static void t_arith(void)
 	  one("class 1 (undefined)", 0x2000, NULL, 0, 0, &s);
 	  one("FMOVECR fmt!=X?", 0x5c00 | 0x40, NULL, 0, 0, &s);
 	  s.fpsr = 0x01000000; one("FADD NaN cc then FADD", (uint16_t)(0x0022 | 1 << 10), NULL, 0, 0, &s); }
+	/* the register-to-register fast path (fpe_fpp.c) against fpp.c driven the normal way: every
+	 * opmode $00-$3F (all exist on a 6888x), special and ordinary operands in both registers,
+	 * every rounding mode/precision combination; FSINCOS writes a second register, FMOD/FREM the
+	 * quotient byte, FCMP/FTST no register: run_check compares all of it */
+	category("fast-path");
+	{
+		static const int fv[] = { 0, 1, 2, 3, 6, 9, 10, 15, 16, 19, 20, 21, 22, 24, 25, 27, 30 };
+		static const int dv[] = { 2, 9, 0, 19, 21, 24, 30 };
+		const int nf = (int)(sizeof fv / sizeof *fv), nd = (int)(sizeof dv / sizeof *dv);
+		for (int op = 0; op < 0x40; op++)
+			for (int i = 0; i < nf; i++)
+				for (int j = 0; j < nd; j++) {
+					int c = (op + i * 3 + j) % 9;   /* a different FPCR per operand pair, all nine per opmode */
+					St st = base_state(); st.fpcr = fpcr_var[c];
+					st.se[1] = xpool[fv[i]].se; st.m[1] = xpool[fv[i]].m;
+					st.se[3] = xpool[dv[j]].se; st.m[3] = xpool[dv[j]].m;
+					snprintf(nm, sizeof nm, "op $%02x FP1=%s FP3=%s (%s)", op, xpool[fv[i]].n, xpool[dv[j]].n, fpcr_nm[c]);
+					one(nm, (uint16_t)(1 << 10 | 3 << 7 | op), NULL, 0, 0, &st);
+				}
+	}
 	category("cond");
 	for (int cc = 0; cc < 32; cc++) for (int cs = 0; cs < 16; cs++) {
 		St s = base_state(); s.fpsr = (uint32_t)cs << 24; int a, e;

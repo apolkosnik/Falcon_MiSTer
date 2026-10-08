@@ -108,10 +108,11 @@ kind uses it and it differs from what the mailbox holds, so a run of like
 instructions posts RSEQ alone.  The reply at +$200: STATUS (written last;
 the only word the bridge reads: RSEQ[3:0], the FPSR condition codes, the
 exception vector - 48 and the flags not implemented, exception pending,
-condition true, exception enabled, raised by this request), then FLAGS,
-FPSR, FPCR[15:0], NBYTES (informational), result bytes at +$210 (the save
+condition true, exception enabled, raised by this request) with FLAGS
+(informational) in the same 32-bit write, result bytes at +$210 (the save
 frame).  The service reads and writes it in 32-bit words (the mapping is
-uncached).  `tools/falcon_fpu/fpu_request.h` executes a request for the
+uncached) and only what a request uses: NBYTES only for the opclasses that
+send operand bytes, IADDR only while an exception is enabled.  `tools/falcon_fpu/fpu_request.h` executes a request for the
 service and for the system simulation alike.  Operand and result bytes are copied in
 memory order between the operand CIR and the mailbox, so the bridge needs no
 buffer.
@@ -121,8 +122,14 @@ and softfloat unmodified with a shim (`libfpe`, host and ARM).  `fpp.c` is
 given a synthetic `(A0)` opcode (`-(A0)` for predecrement FMOVEM lists) and
 its memory accessors map onto the operand/result buffer, so the buffer is
 the memory image the 68030 transfers and every 68882 detail of `fpp.c`
-applies; `engine/fpe_selftest` compares this against `fpp.c` driven with
-real EAs (16,930 checks, host and qemu-arm).
+applies.  Register-to-register arithmetic with no exception pending or
+enabled takes a fast path (`engine/fpe_fpp.c`, which includes `fpp.c`
+unmodified): the same steps of `fpuop_arithmetic` in the same order, without
+the per-instruction checks that cannot fire then (a third of an FADD's
+time).  `engine/fpe_selftest` compares all of it against `fpp.c` driven the
+normal way with real EAs (24,546 checks, host and qemu-arm; 7,616 of them
+the fast path: every opmode $00-$3F with special and ordinary operands in
+every rounding mode and precision).
 The bridge polls MAGIC/HEARTBEAT every 5 ms and reports an FPU while the
 heartbeat has moved within 100 ms.  It owns `falcon_memarb`'s d3 port
 (between the blitter and the CPU), which the probe proved; a measurement
@@ -202,7 +209,11 @@ accessing the mailbox in 32-bit words), same board, same day:
 | FMOVE.X FP0,(A4) | 18.45 | 12.95 | 77,220 |
 | FMOVE.D (A4),FP0 + FMUL.D (A4),FP0 | 13.45 | 8.70 | 114,942 |
 
-`falcon_fpu -s` during the run (A9 global timer): a mailbox read costs
+With the engine's register-to-register fast path and the service reading
+and writing only what a request uses (the next commit), FADD FP1,FP0 took
+4.0 us on the same board.
+
+`falcon_fpu -s` during the VERSION 4 run (A9 global timer): a mailbox read costs
 128 ns, a write 71 ns; while the reg-reg rows ran, a request spent 3.05 us
 in the service (2.16 us in the engine, 0.89 us mailbox and the rest) and
 2.23 us between its reply and the next request (the bridge noticing the

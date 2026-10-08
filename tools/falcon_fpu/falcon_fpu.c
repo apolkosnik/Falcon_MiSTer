@@ -39,9 +39,13 @@
  *   +$100 RSEQ  +$102 KIND  +$104 CMD  +$106 AUX  +$108 NBYTES
  *   +$10A IADDR[31:16]  +$10C IADDR[15:0]  +$110..+$1FF operand bytes
  *   reply (ARM -> FPGA), STATUS written last:
- *   +$200 STATUS  +$202 FLAGS  +$204 FPSR  +$208 FPCR[15:0]  +$20A NBYTES
- *   +$210.. result bytes
+ *   +$200 STATUS  +$202 FLAGS  +$210.. result bytes
  * Request kinds, which fields each uses, STATUS and FLAGS: fpu_request.h.
+ * Read per request: the RSEQ/KIND word (the poll), CMD/AUX (execute,
+ * condition, restore), NBYTES only for the opclasses that send operand
+ * bytes (010, 100, 110) and for restore, IADDR only while an arithmetic
+ * exception is enabled (the bridge posts it then, and only then does the
+ * engine use it: FPIAR); written: the result bytes, STATUS/FLAGS.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -79,7 +83,7 @@
 
 enum { O_MAGIC = 0x000, O_HB = 0x002, O_VERSION = 0x004,
        O_RSEQ = 0x100, O_CMD = 0x104, O_RNBYTES = 0x108, O_IADDRL = 0x10C, O_RDATA = 0x110,
-       O_STATUS = 0x200, O_FPSR = 0x204, O_FPCR = 0x208, O_ADATA = 0x210 };
+       O_STATUS = 0x200, O_ADATA = 0x210 };
 
 static volatile uint8_t *mb;
 static volatile sig_atomic_t quit;
@@ -221,11 +225,14 @@ static void serve(uint32_t w0, int verbose)
 		cmd = f_lo(w1);
 		aux = f_hi(w1);
 	}
-	if (fpu_kind_has_data(kind)) {
+	unsigned cls = cmd >> 13;
+	int need_n = kind == FPU_KIND_RESTORE || (kind == FPU_KIND_EXEC && (cls == 2 || cls == 4 || cls == 6));
+	int need_ia = kind == FPU_KIND_EXEC && (fpe_fpcr() & 0x7f00);
+	if (need_n || need_ia) {
 		uint32_t w2 = rd32(O_RNBYTES);                  /* NBYTES, IADDR[31:16] */
-		n = f_lo(w2);
+		if (need_n) n = f_lo(w2);
 		if (n > FPU_REQ_MAX) n = FPU_REQ_MAX;
-		if (kind == FPU_KIND_EXEC) iaddr = (uint32_t)f_hi(w2) << 16 | f_lo(rd32(O_IADDRL));
+		if (need_ia) iaddr = (uint32_t)f_hi(w2) << 16 | f_lo(rd32(O_IADDRL));
 		for (int i = 0; i < n; i += 4) {
 			uint32_t v = rd32(O_RDATA + i);
 			memcpy(in + i, &v, 4);
@@ -243,9 +250,7 @@ static void serve(uint32_t w0, int verbose)
 		memcpy(&v, out + i, 4);
 		wr32(O_ADATA + i, v);
 	}
-	wr32(O_FPSR, __builtin_bswap32(fpsr));
-	wr32(O_FPCR, fields((uint16_t)fpe_fpcr(), (uint16_t)out_len));
-	barrier();                      /* the reply is complete before STATUS */
+	if (out_len) barrier();         /* the result bytes are in memory before STATUS */
 	wr32(O_STATUS, fields(fpu_status(seq, flags, fpsr), flags));
 	barrier();
 

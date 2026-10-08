@@ -6,7 +6,8 @@
 #   HOSTCC   host compiler (default cc)
 #   OUT      output directory (default ./build next to this script)
 #   HOST_ONLY=1  only the host library (no ARM toolchain needed; the simulations)
-# Hatari's files are compiled in place and unmodified.  shim/config.h is an empty stand-in for
+# Hatari's files are compiled in place and unmodified (fpp.c through fpe_fpp.c, which includes it and adds
+# the register-to-register fast path).  shim/config.h is an empty stand-in for
 # Hatari's CMake config.h: no SDL, no config, so the same sources build for the ARM target.
 set -e
 cd "$(dirname "$0")"
@@ -17,7 +18,7 @@ CC="${CC:-arm-none-linux-gnueabihf-gcc}"
 HOSTCC="${HOSTCC:-cc}"
 AR_ARM="${AR_ARM:-${CC%gcc}ar}"
 INC="-I. -Ishim -I$H/cpu -I$H/cpu/softfloat -I$H/includes -I$H/debug"
-SRC="$H/cpu/fpp.c $H/cpu/fpp_softfloat.c $H/cpu/softfloat/softfloat.c $H/cpu/softfloat/softfloat_fpsp.c $H/cpu/softfloat/softfloat_decimal.c"
+SRC="fpe_fpp.c $H/cpu/fpp_softfloat.c $H/cpu/softfloat/softfloat.c $H/cpu/softfloat/softfloat_fpsp.c $H/cpu/softfloat/softfloat_decimal.c"
 # -fwrapv: Hatari builds with it.  -w: Hatari's code is warning-noisy; the shim itself is built with -Wall.
 HF="-std=gnu99 -O2 -w -fwrapv"
 mkdir -p "$OUT/host" "$OUT/arm"

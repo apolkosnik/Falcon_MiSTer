@@ -102,13 +102,12 @@
 //   the mailbox holds (shadow registers; all unknown at power on and while
 //   no service is present): a run of like instructions posts RSEQ alone.
 //   reply, STATUS written last (ARM -> FPGA):
-//   +$200 STATUS  +$202 FLAGS  +$204 FPSR  +$208 FPCR[15:0]  +$20A NBYTES
-//   +$210.. result bytes (save: the frame)
+//   +$200 STATUS  +$202 FLAGS  +$210.. result bytes (save: the frame)
 //   STATUS, all the bridge reads: 15..12 the request's RSEQ[3:0], 11..8 FPSR
 //   condition codes, 7..5 vector - 48 (48..54), 4 this request raised the
 //   exception itself (FMOVE out, BSUN), 3 arithmetic exception enabled,
-//   2 condition true, 1 exception pending, 0 not implemented; FLAGS, FPSR,
-//   FPCR and NBYTES are informational (tools/falcon_fpu/fpu_request.h)
+//   2 condition true, 1 exception pending, 0 not implemented; FLAGS is
+//   informational (tools/falcon_fpu/fpu_request.h)
 // Operand and result words move between the operand CIR and the mailbox
 // directly (a CIR access waits for its one or two 16-bit DDR3 accesses).
 module falcon_fpu_bridge #(

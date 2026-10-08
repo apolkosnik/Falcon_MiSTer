@@ -89,10 +89,6 @@ static void fpu_serve(void)
     for (int i = 0; i < out_len; i++) guest_wr8(MB + 0x210 + i, out[i]);
     uint32_t fpsr = fpe_fpsr();
     guest_wr16(MB + 0x202, flags);
-    guest_wr16(MB + 0x204, (uint16_t)(fpsr >> 16));
-    guest_wr16(MB + 0x206, (uint16_t)fpsr);
-    guest_wr16(MB + 0x208, (uint16_t)fpe_fpcr());
-    guest_wr16(MB + 0x20A, (uint16_t)out_len);
     guest_wr16(MB + 0x200, fpu_status(seq, flags, fpsr));      // STATUS last
 }
 

@@ -213,6 +213,8 @@ static int ev_flags(void)
 }
 
 /* ---- execution ----------------------------------------------------------------------- */
+int fpe_fast_arith(uae_u32 opcode, uae_u16 extra, uaecptr pc);     /* fpe_fpp.c */
+
 static int popcnt8(unsigned v) { int n = 0; for (v &= 0xff; v; v >>= 1) n += v & 1; return n; }
 
 int fpe_exec(uint16_t cmd, const uint8_t *in, int in_len, uint16_t aux, uint32_t iaddr,
@@ -227,6 +229,16 @@ int fpe_exec(uint16_t cmd, const uint8_t *in, int in_len, uint16_t aux, uint32_t
 	fpe_shim_use_buffer();
 	fpe_shim_clear_events();
 	if (in_len < 0 || in_len > FPE_MAXIO) in_len = in_len < 0 ? 0 : FPE_MAXIO, flags |= FPE_ERROR;
+
+	/* register to register with no exception pending or enabled: fpe_fpp.c, the same steps as
+	 * fpuop_arithmetic() without the checks that cannot fire (no operand bytes, no result) */
+	if (cls == 0 && in_len == 0) {
+		fpe_shim_set_pc(iaddr + 4);
+		if (fpe_fast_arith(opcode, cmd, iaddr)) {
+			if (out_len) *out_len = 0;
+			return flags | ev_flags();
+		}
+	}
 
 	/* FMOVEM.X FPn,<ea> with a predecrement-format register list (mode 00/01): fpp.c writes
 	 * downwards from A0, so use -(A0) with A0 = transfer size; the buffer then holds the memory
