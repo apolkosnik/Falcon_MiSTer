@@ -13,7 +13,8 @@
 // 100 ms window simulable while every protocol cycle is the real RTL.
 
 module tb_fpu_top #(
-    parameter int CLK_HZ = 200000
+    parameter int CLK_HZ = 200000,
+    parameter int CPU_DIV = 1           // the CPU on every CPU_DIV-th clock (falcon_system: 1 turbo, 2 = 16 MHz, 4 = 8 MHz)
 ) (
     input             clk,
     input             por,          // power-on reset (arbiter, bridge presence)
@@ -80,9 +81,16 @@ wire [31:0] dbg_pc;
 
 wire dev_reset = reset | cpu_reset_oe;      // as in falcon_system: RESET resets the peripherals only
 
-ap030_top cpu
+reg [1:0] cpu_div = 2'd0;
+reg       cpu_ce = 1'b1;
+always @(posedge clk) begin
+    cpu_div <= (cpu_div == CPU_DIV - 1) ? 2'd0 : cpu_div + 2'd1;
+    cpu_ce  <= (CPU_DIV == 1) || (cpu_div == CPU_DIV - 1);
+end
+
+ap030_top #(.USE_CE(1)) cpu
 (
-    .clk(clk),
+    .clk(clk), .ce(cpu_ce),
     .fast_req(), .fast_addr(), .fast_fc(), .fast_rw(), .fast_ci(), .fast_burst(), .fast_be(), .fast_wdata(),
     .fast_match(1'b0), .fast_ready(1'b0), .fast_valid(1'b0), .fast_last(1'b0),
     .fast_word(2'b00), .fast_rdata(32'd0),

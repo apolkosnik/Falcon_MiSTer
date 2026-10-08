@@ -13,6 +13,7 @@ module tb_top
 	input       [3:0] ram_mb,
 	input             ram_tos,
 	input       [1:0] monitor,
+	input             cpu_turbo,
 
 	input      [10:0] ps2_key,
 	input      [24:0] ps2_mouse,
@@ -113,7 +114,7 @@ assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk), .reset(reset), .cold_reset(cold_reset), .por(por),
-	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
 	.nv_init(1'b0), .nv_addr(6'd0), .nv_din(8'd0), .nv_wr(1'b0),

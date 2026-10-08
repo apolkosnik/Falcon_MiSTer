@@ -11,6 +11,7 @@
 #   VASM=/path/to/vasmm68k_mot  (default vasmm68k_mot, as rtl/AP68030/tb/run_tests.sh)
 #   HATARI=...                  Hatari source tree (default ~/Devel/Atari/hatari)
 #   NOBUILD=1                   reuse obj/vl (programs are always re-assembled)
+#   CPU_DIV                     the CPU on every CPU_DIV-th clock: 1 (default, turbo), 2 (16 MHz), 4 (8 MHz)
 #   CLK_HZ                      bridge clock parameter (default 1000000 = poll every 5000 clocks,
 #                               watchdog 100000 clocks); runs with the real service are paced to
 #                               wall time (1 clock = 1/CLK_HZ s) when the simulator is faster
@@ -48,13 +49,13 @@ cc -O2 -Wall -Wextra -I$ROOT/tools/falcon_fpu -o obj/falcon_fpu_host $ROOT/tools
 	|| { echo "RESULT: FAIL (falcon_fpu host build)"; exit 1; }
 
 if [ "${NOBUILD:-0}" != 1 ] || [ ! -x obj/vl/tb_fpu ] || [ -n "$BRIDGE_SV$CPUBUS_SV$MEMARB_SV$CPU_DIR" ]; then
-	echo "== verilating (CLK_HZ=$CLK_HZ) =="
+	echo "== verilating (CLK_HZ=$CLK_HZ CPU_DIV=${CPU_DIV:-1}) =="
 	rm -rf obj/vl
 	verilator --cc --exe --build -j "${JOBS:-8}" -O2 -Wall -Wno-fatal \
 		-Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-PINCONNECTEMPTY -Wno-TIMESCALEMOD \
 		-Wno-CASEINCOMPLETE -Wno-WIDTH -Wno-MULTIDRIVEN -Wno-UNOPTFLAT -Wno-LATCH -Wno-VARHIDDEN \
 		--output-split 20000 --output-split-cfuncs 500 \
-		-I$CPU -I$CPU/core --top-module tb_fpu_top -GCLK_HZ=$CLK_HZ --Mdir obj/vl \
+		-I$CPU -I$CPU/core --top-module tb_fpu_top -GCLK_HZ=$CLK_HZ -GCPU_DIV=${CPU_DIV:-1} --Mdir obj/vl \
 		$CPU/ap030_top.v $CPU/ap030_core.v $CPU/ap030_memsys.v $CPU/ap030_mmu.v $CPU/ap030_cache.v \
 		$CPU/ap030_bus.v $CPU/ap030_alu.v $CPU/ap030_muldiv.v $CPU/ap030_regfile.v \
 		${CPUBUS_SV:-$RTL/falcon/falcon_cpubus.sv} ${MEMARB_SV:-$RTL/falcon/falcon_memarb.sv} ${BRIDGE_SV:-$RTL/falcon/falcon_fpu_bridge.sv} \

@@ -18,6 +18,7 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 	input       [3:0] ram_mb,
 	input             ram_tos,      // loaded TOS is a RAM TOS behind its loader
 	input       [1:0] monitor,
+	input             cpu_turbo,    // 1: CPU on every clock (32 MHz); 0: Falcon, 16/8 MHz ($FF8007 bit 0)
 
 	// ROM/cartridge loader
 	input             ld_wr,
@@ -118,9 +119,21 @@ wire dev_reset = reset | cpu_reset_oe;
 wire ld_busy_arb;
 assign ld_busy = ld_busy_arb;
 
-ap030_top cpu
+// CPU clock (docs/CPU_TIMING.md): the 68030 advances on the clocks with
+// cpu_ce.  Turbo: every clock (32 MHz).  Falcon: every second clock (16 MHz),
+// or every fourth (8 MHz) when $FF8007 bit 0 is clear, as Hatari switches
+// its 68030 (IoMemTabFalcon_BusCtrl_WriteByte); a change takes effect at once.
+wire       cpu_16mhz;
+reg  [1:0] cpu_div = 2'd0;
+reg        cpu_ce = 1'b1;
+always @(posedge clk) begin
+	cpu_div <= cpu_div + 2'd1;
+	cpu_ce  <= cpu_turbo || (cpu_16mhz ? cpu_div[0] : (cpu_div == 2'd3));
+end
+
+ap030_top #(.USE_CE(1)) cpu
 (
-	.clk(clk),
+	.clk(clk), .ce(cpu_ce),
 	.a(cpu_a), .fc(cpu_fc), .siz(cpu_siz), .rw(cpu_rw), .rmc_n(cpu_rmc_n),
 	.as_n(cpu_as_n), .ds_n(cpu_ds_n), .dben_n(cpu_dben_n), .ecs_n(cpu_ecs_n), .ocs_n(cpu_ocs_n),
 	.ciout_n(cpu_ciout_n), .cbreq_n(cpu_cbreq_n), .bus_oe(cpu_bus_oe),
@@ -457,7 +470,7 @@ falcon_combel combel
 	.ram_mb(ram_mb), .monitor(monitor),
 	`DEVBUS(sel_combel), .bus_addr(dev_addr), .bus_dout(combel_dout), .bus_ack(combel_ack),
 	.joy0(joy0), .joy1(joy1), .ana0(ana0), .ana1(ana1),
-	.falcon_bus(falcon_bus), .cpu_16mhz()
+	.falcon_bus(falcon_bus), .cpu_16mhz(cpu_16mhz)
 );
 
 // ---- Videl ----

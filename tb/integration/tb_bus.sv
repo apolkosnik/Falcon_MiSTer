@@ -22,7 +22,7 @@ reg [2:0] fc = 5;
 reg [1:0] siz = 2;
 reg rw = 1, as_n = 1, ds_n = 1;
 tb_top t(.clk(clk), .reset(reset), .cold_reset(reset), .por(reset),
- .ram_mb(4'd14), .ram_tos(1'b0), .monitor(monitor),
+ .ram_mb(4'd14), .ram_tos(1'b0), .monitor(monitor), .cpu_turbo(1'b0),
  .ps2_key(11'd0), .ps2_mouse(25'd0), .joy0(32'd0), .rtc(65'd0),
  .img_mounted(7'd0), .img_readonly(1'b0), .img_size(64'd0),
  .sd_ack(7'd0), .sd_buff_addr(14'd0), .sd_buff_dout(8'd0), .sd_buff_wr(1'b0));
