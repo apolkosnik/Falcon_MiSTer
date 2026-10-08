@@ -26,6 +26,8 @@ CASEIX		equ	$0F30		; long: generated case being run
 RESUME		equ	$0F34		; long: where an aborted case continues
 SAVESP		equ	$0F38		; long: stack pointer at the start of the case program
 ABORTMODE	equ	$0F3C		; long: non-zero: unexpected exceptions abort the current case
+IRQCNT		equ	$0F5C		; long: interrupts taken by h_irq
+HMODE		equ	$0F58		; long: 0 the FPU exception handler absorbs the exception, 1 it only returns
 SOFTEXC		equ	$0F54		; long: non-zero: an expected pre-instruction exception is stepped over (SKIP)
 MARK1		equ	$0F40		; longs: progress markers of the hand written M2 programs
 MARK2		equ	$0F44

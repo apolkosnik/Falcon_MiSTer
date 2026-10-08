@@ -27,9 +27,13 @@ main:
 	moves.w	$14(a0),d2		; $14 register select
 	moves.l	$18(a0),d2		; $18 instruction address
 	moves.l	$1C(a0),d2		; $1C operand address
-	moves.w	4(a0),d1		; $04 save (first-type read): null state -> format $0000
+	move.w	#4000,d5		; $04 save (first-type read): come again ($0118) until the ARM's frame, null -> $0038
+rs1:	moves.w	4(a0),d1
 	and.l	#$FFFF,d1
-	REC	T_RAW_SAVE,d1
+	cmp.w	#$0118,d1
+	bne.s	rs2
+	dbra	d5,rs1
+rs2:	REC	T_RAW_SAVE,d1
 ;---- writes
 	moveq	#0,d3
 	moves.w	d3,8(a0)		; operation word
@@ -37,10 +41,16 @@ main:
 	moves.w	d3,$14(a0)		; register select
 	moves.l	d3,$18(a0)		; instruction address
 	moves.l	d3,$1C(a0)		; operand address
-;---- condition T: response null with TF = 1
+;---- condition T: the first conditional after a reset is asked of the ARM (come again, $89xx),
+;     then null with TF = 1
 	move.w	#$000F,d3
 	moves.w	d3,$E(a0)
-	moves.w	(a0),d1
+	move.w	#4000,d5
+rt1:	moves.w	(a0),d1
+	cmp.w	#$8900,d1
+	bne.s	rt2
+	dbra	d5,rt1
+rt2:
 	and.l	#$FFFF,d1
 	move.l	d1,d4
 	lsr.l	#8,d4

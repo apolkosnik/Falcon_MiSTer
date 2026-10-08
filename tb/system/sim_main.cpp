@@ -15,7 +15,7 @@
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
 //     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC,
-//                       VERSION 2 and a heartbeat every 10 ms in the mailbox
+//                       VERSION 3 and a heartbeat every 10 ms in the mailbox
 //                       at $E90000, and every request executed by the same
 //                       68882 engine (libfpe) the ARM service uses
 //     --cptrace         print every coprocessor (FPU) interface register access
@@ -24,7 +24,7 @@
 #include "Vtb_top__Dpi.h"
 #include "verilated.h"
 #include "svdpi.h"
-#include "falcon_fpu_engine.h"
+#include "fpu_request.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -77,22 +77,16 @@ static void fpu_serve(void)
     uint16_t seq = guest_rd16(MB + 0x100);
     if (seq == fpu_seen) return;
     fpu_seen = seq;
-    uint8_t in[FPE_MAXIO], out[FPE_MAXIO];
+    uint8_t in[FPU_REQ_MAX], out[FPE_MAXIO];
     uint16_t kind = guest_rd16(MB + 0x102), cmd = guest_rd16(MB + 0x104), aux = guest_rd16(MB + 0x106);
-    int n = guest_rd16(MB + 0x108), out_len = 0, flags = 0;
-    if (n > FPE_MAXIO) n = FPE_MAXIO;
+    int n = guest_rd16(MB + 0x108), out_len = 0;
+    uint32_t iaddr = (uint32_t)guest_rd16(MB + 0x10A) << 16 | guest_rd16(MB + 0x10C);
+    if (n > FPU_REQ_MAX) n = FPU_REQ_MAX;
     for (int i = 0; i < n; i++) in[i] = guest_rd8(MB + 0x110 + i);
-    if (kind == 2) fpe_reset();
-    else if (kind == 3) {                               // condition (BSUN cases)
-        int r = fpe_cond(cmd & 0x3f);
-        if (r == -2) { flags = 2; fpe_clear_exception(); }
-        else if (r) flags = 4;
-    }
-    else flags = fpe_exec(cmd, in, n, aux, 0, out, &out_len);
-    if (out_len < 0 || out_len > FPE_MAXIO) out_len = 0;
+    uint16_t flags = fpu_request(kind, cmd, aux, iaddr, in, n, out, &out_len);
     for (int i = 0; i < out_len; i++) guest_wr8(MB + 0x210 + i, out[i]);
     uint32_t fpsr = fpe_fpsr();
-    guest_wr16(MB + 0x202, (uint16_t)flags);
+    guest_wr16(MB + 0x202, flags);
     guest_wr16(MB + 0x204, (uint16_t)(fpsr >> 16));
     guest_wr16(MB + 0x206, (uint16_t)fpsr);
     guest_wr16(MB + 0x208, (uint16_t)fpe_fpcr());
@@ -288,7 +282,7 @@ int main(int argc, char **argv) {
             fpe_reset();
             fpu_seen = guest_rd16(0xE90100);
             guest_wr16(0xE90200, fpu_seen);
-            guest_wr16(0xE90004, 2);          // VERSION
+            guest_wr16(0xE90004, 3);          // VERSION
             guest_wr16(0xE90000, 0x4650);     // MAGIC "FP"
         }
         if (fpu_service && cyc % 320000 == 0) guest_wr16(0xE90002, ++fpu_hb);   // 10 ms

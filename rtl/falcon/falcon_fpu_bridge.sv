@@ -6,7 +6,7 @@
 // docs/FPU_ARM.md.  References: MC68881/MC68882 User's Manual (UM) ch. 6-7,
 // MC68030 UM ch. 10 as implemented by the AP68030 (core/ap030_exec_c.vh).
 //
-// Presence: the service writes MAGIC, VERSION (2) and increments HEARTBEAT
+// Presence: the service writes MAGIC, VERSION (3) and increments HEARTBEAT
 // about every 10 ms.  Polled every 5 ms; the FPU exists while HEARTBEAT has
 // changed within the last 100 ms.  Without it the first CIR access of an
 // instruction (command, condition or restore write, save read) ends in BERR
@@ -16,8 +16,11 @@
 //
 // Dialogs (response word: CA 15, PC 14, DR 13, primitive 12..8, parameter;
 // UM table 7-7).  The CA=1 forms are used throughout (the 68881 dialog,
-// legal for the 68882, UM 7.5.1); PC is never requested (FPIAR is not
-// loaded from the instruction address yet: milestone 4).
+// legal for the 68882, UM 7.5.1).  While an arithmetic exception is enabled
+// (FPCR[14:8], mirrored from each reply) the first primitive of opclass
+// 000/010/011 also has PC set: the 68030 writes the instruction address to
+// CIR $18 and the request carries it (FPIAR); a request that would be posted
+// with that first primitive waits for the address.
 //   cpGEN opclass 000 reg-to-reg, FMOVECR: the request is posted, the CPU is
 //     released at once ($0900) and the ARM executes in the background.
 //   opclass 010 <ea>,FPn: evaluate EA and transfer data, DR=0: B $9501,
@@ -55,12 +58,26 @@
 // waiting instruction ends with the mid-instruction exception primitive,
 // coprocessor protocol violation ($1D0D), instead of hanging the 68030.
 //
-// Null/idle state (UM 6.4.2): null after reset and after FRESTORE of a null
-// frame (both also reset the FPU on the ARM: a reset request); idle after
-// any command or condition word.  FSAVE: null -> $0000; idle -> $1F38 and
-// 14 operand longs (no state in the body yet).  FRESTORE: $00xx resets,
-// $1F38 restores idle (14 longs taken), any other format reads back $02xx
-// (format error).
+// Exceptions (UM 6.4.2.2, as Hatari's fpp.c models the 68882): an enabled
+// exception raised by an instruction is pending (reply FLAGS bit 1, vector in
+// 15..8) and reported to the next opclass 000/010/011 instruction or
+// conditional as its first response, take pre-instruction exception ($1Cvv),
+// instead of executing it; FMOVEM and the control register moves do not
+// report it.  The 68882 keeps it pending when the 68030 takes it (exception
+// acknowledge); FSAVE absorbs it into the frame (BIU flags bit 27) and
+// FRESTORE of that frame re-arms it.  FMOVE out raising an enabled exception
+// itself ends with take mid-instruction exception ($1Dvv) after the result.
+//
+// FSAVE/FRESTORE (UM 6.4.2): the frame is the ARM's.  FSAVE posts a save
+// request and reads come-again ($0118) until the reply, whose data is the
+// frame image: the format word ($0000 null, $1F38 idle), then the body as
+// operand reads, last long first.  FRESTORE: $00xx resets the FPU (reset
+// request); $1F38/$1F18 (idle 68882/68881) and $1FD4/$1FB4 (busy) take the
+// body into the request and post it as a restore request; any other format
+// reads back $02xx (format error).  The restore write waits for an
+// outstanding request.  The ARM's FPU is null after a reset or a null frame
+// until a request reaches it: the first conditional after it is asked of the
+// ARM (null -> idle), so FNOP; FSAVE reads an idle frame.
 //
 // Conditionals: the predicate is evaluated from the FPSR condition codes of
 // the last reply (N, Z, I, NAN) with Hatari's 6888x table (COND_TAB) once no
@@ -69,19 +86,23 @@
 // accrued IOP in the FPSR, and raises the BSUN exception if it is enabled
 // (Hatari fpp_cond/fpsr_set_bsun): that case goes to the ARM as a condition
 // request (KIND 3, the predicate in CMD); the reply's FLAGS bit 2 is the
-// result, bit 1 the BSUN exception (pre-instruction exception primitive,
-// vector 48, $1C30).
+// result, bit 4 the BSUN exception (take pre-instruction exception with the
+// PC, $5C30).
 //
 // Mailbox (guest $E90000, DDR3 0x30E90000; 16-bit words big endian, bytes
 // in memory order: DDR3 byte k = guest byte k):
-//   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (2)   ARM -> FPGA
+//   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (3)   ARM -> FPGA
 //   request, RSEQ written last (FPGA -> ARM):
-//   +$100 RSEQ  +$102 KIND (1 execute, 2 reset, 3 condition)  +$104 CMD  +$106 AUX (Dn
-//   for a dynamic list or k-factor)  +$108 NBYTES  +$110.. operand bytes
+//   +$100 RSEQ  +$102 KIND (1 execute, 2 reset, 3 condition, 4 save, 5 restore)
+//   +$104 CMD  +$106 AUX (Dn for a dynamic list or k-factor; restore: the
+//   format word)  +$108 NBYTES  +$10A IADDR (when the PC was asked for)
+//   +$110..+$1FF operand bytes (restore: the frame body)
 //   reply, ASEQ written last (ARM -> FPGA):
-//   +$200 ASEQ  +$202 FLAGS (bit 0 not implemented, 1 exception, 2 condition
-//   true)  +$204 FPSR[31:16]
-//   +$206 FPSR[15:0]  +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes
+//   +$200 ASEQ  +$202 FLAGS  +$204 FPSR[31:16]  +$206 FPSR[15:0]
+//   +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes (save: the frame)
+//   FLAGS: 0 not implemented, 1 exception pending, 2 condition true,
+//   3 arithmetic exception enabled, 4 this request raised the exception
+//   itself (FMOVE out, BSUN); 15..8 the vector (tools/falcon_fpu/fpu_request.h)
 // Operand and result words move between the operand CIR and the mailbox
 // directly (a CIR access waits for its one or two 16-bit DDR3 accesses).
 module falcon_fpu_bridge #(
@@ -115,21 +136,19 @@ module falcon_fpu_bridge #(
 );
 
 localparam [4:0] CIR_RESP = 5'h00, CIR_CTRL = 5'h02, CIR_SAVE = 5'h04, CIR_REST = 5'h06,
-                 CIR_CMD  = 5'h0A, CIR_COND = 5'h0E, CIR_OPND = 5'h10, CIR_RSEL = 5'h14;
+                 CIR_CMD  = 5'h0A, CIR_COND = 5'h0E, CIR_OPND = 5'h10, CIR_RSEL = 5'h14,
+                 CIR_IADR = 5'h18;
 
 localparam [15:0] R_IDLE  = 16'h0802;   // null, PF: idle
 localparam [15:0] R_REL   = 16'h0900;   // null, IA: released while executing
 localparam [15:0] R_CA    = 16'h8900;   // null, CA, IA: come again
 localparam [15:0] R_FLINE = 16'h1C0B;   // take pre-instruction exception, vector 11
-localparam [15:0] R_BSUN  = 16'h1C30;   // take pre-instruction exception, vector 48
 localparam [15:0] R_PROTO = 16'h1D0D;   // take mid-instruction exception, vector 13
 localparam [15:0] R_ILL   = 16'h1C04;   // take pre-instruction exception, vector 4
 localparam [15:0] R_MIN   = 16'h810C;   // transfer multiple coprocessor registers, to the FPU
 localparam [15:0] R_MOUT  = 16'hA10C;   // ... from the FPU
 
-localparam [15:0] F_IDLE  = 16'h1F38;   // 68882 idle frame: version $1F, 56 bytes
 localparam [15:0] F_CA    = 16'h0118;   // FSAVE while busy: come again
-localparam [3:0]  FRAME_LONGS = 4'd14;
 
 localparam [23:0] MB      = 24'hE90000;
 localparam [23:0] A_MAGIC = MB + 24'h000;
@@ -140,13 +159,14 @@ localparam [23:0] A_KIND  = MB + 24'h102;
 localparam [23:0] A_CMD   = MB + 24'h104;
 localparam [23:0] A_AUX   = MB + 24'h106;
 localparam [23:0] A_RNB   = MB + 24'h108;
+localparam [23:0] A_IADR  = MB + 24'h10A;
 localparam [23:0] A_RDATA = MB + 24'h110;
 localparam [23:0] A_ASEQ  = MB + 24'h200;
 localparam [23:0] A_FLAGS = MB + 24'h202;
 localparam [23:0] A_FPSRH = MB + 24'h204;
 localparam [23:0] A_ADATA = MB + 24'h210;
 localparam [15:0] MAGIC   = 16'h4650;
-localparam [15:0] VERSION = 16'd2;
+localparam [15:0] VERSION = 16'd3;
 
 localparam int POLL_CLKS   = CLK_HZ / 200;          // presence poll, 5 ms
 localparam int ALIVE_POLLS = 20;                    // 100 ms without a heartbeat
@@ -158,12 +178,14 @@ localparam [5:0] GAP_BG    = 6'd32;                 // ... CPU running (leave it
 
 // dialog states
 localparam [3:0] D_IDLE = 4'd0, D_CMD = 4'd1, D_COND = 4'd2, D_DN = 4'd3, D_IN = 4'd4,
-                 D_RSEL = 4'd5, D_WAIT = 4'd6, D_OUT = 4'd7, D_PRIM = 4'd8;
+                 D_RSEL = 4'd5, D_WAIT = 4'd6, D_OUT = 4'd7, D_PRIM = 4'd8,
+                 D_SAVE = 4'd9, D_REST = 4'd10;
 // controller states
 localparam [4:0] T_IDLE  = 5'd0,  T_CIR   = 5'd1,  T_DMA   = 5'd2,
                  T_OST1  = 5'd3,  T_OSTD  = 5'd4,  T_OLD1  = 5'd5,  T_OLDD  = 5'd6,
                  T_PKIND = 5'd7,  T_PCMD  = 5'd8,  T_PAUX  = 5'd9,  T_PNB   = 5'd10,
-                 T_PSEQ  = 5'd11, T_PDONE = 5'd12,
+                 T_PSEQ  = 5'd11, T_PDONE = 5'd12, T_PIAH = 5'd22, T_PIAL = 5'd23,
+                 T_SFMT  = 5'd24,
                  T_QSEQ  = 5'd13, T_QFLG  = 5'd14, T_QFPSR = 5'd15,
                  T_QDONE = 5'd18,
                  T_SMAG  = 5'd19, T_SVER  = 5'd20, T_SHB   = 5'd21;
@@ -222,7 +244,6 @@ reg  [1:0]    cr_siz;
 reg  [31:0]   cr_wdata;
 
 // FPU and dialog state
-reg           st_null;
 reg  [3:0]    dst;
 reg  [15:0]   resp;
 reg  [15:0]   cmd;
@@ -230,13 +251,23 @@ reg  [15:0]   cond;
 reg  [15:0]   aux;
 reg           phase2;               // the Dn of a dynamic list/k-factor is in
 reg  [3:0]    fcc;                  // FPSR condition codes {N, Z, I, NAN}
-reg  [3:0]    frm_cnt;
-reg           frm_save;
-reg  [15:0]   rest_fmt;
+reg  [15:0]   rest_fmt;             // what the restore CIR reads back
+reg           st_null;              // the ARM's FPU may be null (reset, null frame)
+
+// exceptions (UM 6.4.2.2: EXC PEND = FPSR EXC & FPCR ENABLE, kept until FSAVE)
+reg           exc_pend;
+reg  [7:0]    exc_vec;
+reg           exc_en;               // an arithmetic exception is enabled: request the PC
+reg           pc_done;              // this instruction's first primitive asked for the PC
+reg           pc_pend;              // its request waits for the instruction address
+reg           post_ia;              // the request carries the instruction address
+reg  [31:0]   iaddr;
+reg           save_wait = 1'b0;     // FSAVE: the frame was requested
+reg           save_rdy;             // FSAVE: the frame is in the reply
 
 // transfers
 reg  [7:0]    in_len, in_pos;
-reg  [7:0]    blk_size, out_off;
+reg  [7:0]    blk_size, out_off, out_base;
 reg  [3:0]    out_blk, nblk;
 reg           out_pd;               // FMOVEM predecrement: blocks last first
 reg  [15:0]   ld_hi;                // first word of a long result
@@ -245,12 +276,14 @@ reg  [2:0]    xn;                   // bytes in this operand access
 // requests and replies
 reg           busy = 1'b0;          // a request is outstanding
 reg           post_req = 1'b0;      // post the request built in the mailbox
-reg  [1:0]    post_kind;            // 1 execute, 2 reset, 3 condition
+reg  [2:0]    post_kind;            // 1 execute, 2 reset, 3 condition, 4 save, 5 restore
 reg           rst_req = 1'b0;       // the ARM FPU has to be reset
 reg  [15:0]   rseq = 16'd0;
 reg           r_unimpl;
-reg           r_exc;                // reply: exception (BSUN of a condition request)
+reg           r_exc;                // reply: the condition raised BSUN
 reg           r_tf;                 // reply: condition result
+reg           r_mid;                // reply: FMOVE out raised an exception itself
+reg  [7:0]    r_vec;
 reg           cond_arm;             // the condition went to the ARM
 reg           dead;                 // the watchdog ended the last request
 reg  [WW-1:0] wd;
@@ -258,8 +291,9 @@ reg  [5:0]    gap;
 
 wire        cr_fpu   = cr_id == 3'd1;
 wire [15:0] cr_word  = cr_off[1] ? cr_wdata[15:0] : cr_wdata[31:16];
+// (the save CIR re-reads of an FSAVE that got come-again are not first accesses)
 wire        cr_first = (cr_we && (cr_off == CIR_CMD || cr_off == CIR_COND || cr_off == CIR_REST)) ||
-                       (!cr_we && cr_off == CIR_SAVE);
+                       (!cr_we && cr_off == CIR_SAVE && !save_wait);
 
 wire [2:0]  opclass  = cmd[15:13];
 wire [2:0]  fmt      = cmd[12:10];
@@ -281,7 +315,11 @@ wire        op_ill   = opmode >= 7'h78;
 // offset in the reply data of the current output position
 wire [7:0]  oblk     = {4'd0, out_pd ? (nblk - 4'd1 - out_blk) : out_blk};
 wire [7:0]  obase    = blk_size == 8'd12 ? ({oblk[4:0], 3'd0} + {oblk[5:0], 2'd0}) : 8'd0;
-wire [7:0]  oofs     = obase + out_off;
+wire [7:0]  oofs     = out_base + obase + out_off;
+wire        exc_cls  = opclass == 3'b000 || opclass == 3'b010 || opclass == 3'b011;
+wire        pc_req   = exc_en && !pc_done && exc_cls;
+wire [15:0] pcb      = pc_req ? 16'h4000 : 16'h0000;      // PC bit of the first primitive
+wire        rest_wr  = cr_pend && cr_we && cr_off == CIR_REST;
 
 // bytes of an operand CIR access (SIZ: 01 byte, 10 word, 11 three, 00 long)
 wire [2:0]  acc_n    = (cr_siz == 2'b01) ? 3'd1 : (cr_siz == 2'b10) ? 3'd2 :
@@ -308,30 +346,35 @@ endtask
 // the start of a command, once no request is outstanding: the first
 // response of its dialog
 task automatic start_cmd;
+    if (pc_req) pc_done <= 1'b1;
+    post_ia <= pc_done || pc_req;
     case (opclass)
         3'b000:                                          // reg-to-reg
             if (op_fline || op_ill) begin
                 resp <= op_ill ? R_ILL : R_FLINE; dst <= D_IDLE;
             end else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
-                resp <= R_REL; dst <= D_IDLE;
+                in_len <= 8'd0; post_kind <= 3'd1;
+                if (pc_req) pc_pend <= 1'b1; else post_req <= 1'b1;
+                resp <= R_REL | pcb; dst <= D_IDLE;
             end
         3'b010:
             if (fmt == 3'b111) begin                     // FMOVECR
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
-                resp <= R_REL; dst <= D_IDLE;
+                in_len <= 8'd0; post_kind <= 3'd1;
+                if (pc_req) pc_pend <= 1'b1; else post_req <= 1'b1;
+                resp <= R_REL | pcb; dst <= D_IDLE;
             end else if (op_fline || op_ill) begin
                 resp <= op_ill ? R_ILL : R_FLINE; dst <= D_IDLE;
             end else begin
                 in_len <= fsz; in_pos <= 8'd0;
-                resp <= {fsz > 8'd4 ? 8'h96 : 8'h95, fsz}; dst <= D_IN;
+                resp <= {fsz > 8'd4 ? 8'h96 : 8'h95, fsz} | pcb; dst <= D_IN;
             end
         3'b011:
             if (fmt == 3'b111 && !phase2) begin          // packed, dynamic k
-                resp <= {13'h1180, dn_reg}; dst <= D_DN;
+                resp <= {13'h1180, dn_reg} | pcb; dst <= D_DN;
             end else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
-                resp <= R_CA; dst <= D_WAIT;
+                in_len <= 8'd0; post_kind <= 3'd1;
+                if (pc_req) pc_pend <= 1'b1; else post_req <= 1'b1;
+                resp <= R_CA | pcb; dst <= D_WAIT;
             end
         3'b100:
             if (ncr == 4'd0) begin resp <= R_FLINE; dst <= D_IDLE; end
@@ -344,7 +387,7 @@ task automatic start_cmd;
         3'b101:
             if (ncr == 4'd0) begin resp <= R_FLINE; dst <= D_IDLE; end
             else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 3'd1;
                 resp <= R_CA; dst <= D_WAIT;
             end
         3'b110:
@@ -353,7 +396,7 @@ task automatic start_cmd;
         3'b111:
             if (dyn_list && !phase2) begin resp <= {13'h1180, dn_reg}; dst <= D_DN; end
             else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 3'd1;
                 resp <= R_CA; dst <= D_WAIT;
             end
         default: begin resp <= R_FLINE; dst <= D_IDLE; end   // opclass 001
@@ -362,8 +405,9 @@ endtask
 
 // the data primitive of an output dialog, once its reply is in
 task automatic out_start;
-    out_off <= 8'd0;
-    out_blk <= 4'd0;
+    out_off  <= 8'd0;
+    out_blk  <= 4'd0;
+    out_base <= 8'd0;
     case (opclass)
         3'b011: begin
             blk_size <= fsz; nblk <= 4'd1; out_pd <= 1'b0;
@@ -414,11 +458,11 @@ always @(posedge clk) begin
 
     case (st)
         T_IDLE:
-            if (cr_pend && !cp_req)                     st <= T_CIR;
-            else if (post_req && present)               st <= T_PKIND;
+            if (cr_pend && !cp_req && !(rest_wr && (busy || post_req))) st <= T_CIR;
+            else if (post_req && present && !busy)      st <= T_PKIND;
             else if (rst_req && !busy && present && !reset) begin
                 post_req  <= 1'b1;
-                post_kind <= 2'd2;
+                post_kind <= 3'd2;
                 in_len    <= 8'd0;
                 rst_req   <= 1'b0;
                 st        <= T_PKIND;
@@ -445,44 +489,56 @@ always @(posedge clk) begin
             end else if (cr_we) begin
                 case (cr_off)
                     CIR_CMD: begin
-                        st_null <= 1'b0;
                         cmd     <= cr_word;
                         phase2  <= 1'b0;
+                        pc_done <= 1'b0;
+                        save_wait <= 1'b0;
                         dead    <= 1'b0;
                         dst     <= D_CMD;
                         ack(32'hFFFF_FFFF);
                     end
                     CIR_COND: begin
-                        st_null  <= 1'b0;
                         cond     <= cr_word;
                         cond_arm <= 1'b0;
+                        save_wait <= 1'b0;
                         dead     <= 1'b0;
                         dst     <= D_COND;
                         ack(32'hFFFF_FFFF);
                     end
                     CIR_CTRL: begin                     // abort / exception acknowledge
-                        resp    <= R_IDLE;
+                        resp    <= R_IDLE;              // (EXC PEND stays: UM 7.2.2)
                         dst     <= D_IDLE;
-                        frm_cnt <= 4'd0;
+                        pc_pend <= 1'b0;
                         ack(32'hFFFF_FFFF);
                     end
-                    CIR_REST: begin
-                        frm_cnt <= 4'd0;
-                        dst     <= D_IDLE;
-                        resp    <= R_IDLE;
+                    CIR_REST: begin                     // FRESTORE format word
+                        dst      <= D_IDLE;
+                        resp     <= R_IDLE;
+                        save_wait <= 1'b0;
                         if (cr_word[15:8] == 8'h00) begin   // null frame: reset
-                            st_null  <= 1'b1;
                             fcc      <= 4'd0;
+                            st_null  <= 1'b1;
+                            exc_pend <= 1'b0;
                             rst_req  <= 1'b1;
-                            post_req <= 1'b0;
                             rest_fmt <= cr_word;
-                        end else if (cr_word == F_IDLE) begin
-                            st_null  <= 1'b0;
+                        end else if (cr_word == 16'h1F38 || cr_word == 16'h1F18 ||
+                                     cr_word == 16'h1FD4 || cr_word == 16'h1FB4) begin
+                            // idle 68882/68881, busy 68882/68881 (Hatari fpuop_restore)
                             rest_fmt <= cr_word;
-                            frm_cnt  <= FRAME_LONGS;
-                            frm_save <= 1'b0;
+                            aux      <= cr_word;
+                            in_len   <= cr_word[7:0];
+                            in_pos   <= 8'd0;
+                            dst      <= D_REST;
                         end else
                             rest_fmt <= {8'h02, cr_word[7:0]};
+                        ack(32'hFFFF_FFFF);
+                    end
+                    CIR_IADR: begin                     // instruction address (PC primitive)
+                        iaddr <= cr_wdata;
+                        if (pc_pend) begin
+                            pc_pend  <= 1'b0;
+                            post_req <= 1'b1;
+                        end
                         ack(32'hFFFF_FFFF);
                     end
                     CIR_OPND:
@@ -492,7 +548,7 @@ always @(posedge clk) begin
                             dst    <= D_CMD;
                             resp   <= R_CA;
                             ack(32'hFFFF_FFFF);
-                        end else if (dst == D_IN && in_pos < in_len) begin
+                        end else if ((dst == D_IN || dst == D_REST) && in_pos < in_len) begin
                             xn <= acc_n;
                             if (acc_n == 3'd1)
                                 dma(1'b1, A_RDATA + {16'd0, in_pos}, {2{cr_wdata[31:24]}},
@@ -500,40 +556,45 @@ always @(posedge clk) begin
                             else
                                 dma(1'b1, A_RDATA + {16'd0, in_pos}, cr_wdata[31:16], 2'b11,
                                     acc_n == 3'd2 ? T_OSTD : T_OST1);
-                        end else begin
-                            if (frm_cnt != 4'd0 && !frm_save) frm_cnt <= frm_cnt - 1'd1;
+                        end else
                             ack(32'hFFFF_FFFF);
-                        end
-                    default: ack(32'hFFFF_FFFF);        // instruction address etc.
+                    default: ack(32'hFFFF_FFFF);
                 endcase
             end else begin
                 case (cr_off)
                     CIR_RESP:
                         case (dst)
                             D_CMD:
-                                if (busy || post_req) ack({R_CA, R_CA});
+                                if (busy || post_req || pc_pend) ack({R_CA, R_CA});
                                 else if (dead) begin
                                     dead <= 1'b0; dst <= D_IDLE; resp <= R_IDLE;
                                     ack({R_PROTO, R_PROTO});
+                                end else if (exc_pend && exc_cls && !phase2) begin
+                                    dst <= D_IDLE; resp <= R_IDLE;   // pre-instruction exception
+                                    ack({2{8'h1C, exc_vec}});
                                 end else begin
                                     start_cmd;
                                     st <= T_CIR;            // answer with the new response
                                 end
                             D_COND:
-                                if (busy || post_req) ack({R_CA, R_CA});
+                                if (busy || post_req || pc_pend) ack({R_CA, R_CA});
                                 else if (dead) begin
                                     dead <= 1'b0; dst <= D_IDLE; resp <= R_IDLE;
                                     ack({R_PROTO, R_PROTO});
+                                end else if (exc_pend && !cond_arm) begin
+                                    dst <= D_IDLE; resp <= R_IDLE;   // pre-instruction exception
+                                    ack({2{8'h1C, exc_vec}});
                                 end else if (cond_arm) begin  // the ARM's answer
                                     cond_arm <= 1'b0;
                                     dst  <= D_IDLE;
                                     resp <= R_IDLE;
-                                    ack(r_exc ? {R_BSUN, R_BSUN} : {2{15'h0400, r_tf}});
-                                end else if (cond_nan) begin  // BSUN: ask the ARM
+                                    // BSUN: pre-instruction exception with the PC (UM 7.5.4.4)
+                                    ack(r_exc ? {2{8'h5C, r_vec}} : {2{15'h0400, r_tf}});
+                                end else if (cond_nan || st_null) begin  // ask the ARM
                                     cond_arm  <= 1'b1;
                                     in_len    <= 8'd0;
                                     post_req  <= 1'b1;
-                                    post_kind <= 2'd3;
+                                    post_kind <= 3'd3;
                                     ack({R_CA, R_CA});
                                 end else begin
                                     dst  <= D_IDLE;
@@ -543,14 +604,15 @@ always @(posedge clk) begin
                             D_IN:
                                 if (in_pos >= in_len) begin // operand complete: post
                                     post_req  <= 1'b1;
-                                    post_kind <= 2'd1;
+                                    post_kind <= 3'd1;
                                     dst       <= D_IDLE;
                                     resp      <= R_IDLE;
                                     ack(opclass == 3'b010 ? {R_REL, R_REL} : {R_IDLE, R_IDLE});
                                 end else
                                     ack({resp, resp});
                             D_WAIT:
-                                if (busy || post_req) ack({R_CA, R_CA});
+                                if (pc_pend) ack({resp, resp});     // the first primitive: PC set
+                                else if (busy || post_req) ack({R_CA, R_CA});
                                 else if (dead) begin
                                     dead <= 1'b0; dst <= D_IDLE; resp <= R_IDLE;
                                     ack({R_PROTO, R_PROTO});
@@ -568,7 +630,8 @@ always @(posedge clk) begin
                             D_OUT: begin                    // result taken
                                 dst  <= D_IDLE;
                                 resp <= R_IDLE;
-                                ack({R_IDLE, R_IDLE});
+                                // an exception of the move itself: mid-instruction (UM 6.4.2.2)
+                                ack(r_mid && opclass == 3'b011 ? {2{8'h1D, r_vec}} : {R_IDLE, R_IDLE});
                             end
                             default: begin                  // a primitive reads once
                                 ack({resp, resp});
@@ -585,23 +648,33 @@ always @(posedge clk) begin
                         end
                         ack({mask, 8'h00, mask, 8'h00});
                     end
-                    CIR_SAVE:
-                        if (busy || post_req) ack({F_CA, F_CA});
-                        else if (st_null) ack(32'h0000_0000);
-                        else begin
-                            frm_cnt  <= FRAME_LONGS;
-                            frm_save <= 1'b1;
-                            ack({F_IDLE, F_IDLE});
+                    CIR_SAVE:                           // FSAVE: the frame from the ARM
+                        if (busy || post_req || pc_pend) ack({F_CA, F_CA});
+                        else if (save_wait && (dead || !present)) begin
+                            // the service stopped answering: FSAVE cannot take an
+                            // exception, it ends with a null frame
+                            save_wait <= 1'b0;
+                            dead      <= 1'b0;
+                            ack(32'h0000_0000);
+                        end else if (save_wait && save_rdy) begin
+                            save_wait <= 1'b0;
+                            save_rdy  <= 1'b0;
+                            dma(1'b0, A_ADATA, 16'd0, 2'b11, T_SFMT);
+                        end else begin
+                            save_wait <= 1'b1;
+                            save_rdy  <= 1'b0;
+                            dead      <= 1'b0;          // only this request's timeout counts
+                            in_len    <= 8'd0;
+                            post_req  <= 1'b1;
+                            post_kind <= 3'd4;
+                            ack({F_CA, F_CA});
                         end
                     CIR_REST: ack({rest_fmt, rest_fmt});
                     CIR_OPND:
-                        if (dst == D_OUT) begin
+                        if (dst == D_OUT || dst == D_SAVE) begin
                             xn <= acc_n;
                             dma(1'b0, A_ADATA + {16'd0, oofs[7:1], 1'b0}, 16'd0, 2'b11,
                                 acc_n == 3'd4 ? T_OLD1 : T_OLDD);
-                        end else if (frm_cnt != 4'd0 && frm_save) begin
-                            frm_cnt <= frm_cnt - 1'd1;
-                            ack(32'h0000_0000);
                         end else
                             ack(32'hFFFF_FFFF);
                     default: ack(32'hFFFF_FFFF);        // unimplemented CIRs
@@ -612,7 +685,27 @@ always @(posedge clk) begin
         T_OST1: dma(1'b1, A_RDATA + {16'd0, in_pos} + 24'd2, cr_wdata[15:0], 2'b11, T_OSTD);
         T_OSTD: begin
             in_pos <= in_pos + {5'd0, xn};
+            if (dst == D_REST && in_pos + {5'd0, xn} >= in_len) begin
+                post_req  <= 1'b1;              // the whole frame is in: restore it
+                post_kind <= 3'd5;
+                dst       <= D_IDLE;
+            end
             ack(32'hFFFF_FFFF);
+        end
+
+        // ---- FSAVE: the format word of the frame in the reply, then the body as
+        // operand reads, last long first: the 68030 stores the body to
+        // descending addresses (UM 10.2.3.3), the reply holds the frame image
+        // (format long, then the body ascending) ----
+        T_SFMT: begin
+            out_base <= rd_q[7:0];          // offset of the last long
+            out_off  <= 8'd0;
+            out_blk  <= 4'd0;
+            nblk     <= 4'd1;
+            out_pd   <= 1'b0;
+            blk_size <= 8'd4;
+            dst      <= rd_q[15:8] == 8'h00 ? D_IDLE : D_SAVE;
+            ack({rd_q, rd_q});
         end
 
         // ---- result from the reply ----
@@ -629,15 +722,20 @@ always @(posedge clk) begin
                 out_blk <= out_blk + 1'd1;
             end else
                 out_off <= out_off + {5'd0, xn};
+            if (dst == D_SAVE) out_base <= out_base - 8'd4;
         end
 
         // ---- post a request: header, RSEQ last ----
-        T_PKIND: dma(1'b1, A_KIND, {14'd0, post_kind}, 2'b11, T_PCMD);
-        T_PCMD:  dma(1'b1, A_CMD, post_kind == 2'd3 ? {10'd0, cond[5:0]} : cmd, 2'b11, T_PAUX);
+        T_PKIND: dma(1'b1, A_KIND, {13'd0, post_kind}, 2'b11, T_PCMD);
+        T_PCMD:  dma(1'b1, A_CMD, post_kind == 3'd3 ? {10'd0, cond[5:0]} : cmd, 2'b11, T_PAUX);
         T_PAUX:  dma(1'b1, A_AUX, aux, 2'b11, T_PNB);
-        T_PNB:   dma(1'b1, A_RNB, {8'd0, in_len}, 2'b11, T_PSEQ);
+        T_PNB:   dma(1'b1, A_RNB, {8'd0, in_len}, 2'b11, (post_ia && post_kind == 3'd1) ? T_PIAH : T_PSEQ);
+        T_PIAH:  dma(1'b1, A_IADR, iaddr[31:16], 2'b11, T_PIAL);
+        T_PIAL:  dma(1'b1, A_IADR + 24'd2, iaddr[15:0], 2'b11, T_PSEQ);
         T_PSEQ:  dma(1'b1, A_RSEQ, rseq + 1'd1, 2'b11, T_PDONE);
         T_PDONE: begin
+            if (post_kind == 3'd1 || post_kind == 3'd3 || post_kind == 3'd5)
+                st_null <= 1'b0;            // the request takes the ARM's FPU to idle
             rseq     <= rseq + 1'd1;
             busy     <= 1'b1;
             post_req <= 1'b0;
@@ -653,9 +751,18 @@ always @(posedge clk) begin
                 st  <= T_IDLE;
             end
         T_QFLG: begin
+            // FLAGS: 0 not implemented, 1 exception pending (EXC PEND), 2 condition
+            // true, 3 arithmetic exceptions enabled, 4 the instruction raised its
+            // exception itself (FMOVE out, BSUN of a condition); 15..8 vector
             r_unimpl <= rd_q[0];
-            r_exc    <= rd_q[1];
+            r_exc    <= rd_q[4];
             r_tf     <= rd_q[2];
+            r_mid    <= rd_q[4];
+            r_vec    <= rd_q[15:8];
+            exc_pend <= rd_q[1];
+            exc_vec  <= rd_q[15:8];
+            exc_en   <= rd_q[3];
+            if (post_kind == 3'd4) save_rdy <= 1'b1;
             dma(1'b0, A_FPSRH, 16'd0, 2'b11, T_QFPSR);
         end
         T_QFPSR: begin                      // (FPCR and the result length are not needed)
@@ -664,7 +771,7 @@ always @(posedge clk) begin
         end
         T_QDONE: begin
             busy <= 1'b0;
-            if (resp == R_REL) resp <= R_IDLE;  // the background instruction is done
+            if ((resp & 16'hBFFF) == R_REL) resp <= R_IDLE;  // the background instruction is done
             st   <= T_IDLE;
         end
 
@@ -691,12 +798,17 @@ always @(posedge clk) begin
         dst      <= D_IDLE;
         resp     <= R_IDLE;
         fcc      <= 4'd0;
-        frm_cnt  <= 4'd0;
         rest_fmt <= 16'h0000;
+        exc_pend <= 1'b0;
+        exc_en   <= 1'b0;
+        pc_pend  <= 1'b0;
+        save_wait <= 1'b0;
+        save_rdy <= 1'b0;
         dead     <= 1'b0;
         cond_arm <= 1'b0;
         rst_req  <= 1'b1;               // reset the FPU on the ARM too
-        if (st != T_PKIND && st != T_PCMD && st != T_PAUX && st != T_PNB && st != T_PSEQ)
+        if (st != T_PKIND && st != T_PCMD && st != T_PAUX && st != T_PNB && st != T_PIAH &&
+            st != T_PIAL && st != T_PSEQ)
             post_req <= 1'b0;
     end
     if (por) begin

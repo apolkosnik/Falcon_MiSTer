@@ -24,5 +24,5 @@ verilator --cc --exe --build -j 16 -O3 --x-assign fast --x-initial fast \
 	-Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD -Wno-MULTIDRIVEN -Wno-UNOPTFLAT \
 	--top-module tb_top -Mdir ${OBJ:-obj_dir} $DEFS \
 	-I$R/AP68030/rtl -I$R/AP68030/rtl/core -I$R/falcon -I$R/falcon/dsp \
-	-CFLAGS "-I$PWD/$FPE" -LDFLAGS "$PWD/$FPE/build/host/libfpe.a -lm" \
+	-CFLAGS "-I$PWD/$FPE -I$PWD/$FPE/.." -LDFLAGS "$PWD/$FPE/build/host/libfpe.a -lm" \
 	tb_top.sv ddr3_model.sv $R/AP68030/rtl/*.v $SRCS sim_main.cpp

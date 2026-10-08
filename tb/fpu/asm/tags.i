@@ -68,7 +68,8 @@ T_RS_SIZE	equ	$0603	; bytes pushed by the FSAVE after RESET
 T_RAW		equ	$0700
 
 ; t_frames: idle frame body (14 longs after the format long) OR-ed together
-T_FS_IDLE_BODY	equ	$0115
+T_FS_IDLE_BODY	equ	$0170	; + n, n = 0..13: the 14 body longs
+T_ODDF		equ	$0160	; + 4*i + {0 exceptions, 1 bytes consumed}
 
 ; t_raw / t_rawna  (raw CIR reads/writes through MOVES with DFC = SFC = 7)
 T_RAW_RESP0	equ	$0700	; response CIR after reset (read)
@@ -86,3 +87,12 @@ T_BG_FP0	equ	$0800
 T_BUSY_FMT	equ	$0810
 T_BUSY_DELTA	equ	$0811
 T_WD_AFTER	equ	$0820
+
+; t_irq / t_fsdie (milestone 4)
+T_IRQ_DELTA	equ	$0830
+T_IRQ_FMT	equ	$0831
+T_IRQ_CNT	equ	$0832
+T_FSD_DELTA	equ	$0840	; FSAVE whose service died: bytes pushed
+T_FSD_FMT	equ	$0841	; ... format word (null, $0000)
+T_FSD_DELTA2	equ	$0842	; FNOP; FSAVE after the service is back: bytes pushed
+T_FSD_FMT2	equ	$0843	; ... format word

@@ -6,6 +6,7 @@
 /* per-instruction event record filled by the Exception()/op_illg() hooks */
 extern int      fpe_ev_unimpl;     /* op_illg() called */
 extern int      fpe_ev_exc;        /* Exception() called */
+extern int      fpe_ev_fmt, fpe_ev_pre; /* format error / exception reported pre-instruction */
 extern uint32_t fpe_ev_vector;     /* last vector */
 extern uint32_t fpe_ev_opcode;     /* opcode given to op_illg */
 

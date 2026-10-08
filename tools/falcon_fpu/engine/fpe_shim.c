@@ -34,7 +34,7 @@ uae_u16 mmu030_state[3];
 uae_u32 mmu030_data_buffer_out;
 uae_u32 mmu030_fmovem_store[2];
 
-int      fpe_ev_unimpl, fpe_ev_exc;
+int      fpe_ev_unimpl, fpe_ev_exc, fpe_ev_fmt, fpe_ev_pre;
 uint32_t fpe_ev_vector, fpe_ev_opcode;
 
 static uae_u8 dummy_code[16];          /* m68k_setpc()/get_real_address() target */
@@ -46,7 +46,9 @@ uae_u8 *memory_get_real_address(uaecptr a) { (void)a; return dummy_code; }
  * instruction this FPU executes" and are reported as unimplemented */
 void Exception(int nr)
 {
-	if (nr == 4 || nr == 11) fpe_ev_unimpl = 1; else fpe_ev_exc = 1;
+	if (nr == 4 || nr == 11) fpe_ev_unimpl = 1;
+	else if (nr == 14) fpe_ev_fmt = 1;                 /* FRESTORE format error */
+	else { fpe_ev_exc = 1; fpe_ev_pre = regs.fpu_exp_pre ? 1 : 0; }
 	fpe_ev_vector = (uint32_t)nr;
 }
 void Exception_cpu_oldpc(int nr, uaecptr oldpc) { (void)oldpc; Exception(nr); }
@@ -65,6 +67,7 @@ uae_u32 restore_u32(void) { return 0; }
 
 /* ---- memory accessors ---------------------------------------------------------------- */
 #define BUFSZ 256
+#define IADDR_DUMMY 0
 static uae_u8  fpe_buf[BUFSZ];
 static int     buf_rd_end, buf_wr_lo, buf_wr_hi, buf_err;
 
@@ -160,7 +163,7 @@ void fpe_shim_set_pc(uint32_t pc)
 
 void fpe_shim_clear_events(void)
 {
-	fpe_ev_unimpl = fpe_ev_exc = 0;
+	fpe_ev_unimpl = fpe_ev_exc = fpe_ev_fmt = fpe_ev_pre = 0;
 	fpe_ev_vector = fpe_ev_opcode = 0;
 	buf_err = 0;
 }
@@ -204,6 +207,11 @@ void fpe_reset(void)
 	fpe_shim_clear_events();
 }
 
+static int ev_flags(void)
+{
+	return (fpe_ev_unimpl ? FPE_UNIMPL : 0) | (fpe_ev_exc ? FPE_EXCEPTION : 0) | (fpe_ev_fmt ? FPE_FORMAT : 0);
+}
+
 /* ---- execution ----------------------------------------------------------------------- */
 static int popcnt8(unsigned v) { int n = 0; for (v &= 0xff; v; v >>= 1) n += v & 1; return n; }
 
@@ -237,10 +245,19 @@ int fpe_exec(uint16_t cmd, const uint8_t *in, int in_len, uint16_t aux, uint32_t
 	regs.regs[(cmd >> 4) & 7] = (uae_u32)(uae_s32)(int16_t)aux; /* Dn for dynamic list / k-factor */
 	fpe_shim_set_pc(iaddr + 4);                          /* fpp.c: pc = m68k_getpc() - 4 */
 
-	fpuop_arithmetic(opcode, cmd);
+	/* UM 6.4.2.2: a pending enabled exception is reported only by opclass 000/010/011 and the conditionals;
+	 * FMOVEM and the control-register moves (opclass 100-111) execute normally.  Hatari checks it for every
+	 * opclass, so hide it around those. */
+	if (cls >= 4) {
+		uae_u32 pend = regs.fp_exp_pend;
+		regs.fp_exp_pend = 0;
+		fpuop_arithmetic(opcode, cmd);
+		if (!regs.fp_exp_pend) regs.fp_exp_pend = pend;
+	} else {
+		fpuop_arithmetic(opcode, cmd);
+	}
 
-	if (fpe_ev_unimpl) flags |= FPE_UNIMPL;
-	if (fpe_ev_exc)    flags |= FPE_EXCEPTION;
+	flags |= ev_flags();
 	if (buf_err || buf_rd_end > in_len) flags |= FPE_ERROR;
 
 	lo = buf_wr_lo; hi = buf_wr_hi;
@@ -259,9 +276,85 @@ uint32_t fpe_vector(void){ return fpe_ev_vector; }
 
 int fpe_cond(int cc)
 {
+	/* run Hatari's FScc Dn so the pre-instruction exception check, BSUN and the null->idle transition
+	 * all happen as for a real conditional instruction */
+	uae_u32 d1;
+	int r;
 	fpe_shim_init();
 	fpe_shim_clear_events();
-	return fpp_cond(cc);
+	fpe_shim_set_pc(4);
+	d1 = regs.regs[1];                                    /* the caller's D1 (tests share regs) */
+	regs.regs[1] = 0x5A5A5A00u;
+	fpuop_scc(0xF241, (uae_u16)cc);                       /* FScc D1 */
+	r = (fpe_ev_exc || fpe_ev_unimpl) ? -2 : (regs.regs[1] & 0xff) == 0xff;
+	regs.regs[1] = d1;
+	return r;
+}
+
+int fpe_status(void)
+{
+	int st = 0;
+	if (regs.fp_exp_pend) st |= FPE_ST_PEND;
+	if (fpe_ev_exc) st |= fpe_ev_pre ? FPE_ST_PRE : FPE_ST_MID;
+	if (regs.fpcr & 0x7f00) st |= FPE_ST_ENABLED;
+	return st;
+}
+uint32_t fpe_pending_vector(void) { return regs.fp_exp_pend; }
+
+/* FSAVE -(A0) with A0 = 256: the buffer then holds the frame image ascending. */
+int fpe_save(uint8_t *frame, int *len)
+{
+	int n, flags;
+	uae_u32 a0;
+	fpe_shim_init();
+	fpe_shim_use_buffer();
+	fpe_shim_clear_events();
+	memset(fpe_buf, 0, sizeof fpe_buf);
+	buf_rd_end = 0; buf_wr_lo = BUFSZ; buf_wr_hi = 0;
+	a0 = regs.regs[8];                                    /* the caller's A0 (tests share regs) */
+	regs.regs[8] = BUFSZ;
+	fpe_shim_set_pc(IADDR_DUMMY + 2);
+	/* Divergence from the UM: Hatari writes BIU flags bit 27 = 1 (no exception) unless fpu_exp_state is set,
+	 * which only FRESTORE does.  A pending exception must be saved with bit 27 = 0, so mark the state first;
+	 * fpuop_save then writes 0x20000000 (bit 27 clear) and itself clears fp_exp_pend / fpu_exp_state. */
+	if (regs.fp_exp_pend) regs.fpu_exp_state = 2;
+	fpuop_save(0xF320);                                    /* FSAVE -(A0) */
+	regs.regs[8] = a0;
+	flags = ev_flags();
+	if (buf_err) flags |= FPE_ERROR;
+	n = buf_wr_hi > buf_wr_lo ? buf_wr_hi - buf_wr_lo : 0;
+	if (n && buf_wr_hi != BUFSZ) flags |= FPE_ERROR;
+	if (n > FPE_MAXIO) { n = FPE_MAXIO; flags |= FPE_ERROR; }
+	if (frame && n) memcpy(frame, fpe_buf + BUFSZ - n, (size_t)n);
+	if (len) *len = n;
+	return flags;
+}
+
+/* FRESTORE (A0)+ on a frame at offset 0.  Version byte other than $00 (null) and $1F (6888x) is a format
+ * error here; Hatari would otherwise reinterpret $40/$41 as a 68040 frame. */
+int fpe_restore(const uint8_t *frame, int len)
+{
+	int flags = 0;
+	uae_u32 a0;
+	fpe_shim_init();
+	fpe_shim_use_buffer();
+	fpe_shim_clear_events();
+	if (len < 4 || len > FPE_MAXIO || !frame) return FPE_ERROR;
+	if (frame[0] != 0x00 && frame[0] != 0x1f) {
+		fpe_ev_fmt = 1; fpe_ev_vector = 14;
+		return FPE_FORMAT;
+	}
+	memset(fpe_buf, 0, sizeof fpe_buf);
+	memcpy(fpe_buf, frame, (size_t)len);
+	buf_rd_end = 0; buf_wr_lo = BUFSZ; buf_wr_hi = 0;
+	a0 = regs.regs[8];                                    /* the caller's A0 (tests share regs) */
+	regs.regs[8] = 0;
+	fpe_shim_set_pc(IADDR_DUMMY + 2);
+	fpuop_restore(0xF358);                                 /* FRESTORE (A0)+ */
+	regs.regs[8] = a0;
+	flags = ev_flags();
+	if (buf_err || buf_rd_end > len) flags |= FPE_ERROR;
+	return flags;
 }
 
 void fpe_set_fpcr(uint32_t v)  { fpe_shim_init(); fpp_set_fpcr(v); }

@@ -30,9 +30,14 @@
 #include "fpe_internal.h"
 
 /* ---------------------------------------------------------------- state helpers */
-typedef struct { uint16_t se[8]; uint64_t m[8]; uint32_t fpcr, fpsr, fpiar; int pend; } St;
+typedef struct { uint16_t se[8]; uint64_t m[8]; uint32_t fpcr, fpsr, fpiar; int pend; int fs; } St;
 typedef struct { uint16_t cmd; uint8_t in[FPE_MAXIO]; int in_len; uint16_t aux; } Step;
-typedef struct { int flags; uint32_t vec; int out_len; uint8_t out[FPE_MAXIO]; } Res;
+typedef struct { int flags; uint32_t vec; int out_len; uint8_t out[FPE_MAXIO]; int st; uint32_t pvec; } Res;
+/* optional independent expectations for the next run_check (-1 = unchecked) */
+static int want_fl[3] = { -1, -1, -1 }, want_st[3] = { -1, -1, -1 };
+static int want_vec[3] = { -1, -1, -1 };
+static int64_t want_fpiar = -1;
+static void clear_want(void) { for (int i = 0; i < 3; i++) want_fl[i] = want_st[i] = want_vec[i] = -1; want_fpiar = -1; }
 
 #define IADDR 0x00012340u
 #define BASE  0x100u
@@ -63,12 +68,13 @@ static void get_state(St *s)
 	s->fpsr = fpe_fpsr();
 	s->fpiar = fpe_fpiar();
 	s->pend = (int)regs.fp_exp_pend;
+	s->fs = (int)(regs.fpu_state | (regs.fpu_exp_state << 4));
 }
 
 static int st_eq(const St *a, const St *b)
 {
 	for (int i = 0; i < 8; i++) if (a->se[i] != b->se[i] || a->m[i] != b->m[i]) return 0;
-	return a->fpcr == b->fpcr && a->fpsr == b->fpsr && a->fpiar == b->fpiar && a->pend == b->pend;
+	return a->fpcr == b->fpcr && a->fpsr == b->fpsr && a->fpiar == b->fpiar && a->pend == b->pend && a->fs == b->fs;
 }
 
 static St base_state(void)
@@ -109,7 +115,7 @@ static void summ(char *d, size_t n, const St *init, const St *s, const Res *r, i
 	d[0] = 0; o = 0;
 	for (int k = 0; k < ns; k++) {
 		hex(h, sizeof h, r[k].out, r[k].out_len);
-		o += (size_t)snprintf(d + o, n - o, "[fl=%d v=%u out(%d)=%.40s%s]", r[k].flags, r[k].vec, r[k].out_len, h,
+		o += (size_t)snprintf(d + o, n - o, "[fl=%d v=%u st=%x out(%d)=%.40s%s]", r[k].flags, r[k].vec, r[k].st, r[k].out_len, h,
 		                      strlen(h) > 40 ? ".." : "");
 	}
 	snprintf(d + o, n - o, " fpsr=%08x fpcr=%08x fpiar=%08x%s%s", s->fpsr, s->fpcr, s->fpiar,
@@ -187,7 +193,15 @@ static void golden_step(const Step *s, int gm, Res *r, int *a1_ok)
 	fpe_shim_use_memory(gmem, GSIZE, is, nis);
 	fpe_shim_set_pc(IADDR + 4);
 	fpe_shim_clear_events();
-	fpuop_arithmetic(gm_opc[gm], s->cmd);
+	if ((s->cmd >> 13) >= 4) {         /* UM rule: pending exception is not tested by FMOVEM / control moves */
+		uae_u32 pend = regs.fp_exp_pend;
+		regs.fp_exp_pend = 0;
+		fpuop_arithmetic(gm_opc[gm], s->cmd);
+		if (!regs.fp_exp_pend) regs.fp_exp_pend = pend;
+	} else {
+		fpuop_arithmetic(gm_opc[gm], s->cmd);
+	}
+	r->st = fpe_status(); r->pvec = fpe_pending_vector();
 	r->flags = (fpe_ev_unimpl ? FPE_UNIMPL : 0) | (fpe_ev_exc ? FPE_EXCEPTION : 0);
 	r->vec = fpe_ev_vector;
 	r->out_len = 0;
@@ -201,6 +215,8 @@ static void golden_step(const Step *s, int gm, Res *r, int *a1_ok)
 }
 
 /* ---------------------------------------------------------------- one check */
+static uint32_t fpe_vector_of(const Res *r) { return r->flags ? r->vec : r->pvec; }
+
 static void run_check(const char *name, const Step *steps, int ns, const St *init)
 {
 	St eg, gg; Res er[3], gr[3];
@@ -212,10 +228,19 @@ static void run_check(const char *name, const Step *steps, int ns, const St *ini
 	for (int k = 0; k < ns; k++) {
 		const Step *s = &steps[k];
 		er[k].flags = fpe_exec(s->cmd, s->in, s->in_len, s->aux, IADDR, er[k].out, &er[k].out_len);
+		er[k].st = fpe_status(); er[k].pvec = fpe_pending_vector();
 		er[k].vec = fpe_vector();
 		if (!er[k].flags) er[k].vec = 0;
 	}
 	get_state(&eg);
+	int wok = 1;
+	for (int k = 0; k < ns; k++) {
+		if (want_fl[k] >= 0 && er[k].flags != want_fl[k]) wok = 0;
+		if (want_vec[k] >= 0 && fpe_vector_of(&er[k]) != (uint32_t)want_vec[k]) wok = 0;
+		if (want_st[k] >= 0 && er[k].st != want_st[k]) wok = 0;
+	}
+	if (want_fpiar >= 0 && eg.fpiar != (uint32_t)want_fpiar) wok = 0;
+	clear_want();
 
 	for (int gm = 0; gm < GM_NMODES; gm++) {
 		int ok = 1, a1ok = 1;
@@ -231,6 +256,7 @@ static void run_check(const char *name, const Step *steps, int ns, const St *ini
 			memcpy(eimg, gmem0, sizeof eimg);
 			if (er[k].out_len) memcpy(eimg + BASE, er[k].out, (size_t)er[k].out_len);
 			if (memcmp(eimg, gmem, sizeof eimg)) ok = 0;
+			if (gr[k].st != er[k].st || gr[k].pvec != er[k].pvec) ok = 0;
 			if (gr[k].flags != er[k].flags || (gr[k].flags && gr[k].vec != er[k].vec)) ok = 0;
 			if (!gr[k].flags && is_out(&steps[k]) && er[k].out_len != exp_size(&steps[k])) ok = 0;
 			if (gr[k].flags & FPE_UNIMPL) {}
@@ -241,10 +267,11 @@ static void run_check(const char *name, const Step *steps, int ns, const St *ini
 		get_state(&gg);
 		if (!st_eq(&gg, &eg)) ok = 0;
 		if (!a1ok) ok = 0;
+		if (!wok) ok = 0;
 		tally(ok);
 		if (!ok || verbose || !quiet) {
 			char tag[48];
-			snprintf(tag, sizeof tag, "%s%s", gm_name[gm], a1ok ? "" : " A1!");
+			snprintf(tag, sizeof tag, "%s%s%s", gm_name[gm], a1ok ? "" : " A1!", wok ? "" : " WANT!");
 			summ(sa, sizeof sa, init, &gg, gr, ns);
 			summ(sb, sizeof sb, init, &eg, er, ns);
 			if (ok && !verbose) printf("[ ok ] %-9s %-34s %-8s exp==got %s\n", cat_name, name, tag, sa);
@@ -562,6 +589,288 @@ static void t_arith(void)
 	printf("  (cond: 512 predicate evaluations through fpe_cond vs fpp_cond)\n");
 }
 
+
+/* ---------------------------------------------------------------- milestone 4 */
+static void expect(const char *name, int cond, const char *detail)
+{
+	tally(cond);
+	if (!cond || !quiet) printf("[%s] %-9s %-52s %s\n", cond ? " ok " : "FAIL", cat_name, name, detail ? detail : "");
+}
+
+#define E_PEND 0x01
+#define E_MID  0x02
+#define E_PRE  0x04
+#define E_EN   0x08
+static Step mkstep(uint16_t cmd, uint16_t se, uint64_t m, int has_x)
+{
+	Step s; memset(&s, 0, sizeof s); s.cmd = cmd;
+	if (has_x) { xbytes(s.in, se, m, 0); s.in_len = 12; }
+	return s;
+}
+
+static void t_exc4(void)
+{
+	char nm[128];
+	category("exc-pend");
+	/* arithmetic that raises each enabled exception; then a 2nd arithmetic (must report it pre-instruction,
+	 * not executing), then FMOVEM.X out (must execute: UM 6.4.2.2) */
+	static const struct { const char *n; uint32_t en; uint16_t fse; uint64_t fm; uint16_t sse; uint64_t sm; int op; int vec; } c[] = {
+		{ "SNAN  FADD sNaN",      0x4000, 0x3fff, 0x8000000000000000ull, 0x7fff, 0x8000000000000001ull, 0x22, 54 },
+		{ "OPERR FSQRT -1",       0x2000, 0x3fff, 0x8000000000000000ull, 0xbfff, 0x8000000000000000ull, 0x04, 52 },
+		{ "OVFL  FMUL huge*huge", 0x1000, 0x7ffe, 0xffffffffffffffffull, 0x7ffe, 0xffffffffffffffffull, 0x23, 53 },
+		{ "UNFL  FMUL min*min",   0x0800, 0x0001, 0x8000000000000000ull, 0x0001, 0x8000000000000000ull, 0x23, 51 },
+		{ "DZ    FDIV 1/0",       0x0400, 0x3fff, 0x8000000000000000ull, 0x0000, 0,                     0x20, 50 },
+		{ "INEX2 FDIV 1/3",       0x0200, 0x3fff, 0x8000000000000000ull, 0x4000, 0xc000000000000000ull, 0x20, 49 },
+		{ "prio  FMUL huge all",  0xff00, 0x7ffe, 0xffffffffffffffffull, 0x7ffe, 0xffffffffffffffffull, 0x23, 53 },
+		{ "prio  FSQRT -1 all",   0xff00, 0x3fff, 0x8000000000000000ull, 0xbfff, 0x8000000000000000ull, 0x04, 52 },
+		{ "prio  FDIV 0/0 all",   0xff00, 0x0000, 0,                     0x0000, 0,                     0x20, 52 },
+		{ "prio  FADD sNaN all",  0xff00, 0x3fff, 0x8000000000000000ull, 0x7fff, 0x8000000000000001ull, 0x22, 54 },
+		{ "prio  FDIV 1/0 all",   0xff00, 0x3fff, 0x8000000000000000ull, 0x0000, 0,                     0x20, 50 },
+		{ "prio  FMUL min*min all", 0xff00, 0x0001, 0x8000000000000000ull, 0x0001, 0x8000000000000000ull, 0x23, 51 },
+		{ "prio  FDIV 1/3 all",   0xff00, 0x3fff, 0x8000000000000000ull, 0x4000, 0xc000000000000000ull, 0x20, 49 },
+		{ "none  FDIV 1/0 disabled", 0x0000, 0x3fff, 0x8000000000000000ull, 0x0000, 0,                  0x20, 0 },
+		{ "none  FDIV 1/0 BSUN-only", 0x8000, 0x3fff, 0x8000000000000000ull, 0x0000, 0,                 0x20, 0 },
+	};
+	for (unsigned i = 0; i < sizeof c / sizeof *c; i++) {
+		for (int v = 0; v < 3; v++) {
+			St s = base_state(); Step st[3];
+			s.fpcr = c[i].en; s.fpiar = 0xCAFEF00Du; s.se[0] = c[i].fse; s.m[0] = c[i].fm;
+			st[0] = mkstep((uint16_t)(0x4000 | F_X << 10 | 0 << 7 | c[i].op), c[i].sse, c[i].sm, 1);
+			/* step 1 variants: arithmetic / FMOVE.L out / FMOVEM.L control out */
+			if (v == 0) st[1] = mkstep((uint16_t)(0x0000 | 1 << 10 | 2 << 7 | 0x22), 0, 0, 0);       /* FADD FP1,FP2 */
+			else if (v == 1) st[1] = mkstep((uint16_t)(0x6000 | F_L << 10 | 1 << 7), 0, 0, 0);       /* FMOVE.L FP1 */
+			else st[1] = mkstep((uint16_t)(0xA000 | 7 << 10), 0, 0, 0);                                 /* FMOVEM.L FPCR/FPSR/FPIAR */
+			st[2] = mkstep((uint16_t)(0xE000 | 2 << 11 | 0x40), 0, 0, 0);                              /* FMOVEM.X FP1 */
+			int en = (c[i].en & 0x7f00) ? E_EN : 0, vec = c[i].vec;
+			want_fl[0] = 0; want_st[0] = vec ? (E_PEND | en) : en; want_vec[0] = vec ? vec : 0;
+			if (vec && v < 2) { want_fl[1] = FPE_EXCEPTION; want_st[1] = E_PEND | E_PRE | en; want_vec[1] = vec; }
+			else { want_fl[1] = 0; want_st[1] = vec ? (E_PEND | en) : en; }
+			want_fl[2] = 0; want_st[2] = vec ? (E_PEND | en) : en;
+			want_fpiar = vec || (c[i].en & 0x7f00) ? 0x12340 : 0xCAFEF00D;
+			if (vec == 0 && (c[i].en & 0x7f00)) want_fpiar = 0x12340;
+			snprintf(nm, sizeof nm, "%s en=%04x -> %s", c[i].n, c[i].en, v == 0 ? "FADD" : v == 1 ? "FMOVE.L out" : "FMOVEM.L ctrl");
+			run_check(nm, st, 3, &s);
+		}
+	}
+	/* conditional: pending exception reported first; BSUN */
+	{ St s = base_state(); int r;
+	  s.fpcr = 0x0400; s.fpsr = 0x00000400; set_state(&s); regs.fp_exp_pend = 50;
+	  r = fpe_cond(1);
+	  expect("FBcc with DZ pending: pre-instruction exception 50", r == -2 && fpe_vector() == 50 && (fpe_status() & E_PRE), NULL);
+	  fpe_clear_exception(); r = fpe_cond(1); expect("FBcc after clear: evaluates (cc=1 EQ false)", r == 0, NULL);
+	  s = base_state(); s.fpsr = 0x01000000; s.fpcr = 0x8000; set_state(&s); r = fpe_cond(0x11);
+	  expect("FBcc NaN + BSUN enabled: BSUN 48 raised", r == -2 && fpe_vector() == 48 && (fpe_status() & E_PRE), NULL);
+	  s = base_state(); s.fpsr = 0x01000000; s.fpcr = 0; set_state(&s); r = fpe_cond(0x11);
+	  expect("FBcc NaN BSUN disabled: no exception, BSUN in FPSR", r >= 0 && (fpe_fpsr() & 0x8000), NULL);
+	  s = base_state(); s.fpsr = 0x04000000; set_state(&s); regs.fpu_state = 0; r = fpe_cond(1);
+	  expect("FBcc EQ with Z set true, null->idle", r == 1 && regs.fpu_state == 1, NULL);
+	}
+	category("exc-mid");
+	{ static const struct { const char *n; int fmt; uint32_t en; uint16_t se; uint64_t m; int vec; } mv[] = {
+		{ "FMOVE.B 20000 OPERR", F_B, 0x2000, 0x400c, 0x9c40000000000000ull, 52 },
+		{ "FMOVE.W 1e10 OPERR",  F_W, 0x2000, 0x4021, 0x9502f90000000000ull, 52 },
+		{ "FMOVE.S huge OVFL",   F_S, 0x1000, 0x7ffe, 0xffffffffffffffffull, 53 },
+		{ "FMOVE.S tiny UNFL",   F_S, 0x0800, 0x3000, 0x8000000000000000ull, 51 },
+		{ "FMOVE.L 1.5 INEX2",   F_L, 0x0200, 0x3fff, 0xc000000000000000ull, 49 },
+		{ "FMOVE.D 1/3 INEX2",   F_D, 0x0200, 0x3ffd, 0xaaaaaaaaaaaaaaabull, 49 },
+		{ "FMOVE.P 1/3 INEX2",   F_P, 0x0200, 0x3ffd, 0xaaaaaaaaaaaaaaabull, 49 },
+		{ "FMOVE.S sNaN SNAN",   F_S, 0x4000, 0x7fff, 0x8000000000000001ull, 54 },
+		{ "FMOVE.X pi (none)",   F_X, 0x7f00, 0x4000, 0xc90fdaa22168c235ull, 0 },
+		{ "FMOVE.B 20000 disabled", F_B, 0x0000, 0x400c, 0x9c40000000000000ull, 0 },
+	};
+	  for (unsigned i = 0; i < sizeof mv / sizeof *mv; i++) {
+		St s = base_state(); Step st[1];
+		s.fpcr = mv[i].en; s.se[2] = mv[i].se; s.m[2] = mv[i].m; s.fpiar = 0xCAFEF00Du;
+		st[0] = mkstep((uint16_t)(0x6000 | mv[i].fmt << 10 | 2 << 7 | (mv[i].fmt == F_P ? 17 : 0)), 0, 0, 0);
+		int en = (mv[i].en & 0x7f00) ? E_EN : 0;
+		want_fl[0] = mv[i].vec ? FPE_EXCEPTION : 0; want_vec[0] = mv[i].vec;
+		want_st[0] = mv[i].vec ? (E_PEND | E_MID | en) : en;
+		want_fpiar = en ? 0x12340 : 0xCAFEF00D;
+		snprintf(nm, sizeof nm, "%s en=%04x (result stored, mid-instruction)", mv[i].n, mv[i].en);
+		run_check(nm, st, 1, &s);
+	  } }
+	category("FPIAR");
+	{ static const uint32_t ens[] = { 0x0000, 0x8000, 0x0100, 0x0200, 0x0400, 0x7f00 };
+	  static const struct { const char *n; uint16_t cmd; int in; int upd; } fi[] = {
+		{ "FADD.X", 0x4000 | F_X << 10 | 0x22, 1, 1 }, { "FMOVE.X in", 0x4000 | F_X << 10, 1, 1 },
+		{ "FMOVECR", 0x5c00 | 3 << 7, 0, 1 },          { "FMOVE.X out", 0x6000 | F_X << 10, 0, 1 },
+		{ "FMOVEM.X out", 0xE000 | 2 << 11 | 0x80, 0, 0 }, { "FMOVEM.L out", 0xA000 | 7 << 10, 0, 0 },
+		{ "FMOVEM.X in", 0xC000 | 2 << 11 | 0x80, 2, 0 }, { "FMOVEM.L in", 0x8000 | 1 << 10, 3, 0 } };
+	  for (unsigned i = 0; i < sizeof ens / sizeof *ens; i++) for (unsigned k = 0; k < sizeof fi / sizeof *fi; k++) {
+		St s = base_state(); Step st[1]; s.fpcr = ens[i]; s.fpiar = 0xCAFEF00Du;
+		st[0] = mkstep(fi[k].cmd, 0x3fff, 0x8000000000000000ull, fi[k].in == 1 || fi[k].in == 2);
+		if (fi[k].in == 3) { st[0].in_len = 4; put32(st[0].in, 0x1111); }
+		want_fpiar = ((ens[i] & 0x7f00) && fi[k].upd) ? 0x12340 : (fi[k].in == 3 ? 0x1111 : 0xCAFEF00D);
+		if (fi[k].in == 3) want_fpiar = 0x1111;
+		snprintf(nm, sizeof nm, "%s fpcr=%04x", fi[k].n, ens[i]);
+		run_check(nm, st, 1, &s);
+	  } }
+}
+
+/* ---- FSAVE / FRESTORE */
+static void force_state(int null) { regs.fpu_state = null ? 0 : 1; regs.fpu_exp_state = 0; }
+static void pr_frame(char *d, size_t n, const uint8_t *f, int len) { char h[2 * FPE_MAXIO + 8]; hex(h, sizeof h, f, len); snprintf(d, n, "len=%d %.60s%s", len, h, strlen(h) > 60 ? ".." : ""); }
+
+static void save_case(const char *name, const St *init, int null, const Step *pre, int npre)
+{
+	uint8_t ef[FPE_MAXIO]; int el, efl, epend, est; St eg, gg; char da[200], nm[160];
+	/* engine */
+	set_state(init); force_state(null);
+	for (int k = 0; k < npre; k++) { uint8_t o[FPE_MAXIO]; int ol; fpe_exec(pre[k].cmd, pre[k].in, pre[k].in_len, pre[k].aux, IADDR, o, &ol); }
+	epend = regs.fp_exp_pend ? 1 : 0;
+	int enull = regs.fpu_state == 0;
+	efl = fpe_save(ef, &el); est = fpe_status(); get_state(&eg);
+	int want_len = enull ? 4 : 60;
+	static const char *gn[] = { "(A1)", "-(A1)", "d16(A1)" };
+	static const uint16_t gop[] = { 0xF311, 0xF321, 0xF329 };
+	for (int g = 0; g < 3; g++) {
+		uint16_t is[2]; int nis = 0, ok = 1; uint8_t eimg[GSIZE];
+		set_state(init); force_state(null);
+		for (int k = 0; k < npre; k++) { Res r; int a; golden_step(&pre[k], GM_IND, &r, &a); }
+		int gpend = regs.fp_exp_pend ? 1 : 0;
+		memset(gmem, 0xA5, sizeof gmem); memcpy(gmem0, gmem, sizeof gmem);
+		regs.regs[9] = g == 1 ? BASE + (uint32_t)want_len : (g == 2 ? BASE - 0x20 : BASE);
+		if (g == 2) is[nis++] = 0x20;
+		fpe_shim_use_memory(gmem, GSIZE, is, nis); fpe_shim_set_pc(IADDR + 2); fpe_shim_clear_events();
+		fpuop_save(gop[g]);
+		fpe_shim_use_buffer();
+		get_state(&gg);
+		/* expected image: Hatari's frame; with an exception pending the UM wants BIU bit 27 = 0 (Hatari writes
+		 * 0x20000000 instead of 0x08000000 for an exception-state frame) */
+		memcpy(eimg, gmem0, sizeof eimg);
+		memcpy(eimg + BASE, gmem + BASE, (size_t)want_len);
+		if (gpend && !enull) {
+			uint32_t biu = (uint32_t)eimg[BASE + 56] << 24 | eimg[BASE + 57] << 16 | eimg[BASE + 58] << 8 | eimg[BASE + 59];
+			biu = (biu & ~0x08000000u) | 0x20000000u; put32(eimg + BASE + 56, biu);
+		}
+		/* the CCR image holds the instruction opcode (F290 synthetic vs F291.. real EA): compare without its EA field */
+		{ uint8_t a[FPE_MAXIO], b[FPE_MAXIO]; memcpy(a, ef, (size_t)want_len); memcpy(b, eimg + BASE, (size_t)want_len);
+		  if (!enull && gpend) { a[5] &= (uint8_t)~0x3f; b[5] &= (uint8_t)~0x3f; }
+		  if (el != want_len || efl != 0 || memcmp(a, b, (size_t)want_len)) ok = 0; }
+		{ uint8_t chk[GSIZE]; memcpy(chk, gmem0, sizeof chk); memcpy(chk + BASE, ef, (size_t)el < sizeof chk - BASE ? (size_t)el : 0);
+		  if (memcmp(chk + BASE + el, gmem + BASE + el, 16)) ok = 0; }          /* nothing written past the frame */
+		/* state: pending absorbed, exception state cleared; same as golden after its own clear */
+		if (eg.pend != 0 || epend != gpend) ok = 0;
+		if (!enull) { uint32_t biu = (uint32_t)ef[56] << 24 | ef[57] << 16 | ef[58] << 8 | ef[59];
+		              if ((epend && (biu & 0x08000000u)) || (!epend && !(biu & 0x08000000u))) ok = 0; }   /* UM bit 27 rule */
+		if (ef[0] != (enull ? 0x00 : 0x1f) || ef[1] != 0x38) ok = 0;
+		if (eg.fs != gg.fs || memcmp(eg.se, gg.se, sizeof eg.se) || eg.fpsr != gg.fpsr || eg.fpiar != gg.fpiar) ok = 0;
+		(void)est;
+		if (!ok && verbose) printf("dbg el=%d efl=%d img=%d eg.pend=%d epend=%d gpend=%d fs=%x/%x\n", el, efl, memcmp(ef, eimg + BASE, (size_t)want_len), eg.pend, epend, gpend, eg.fs, gg.fs);
+		pr_frame(da, sizeof da, ef, el);
+		snprintf(nm, sizeof nm, "FSAVE %s %s", name, gn[g]);
+		tally(ok);
+		if (!ok || !quiet) printf("[%s] %-9s %-44s pend=%d %s\n", ok ? " ok " : "FAIL", cat_name, nm, epend, da);
+	}
+}
+
+static void restore_case(const char *name, const St *init, int null_before, const uint8_t *fr, int len,
+                         int golden, int want_fmt, int want_pend)
+{
+	St eg, gg; int efl, ok = 1; char da[200], nm[160];
+	set_state(init); force_state(null_before);
+	St before; get_state(&before);
+	efl = fpe_restore(fr, len); get_state(&eg);
+	int estat = fpe_status();
+	if (want_fmt >= 0 && ((efl & FPE_FORMAT) != 0) != (want_fmt != 0)) ok = 0;
+	if (want_fmt == 1 && (efl != FPE_FORMAT || fpe_vector() != 14 || !st_eq(&before, &eg))) ok = 0;   /* state unchanged */
+	if (want_pend >= 0 && ((estat & E_PEND) ? (int)fpe_pending_vector() : 0) != want_pend) ok = 0;
+	if (golden) for (int g = 0; g < 2; g++) {
+		memset(gmem, 0xA5, sizeof gmem); memcpy(gmem + BASE, fr, (size_t)len);
+		set_state(init); force_state(null_before);
+		regs.regs[9] = BASE;
+		fpe_shim_use_memory(gmem, GSIZE, NULL, 0); fpe_shim_set_pc(IADDR + 2); fpe_shim_clear_events();
+		fpuop_restore(g ? 0xF359 : 0xF351);
+		int gfl = (fpe_ev_exc ? FPE_EXCEPTION : 0) | (fpe_ev_unimpl ? FPE_UNIMPL : 0) | (fpe_ev_fmt ? FPE_FORMAT : 0);
+		int gst = fpe_status();
+		fpe_shim_use_buffer(); get_state(&gg);
+		if (gfl != efl || !st_eq(&gg, &eg) || gst != estat) ok = 0;
+	}
+	pr_frame(da, sizeof da, fr, len);
+	snprintf(nm, sizeof nm, "FRESTORE %s", name);
+	tally(ok);
+	if (!ok || !quiet) printf("[%s] %-9s %-40s fl=%d vec=%u st=%x pendvec=%u fs=%02x %s\n", ok ? " ok " : "FAIL", cat_name, nm, efl,
+	                         fpe_vector(), estat, fpe_pending_vector(), eg.fs, da);
+}
+
+static void mkframe(uint8_t *f, int ver, int size, uint32_t ccr, uint32_t biu, int total)
+{
+	memset(f, 0, FPE_MAXIO);
+	f[0] = (uint8_t)ver; f[1] = (uint8_t)size;
+	put32(f + 4, ccr);
+	for (int i = 8; i < total - 4; i++) f[i] = (uint8_t)(i * 7);
+	put32(f + total - 4, biu);
+}
+
+static void t_saverestore(void)
+{
+	St s = base_state(); Step pre[2]; uint8_t fr[FPE_MAXIO];
+	category("FSAVE");
+	s.fpiar = 0xCAFEF00Du;
+	save_case("null state", &s, 1, NULL, 0);
+	pre[0] = mkstep(0x0000 | 1 << 10 | 2 << 7 | 0x22, 0, 0, 0);
+	save_case("idle (after FADD)", &s, 1, pre, 1);
+	save_case("idle (state set)", &s, 0, NULL, 0);
+	{ static const struct { uint32_t en; uint16_t fse; uint64_t fm; uint16_t sse; uint64_t sm; int op; } pv[] = {
+		{ 0x0400, 0x3fff, 0x8000000000000000ull, 0x0000, 0, 0x20 }, { 0x2000, 0x3fff, 0x8000000000000000ull, 0xbfff, 0x8000000000000000ull, 0x04 },
+		{ 0x1000, 0x7ffe, 0xffffffffffffffffull, 0x7ffe, 0xffffffffffffffffull, 0x23 }, { 0xff00, 0x3fff, 0x8000000000000000ull, 0x4000, 0xc000000000000000ull, 0x20 } };
+	  for (unsigned i = 0; i < 4; i++) { St p = base_state(); char nm[64]; p.fpcr = pv[i].en; p.se[0] = pv[i].fse; p.m[0] = pv[i].fm;
+		pre[0] = mkstep((uint16_t)(0x4000 | F_X << 10 | pv[i].op), pv[i].sse, pv[i].sm, 1);
+		snprintf(nm, sizeof nm, "exception pending #%u (bit27=0)", i);
+		save_case(nm, &p, 0, pre, 1); }
+	  /* pending + other state: second FSAVE after absorbing is a plain idle frame */
+	  St p = base_state(); p.fpcr = 0x0400; p.se[0] = 0x3fff; p.m[0] = 0x8000000000000000ull;
+	  pre[0] = mkstep(0x4000 | F_X << 10 | 0x20, 0, 0, 1);
+	  set_state(&p); { uint8_t o[FPE_MAXIO], f1[FPE_MAXIO], f2[FPE_MAXIO]; int ol, l1, l2, a, b;
+		fpe_exec(pre[0].cmd, pre[0].in, pre[0].in_len, 0, IADDR, o, &ol);
+		a = fpe_save(f1, &l1); b = fpe_save(f2, &l2);
+		expect("second FSAVE: no longer pending (bit27=1)", !a && !b && l1 == 60 && l2 == 60 && !(f1[56] & 8) && (f2[56] & 8) && !(fpe_status() & E_PEND), NULL); } }
+
+	category("FRESTORE");
+	{ St r = base_state(); r.fpiar = 0xCAFEF00Du;
+	  uint8_t nf1[4] = { 0, 0x38, 0, 0 }, nf2[4] = { 0, 0xff, 0xab, 0xcd }, nf3[4] = { 0, 0, 0, 0 };
+	  restore_case("null $00380000 (from idle)", &r, 0, nf1, 4, 1, 0, 0);
+	  restore_case("null $00ffabcd (from idle)", &r, 0, nf2, 4, 1, 0, 0);
+	  restore_case("null $00000000 (from null)", &r, 1, nf3, 4, 1, 0, 0);
+	  mkframe(fr, 0x1f, 0x38, 0x12345678, 0x540effff | 0x08000000, 60);
+	  restore_case("idle $1F38 bit27=1", &r, 1, fr, 60, 1, 0, 0);
+	  mkframe(fr, 0x1f, 0x18, 0x0badf00d, 0x540effff | 0x08000000, 28);
+	  restore_case("idle $1F18 (68881) bit27=1", &r, 1, fr, 28, 1, 0, 0);
+	  mkframe(fr, 0x1f, 0xd4, 0, 0, 216); restore_case("busy $1FD4 (skipped)", &r, 0, fr, 216, 1, 0, 0);
+	  mkframe(fr, 0x1f, 0xb4, 0, 0, 184); restore_case("busy $1FB4 (skipped)", &r, 1, fr, 184, 1, 0, 0);
+	  mkframe(fr, 0x1f, 0x20, 0, 0, 40);  restore_case("invalid $1F20", &r, 0, fr, 40, 1, 1, -1);
+	  mkframe(fr, 0x1f, 0x00, 0, 0, 40);  restore_case("invalid $1F00", &r, 0, fr, 40, 1, 1, -1);
+	  mkframe(fr, 0x55, 0x38, 0, 0, 60);  restore_case("invalid version $55", &r, 0, fr, 60, 0, 1, -1);
+	  mkframe(fr, 0x40, 0x38, 0, 0, 60);  restore_case("68040 version $40 (rejected here)", &r, 0, fr, 60, 0, 1, -1);
+	  mkframe(fr, 0x41, 0x30, 0, 0, 52);  restore_case("68040 version $41 (rejected here)", &r, 0, fr, 52, 0, 1, -1);
+	  /* re-arming: bit 27 = 0 with a matching enabled FPSR/FPCR bit */
+	  static const struct { uint32_t fpsr, fpcr; uint32_t biu; int vec; const char *n; } ra[] = {
+		{ 0x0400, 0x0400, 0x540effff | 0x20000000, 50, "idle bit27=0, DZ enabled+set -> pending 50" },
+		{ 0x0400, 0x0400, 0x540effff | 0x08000000, 0,  "idle bit27=1 -> not pending" },
+		{ 0x0000, 0x0400, 0x540effff | 0x20000000, 0,  "idle bit27=0, nothing set -> not pending" },
+		{ 0x2400, 0xff00, 0x540effff | 0x20000000, 52, "idle bit27=0, OPERR+DZ -> pending 52" },
+		{ 0x4a00, 0xff00, 0x540effff | 0x20000000, 54, "idle bit27=0, SNAN prio -> pending 54" },
+		{ 0x0200, 0x0200, 0x540effff,              49, "idle bit27=0 (plain), INEX -> pending 49" } };
+	  for (unsigned i = 0; i < sizeof ra / sizeof *ra; i++) { St q = base_state(); q.fpsr = ra[i].fpsr; q.fpcr = ra[i].fpcr;
+		mkframe(fr, 0x1f, 0x38, 0, ra[i].biu, 60);
+		restore_case(ra[i].n, &q, 0, fr, 60, 1, 0, ra[i].vec); }
+	  /* round trip: pending -> FSAVE -> (clear) -> FRESTORE re-arms -> next arithmetic reports it, FMOVEM does not */
+	  { St q = base_state(); uint8_t f[FPE_MAXIO], o[FPE_MAXIO]; int l, ol, fl, ok;
+		q.fpcr = 0x0400; q.se[0] = 0x3fff; q.m[0] = 0x8000000000000000ull;
+		set_state(&q); Step d = mkstep(0x4000 | F_X << 10 | 0x20, 0, 0, 1);
+		fpe_exec(d.cmd, d.in, d.in_len, 0, IADDR, o, &ol);
+		fpe_save(f, &l);
+		ok = !(fpe_status() & E_PEND);
+		force_state(0); fpe_clear_exception();
+		fl = fpe_restore(f, l);
+		ok &= (fl == 0) && (fpe_status() & E_PEND) && fpe_pending_vector() == 50;
+		fl = fpe_exec(0xE000 | 2 << 11 | 0x80, NULL, 0, 0, IADDR, o, &ol);
+		ok &= (fl == 0) && ol == 12;
+		fl = fpe_exec(0x0000 | 1 << 10 | 2 << 7 | 0x22, NULL, 0, 0, IADDR, o, &ol);
+		ok &= (fl == FPE_EXCEPTION) && fpe_vector() == 50 && (fpe_status() & E_PRE);
+		expect("round trip: pending survives FSAVE/FRESTORE", ok, NULL); } }
+}
+
 /* ---------------------------------------------------------------- fuzz */
 static uint64_t rng = 0x9e3779b97f4a7c15ull;
 static uint64_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
@@ -602,7 +911,7 @@ int main(int argc, char **argv)
 	  if (fpe_fpcr() || fpe_fpsr() || fpe_fpiar()) bad = 1;
 	  printf("[%s] reset: FP0-7 = NaN (7fff:ffffffffffffffff), FPCR=FPSR=FPIAR=0\n", bad ? "FAIL" : " ok "); if (bad) n_fail++; else n_ok++; }
 	init_pool();
-	t_fmove_in(); t_fmove_out(); t_fmovecr(); t_ctrl(); t_movem(); t_arith(); t_fuzz(3000);
+	t_fmove_in(); t_fmove_out(); t_fmovecr(); t_ctrl(); t_movem(); t_arith(); t_exc4(); t_saverestore(); t_fuzz(3000);
 	category("");
 	printf("\nchecks: %d ok, %d fail\n%s\n", n_ok, n_fail, n_fail ? "FAIL" : "PASS");
 	return n_fail ? 1 : 0;

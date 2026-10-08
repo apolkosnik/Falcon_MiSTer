@@ -1,9 +1,11 @@
 # MC68882 FPU served by the ARM - design
 
-Status (branch `feature/fpu-arm`): milestones 1-3 done.  Presence, frames and
-detection; full instruction dialogs in `rtl/falcon/falcon_fpu_bridge.sv`, requests
-executed by `tools/falcon_fpu` with Hatari's `fpp.c` (`tools/falcon_fpu/engine`),
-verified by `tb/fpu` against Hatari driven with real EAs.  Milestone 2 needed two
+Status (branch `feature/fpu-arm`): milestones 1-4 done.  Presence, frames and detection; full instruction dialogs in
+`rtl/falcon/falcon_fpu_bridge.sv`, requests executed by `tools/falcon_fpu` with
+Hatari's `fpp.c` (`tools/falcon_fpu/engine`), verified by `tb/fpu` against Hatari
+driven with real EAs.  Milestone 4: enabled exceptions (pending, pre- and
+mid-instruction), FPIAR through the PC primitive, FSAVE/FRESTORE frames
+owned by the ARM.  Milestone 2 needed two
 AP68030 coprocessor fixes (immediate operands in the "memory" EA category, cpScc
 byte size), committed in the submodule on branch `fix/coprocessor-imm-cpscc`.  The core has no FPU today
 (README: "the 68881 does not fit"; `falcon_cpubus` ends every coprocessor
@@ -24,6 +26,9 @@ speaks the coprocessor interface.
 | Hook: `falcon_cpubus.sv:150` sends all non-IACK CPU space to `finish_berr`; the CPU and the bus bridge have no timeout for such a cycle | `falcon_cpubus.sv` |
 | 68882 dialog: response word CA/PC/DR + primitive; reg-to-reg ops release the CPU at once (null, CA=0) and finish in the background; a later instruction gets "null, come again" ($8900) until the FPU is free; conditionals return null CA=0 with TF | MC68881/MC68882 UM ch. 7 (Tables 7-3..7-7) |
 | FSAVE frames: null $00xx; 68882 idle $1F38 + 14 longs; busy $xxD4 | UM 6.4.2 |
+| Hatari/WinUAE (tested on real chips) write the 68882 null frame as $00380000 and keep an exception pending when the CPU takes it (68882 only) until FSAVE | `fpp.c` `fpuop_save`, `fp_exception_pending` |
+| FMOVEM and the control register moves do not report a pending exception (Hatari does: hidden by the shim); FSAVE with one pending clears BIU bit 27 (Hatari loses it: fixed in the shim) | UM 6.4.2.2, `engine/fpe_shim.c` |
+| The 68030 stores an FSAVE body to descending addresses and sends an FRESTORE body ascending | MC68030 UM 10.2.3.3/4, AP68030 `S_CPSV_BODY`/`S_CPRS_BODY` |
 | EmuTOS detects the FPU with FRESTORE(null), FNOP, FSAVE and reads the frame size ($38 = 68882) | EmuTOS `bios/processor.S` `_detect_fpu` |
 | Hatari/WinUAE softfloat FPU back-end (`fpp_softfloat.c`, `softfloat/*`, FPSP-derived transcendentals) is plain portable C; `fpp.c` front-end is tied to the WinUAE CPU core | `hatari/src/cpu` |
 | Main_MiSTer pins itself to CPU 1 (CPU 0 takes the IRQs); it is restarted on every core switch | `main.cpp:42-48`, `fpga_io.cpp:620` |
@@ -54,8 +59,9 @@ Per instruction class:
 | reg-to-reg, mem-to-reg arithmetic, FMOVE in, FMOVECR | collects the operand, posts the request, releases the CPU (null CA=0, as a real 68882 does) | in the background; the next FPU instruction gets come-again ($8900) until it is done |
 | FMOVE out, FMOVEM out, FMOVE from FPCR/FPSR/FPIAR | come-again until the reply, then the data primitives | yes, CPU waits |
 | FBcc/FScc/FDBcc/FTRAPcc | first version: come-again until the ARM answers TF; later: evaluate the predicate in the bridge from FPSR condition codes mirrored from each reply | first version yes, later no |
-| FSAVE / FRESTORE, FNOP | format words in the bridge; idle frame body (14 longs) is opaque ARM state | FSAVE/FRESTORE of an idle frame: yes |
-| enabled FPU exceptions | reply flags it; the next FPU instruction gets the pre-instruction exception primitive | no extra |
+| FSAVE / FRESTORE | the frame is the ARM's (Hatari `fpuop_save`/`fpuop_restore`): FSAVE reads come-again until the save reply, then the format word and the body; FRESTORE formats are checked in the bridge, the body goes to the ARM | yes (FRESTORE: in the background) |
+| FNOP and other conditionals | evaluated in the bridge; the first one after a reset or a null frame goes to the ARM (null -> idle) | only that one |
+| enabled FPU exceptions | the reply flags EXC PEND and the vector; the next opclass 000/010/011 instruction or conditional gets take pre-instruction exception ($1Cvv); FMOVE out raising one ends with $1Dvv; while one is enabled the first primitive asks for the PC (FPIAR) | no extra |
 
 Waiting is always "null, come again, IA=1": the 68030 re-reads the response
 CIR in short bus cycles, so interrupts are serviced and blitter/DMA keep the
@@ -86,11 +92,15 @@ back to sleeping polls after ~1 ms idle so an idle FPU does not take a core
 **Mailbox.**  Guest $E90000 (DDR3 0x30E90000), next to the probe's $E80000
 so the two never mix; 16-bit words, Falcon byte order.  +$000 MAGIC $4650
 ("FP", written by the service, cleared when it stops), +$002 HEARTBEAT
-(incremented every 10 ms), +$004 VERSION (2).  One request at a time:
-+$100 RSEQ (written last), KIND (1 execute, 2 reset), CMD, AUX (Dn of a
-dynamic list or k-factor), NBYTES, operand bytes at +$110; the reply at
-+$200: ASEQ (written last), FLAGS (bit 0 not implemented), FPSR, FPCR[15:0],
-NBYTES, result bytes at +$210.  Operand and result bytes are copied in
+(incremented every 10 ms), +$004 VERSION (3).  One request at a time:
++$100 RSEQ (written last), KIND (1 execute, 2 reset, 3 condition, 4 save,
+5 restore), CMD, AUX (Dn of a dynamic list or k-factor; the restore format
+word), NBYTES, IADDR (+$10A, when the PC was asked for), operand bytes at
++$110 (the restore body); the reply at +$200: ASEQ (written last), FLAGS
+(not implemented, exception pending, condition true, exception enabled,
+raised by this request, vector), FPSR, FPCR[15:0], NBYTES, result bytes at
++$210 (the save frame).  `tools/falcon_fpu/fpu_request.h` executes a request
+for the service and for the system simulation alike.  Operand and result bytes are copied in
 memory order between the operand CIR and the mailbox, so the bridge needs no
 buffer.
 
@@ -100,7 +110,7 @@ given a synthetic `(A0)` opcode (`-(A0)` for predecrement FMOVEM lists) and
 its memory accessors map onto the operand/result buffer, so the buffer is
 the memory image the 68030 transfers and every 68882 detail of `fpp.c`
 applies; `engine/fpe_selftest` compares this against `fpp.c` driven with
-real EAs (16,613 checks, host and qemu-arm).
+real EAs (16,930 checks, host and qemu-arm).
 The bridge polls MAGIC/HEARTBEAT every 5 ms and reports an FPU while the
 heartbeat has moved within 100 ms.  It owns `falcon_memarb`'s d3 port
 (between the blitter and the CPU), which the probe proved; a measurement
@@ -127,7 +137,9 @@ in BERR as before).
    FNOP, FSAVE/FRESTORE (null/idle), detection by EmuTOS/TOS; ARM stub.
 2. Data: FMOVE in/out (all formats), FMOVEM data/control, FMOVECR.
 3. Arithmetic: all 6888x opmodes through softfloat; FPSR/FPCR; conditionals.
-4. Exceptions, background execution, condition-code mirroring in the bridge.
+4. Exceptions (pending, pre/mid-instruction, BSUN with PC), FPIAR, FSAVE/FRESTORE
+   frames from the ARM.  (Background execution and condition-code mirroring
+   came with milestones 2 and 3.)
 5. Main integration (start/stop the service), CPU-0 policy, hardware tests.
 
 ## Open decisions

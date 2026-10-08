@@ -8,9 +8,11 @@
 extern "C" {
 #endif
 
-#define GOLD_RAM_SIZE 0x400000u      /* guest addresses are used directly */
+#define GOLD_RAM_SIZE 0x1000000u     /* guest addresses are used directly (RAM, and the ROM at $E00000) */
 #define GOLD_UNIMPL   1
 #define GOLD_EXC      2
+#define GOLD_FMT      4            /* FRESTORE format error (vector 14) */
+#define GOLD_RAM_SIZE_NOTE 0
 
 void gold_init(void);
 uint8_t *gold_ram(void);
@@ -20,7 +22,14 @@ uint32_t gold_getreg(int r);
 /* execute opcode+cmd (+ extension words) located at address iaddr; returns GOLD_* flags */
 int gold_exec(uint32_t iaddr, uint16_t op, uint16_t cmd, const uint16_t *ext, int next);
 /* FScc <ea> */
-void gold_scc(uint32_t iaddr, uint16_t op, uint16_t cond, const uint16_t *ext, int next);
+int gold_scc(uint32_t iaddr, uint16_t op, uint16_t cond, const uint16_t *ext, int next);
+int gold_fsave(uint32_t iaddr, uint16_t op, const uint16_t *ext, int next);
+int gold_frestore(uint32_t iaddr, uint16_t op, const uint16_t *ext, int next);
+void gold_epilogue(void);
+int gold_idle_frame(uint8_t *out);
+int gold_status(void);
+int gold_pending(void);
+int gold_fpu_state(void);
 /* condition predicate cc (0..31) as fpp.c evaluates it (side effects on FPSR included); -2: BSUN exception */
 int gold_last_vector(void);                          /* vector of the last exception/unimplemented event */
 int gold_cond(int cc);

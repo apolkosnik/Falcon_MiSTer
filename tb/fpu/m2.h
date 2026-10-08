@@ -30,6 +30,7 @@ struct M2Result {
 
 void m2_build();                                             // fill the case table
 int m2_ncases();
+bool m2_skip(int i);                                         // M2_ONLY debugging filter
 const char *m2_group(int i);
 const char *m2_name(int i);
 int m2_nchunks();
@@ -37,7 +38,8 @@ int m2_chunk_first(int c);
 int m2_chunk_end(int c);
 void m2_emit_asm(FILE *f, int chunk);                        // body of obj/gen_cases_<chunk>.s
 void m2_load_ram(uint8_t *ram, int chunk);                   // initial windows of one chunk
-void m2_run_golden(const std::map<std::string, uint32_t> &syms, int chunk);   // needs the assembler's labels
+void m2_run_golden(const std::map<std::string, uint32_t> &syms, int chunk, const std::vector<uint8_t> *rom);
+void m2_ia_sets(std::vector<uint32_t> &must, std::vector<uint32_t> &mustnot);   // instruction addresses that must / must not be written to CIR $18   // needs the assembler's labels
 unsigned m2_golden_cond_requests();                          // nonaware predicates evaluated with NAN set, last golden run
 M2Result m2_compare(const uint8_t *ram, int i, const std::vector<M2Exc> &got);
 uint32_t m2_dump_addr(int i);

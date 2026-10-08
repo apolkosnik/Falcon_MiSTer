@@ -17,6 +17,7 @@ module tb_fpu_top #(
 ) (
     input             clk,
     input             por,          // power-on reset (arbiter, bridge presence)
+    input       [2:0] ipl_n,        // interrupt priority level (active low), autovectored
     input             reset,        // machine reset (CPU, bus bridge); the bench holds it with por
 
     // MiSTer DDRAM port
@@ -92,7 +93,7 @@ ap030_top cpu
     .dsack0_n(dsack0_n), .dsack1_n(dsack1_n), .sterm_n(1'b1), .berr_n(berr_n), .halt_n(1'b1),
     .avec_n(avec_n), .ciin_n(ciin_n), .cback_n(1'b1),
     .br_n(1'b1), .bg_n(cpu_bg_n), .bgack_n(1'b1),
-    .ipl_n(3'b111), .ipend_n(cpu_ipend_n),
+    .ipl_n(ipl_n), .ipend_n(cpu_ipend_n),
     .reset_n_i(~reset), .reset_n_oe(cpu_reset_oe),
     .cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
     .dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_dbg_inst), .dbg_halted(cpu_halted),
@@ -112,6 +113,18 @@ wire  [4:0] cp_off;
 wire  [1:0] cp_siz;
 wire [31:0] cp_wdata, cp_rdata;
 wire        cpu_cycle_done;
+wire        iack_req;
+reg  [2:0]  iack_cnt = 3'd0;
+reg         iack_done = 1'b0;
+// interrupt acknowledge: autovector, answered three clocks after the request (the interrupt controller is not under test)
+always @(posedge clk) begin
+    iack_done <= 1'b0;
+    if (iack_req) iack_cnt <= 3'd3;
+    else if (iack_cnt != 3'd0) begin
+        iack_cnt <= iack_cnt - 3'd1;
+        if (iack_cnt == 3'd1) iack_done <= 1'b1;
+    end
+end
 
 falcon_cpubus cpubus
 (
@@ -125,7 +138,7 @@ falcon_cpubus cpubus
     .dev_cs(), .dev_stb(), .dev_we(), .dev_addr(),
     .dev_uds(), .dev_lds(), .dev_din(), .dev_dout(16'd0),
     .dev_ack(1'b0), .dev_berr(1'b0), .dev_super(),
-    .iack_req(), .iack_level(), .iack_done(1'b0), .iack_avec(1'b0),
+    .iack_req(iack_req), .iack_level(), .iack_done(iack_done), .iack_avec(iack_done),
     .iack_spur(1'b0), .iack_vector(8'd0),
     .cp_req(cp_req), .cp_we(cp_we), .cp_id(cp_id), .cp_off(cp_off), .cp_siz(cp_siz),
     .cp_wdata(cp_wdata), .cp_ack(cp_ack), .cp_berr(cp_berr), .cp_rdata(cp_rdata),

@@ -18,7 +18,7 @@
 #   ONLY=name                   run one scenario: detect_real detect_nosvc detect_badmagic detect_hb0
 #                               detect_badversion watch_freeze watch_magic watch_real frames cond gen
 #                               cpid_alive cpid_absent absent reset raw rawna straddle
-#                               m2cases m3sweeps m2bg m2busy m2wd_stop m2wd_nosvc m2wd_presence
+#                               m2cases m3sweeps m4irq m4fsdie m2bg m2busy m2wd_stop m2wd_nosvc m2wd_presence
 set -e
 cd "$(dirname "$0")"
 ROOT=../..
@@ -74,7 +74,7 @@ for k in $(seq 0 $((NM2-1))); do sed "s/gen_cases.s/gen_cases_$k.s/" asm/t_cases
 for k in $(seq 0 $((NM3-1))); do sed "s/gen_cases.s/gen_m3_$k.s/" asm/t_cases.s > obj/t_m3$k.s; done
 
 echo "== assembling test programs ($($VASM -v 2>&1 </dev/null | head -1)) =="
-ASMS="t_detect t_watch t_frames t_cond t_gen t_cpid t_absent t_reset t_straddle t_raw t_rawna t_bg t_busy t_wd"
+ASMS="t_detect t_watch t_frames t_cond t_gen t_cpid t_absent t_reset t_straddle t_raw t_rawna t_bg t_busy t_wd t_irq t_fsdie"
 for t in $ASMS; do
 	( cd asm && $VASM -quiet -Fbin -m68030 -m68882 -no-opt -I../obj -L ../obj/$t.lst -o ../obj/$t.bin $t.s ) \
 		|| { echo "RESULT: FAIL (assembling $t)"; exit 1; }

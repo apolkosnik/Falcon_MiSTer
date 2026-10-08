@@ -46,12 +46,13 @@ main:
 	move.b	1(a0),d1
 	REC	T_FS_IDLE_LEN,d1
 	REC	T_FS_IDLE_BEYOND,60(a0)
-	moveq	#0,d1			; the 14 body longs are OR-ed together
+	lea	4(a0),a3		; the 14 body longs
+	move.l	#T_FS_IDLE_BODY,d3
 	moveq	#13,d0
-	lea	4(a0),a3
-or1:	or.l	(a3)+,d1
-	dbra	d0,or1
-	REC	T_FS_IDLE_BODY,d1
+bl1:	move.l	d3,(a5)+
+	move.l	(a3)+,(a5)+
+	addq.l	#1,d3
+	dbra	d0,bl1
 	lea	BUF4,a3			; keep the idle frame for the restore test
 	move.w	#14,d0
 cp1:	move.l	(a0)+,(a3)+
@@ -179,8 +180,41 @@ bad_done:
 	move.l	EXCNT,d1
 	sub.l	d7,d1
 	REC	T_FR_AFTERBAD,d1
+
+;---- 9. frames Hatari's fpuop_restore accepts on a 68882: 68881 idle $1F18, busy $1FD4 / $1FB4
+;     (the format long is followed by 'length' bytes of zeros)
+	moveq	#0,d6
+	lea	odd_tab,a4
+od1:	move.w	(a4)+,d5
+	cmp.w	#$FFFF,d5
+	beq	od_done
+	lea	BUF,a0
+	moveq	#63,d0
+od0:	clr.l	(a0)+
+	dbra	d0,od0
+	move.w	d5,BUF
+	lea	BUF,a1
+	move.l	EXCNT,d7
+	dc.w	$f359			; frestore (a1)+
+	move.l	EXCNT,d1
+	sub.l	d7,d1
+	move.l	d6,d3
+	lsl.l	#2,d3
+	add.l	#T_ODDF,d3
+	move.l	d3,(a5)+
+	move.l	d1,(a5)+		; +0 exceptions
+	addq.l	#1,d3
+	move.l	d3,(a5)+
+	move.l	a1,d1
+	sub.l	#BUF,d1
+	move.l	d1,(a5)+		; +1 bytes consumed
+	addq.l	#1,d6
+	bra	od1
+od_done:
 	bra	finish
 
-; invalid frame format words: 68881 idle ($1F18), busy ($1FD4), garbage ($1234)
+; invalid frame format words: garbage ($1234)
 bad_tab:
-	dc.w	$1F18,$1FD4,$1234,$FFFF
+	dc.w	$1234,$FFFF
+odd_tab:
+	dc.w	$1F18,$1FD4,$1FB4,$FFFF

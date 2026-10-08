@@ -17,18 +17,14 @@
  * Mailbox (DDR3 0x30E90000 = guest $E90000).  Words are 16 bit in the
  * Falcon's big-endian byte order; operand and result bytes are stored in
  * memory order (DDR3 byte k = guest byte k), so they are copied as is.
- *   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (2)
+ *   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (3)
  *   request (FPGA -> ARM), RSEQ written last:
- *   +$100 RSEQ  +$102 KIND (1 execute, 2 reset, 3 condition)  +$104 CMD  +$106 AUX
- *   +$108 NBYTES  +$10A IADDR[31:16]  +$10C IADDR[15:0]  +$110.. operand bytes
+ *   +$100 RSEQ  +$102 KIND  +$104 CMD  +$106 AUX  +$108 NBYTES
+ *   +$10A IADDR[31:16]  +$10C IADDR[15:0]  +$110..+$1FF operand bytes
  *   reply (ARM -> FPGA), ASEQ written last:
  *   +$200 ASEQ  +$202 FLAGS  +$204 FPSR[31:16]  +$206 FPSR[15:0]
  *   +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes
- * FLAGS: bit 0 the instruction is not implemented (the bridge answers it
- * with the F-line exception), bit 1 an exception is pending (milestone 4;
- * for a condition request: the BSUN exception), bit 2 the condition is true.
- * A condition request (the bridge sends only IEEE-nonaware predicates with
- * NAN set: they set BSUN/IOP in the FPSR) carries the predicate in CMD.
+ * Request kinds and reply FLAGS: fpu_request.h.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -43,24 +39,21 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "engine/falcon_fpu_engine.h"
+#include "fpu_request.h"
 
 #define FPU_MB_PHYS  0x30E90000u
 #define FPU_MB_SIZE  0x10000u
 #define FPU_MAGIC    0x4650u        /* "FP" */
-#define FPU_VERSION  2u
+#define FPU_VERSION  3u
 #define HB_PERIOD_NS 10000000L      /* heartbeat every 10 ms */
 #define SPIN_NS      1000000L       /* spin this long after a request ... */
 #define NAP_NS       50000L         /* ... then poll every 50 us */
-#define MAX_BYTES    96
 
 enum { O_MAGIC = 0x000, O_HB = 0x002, O_VERSION = 0x004,
        O_RSEQ = 0x100, O_KIND = 0x102, O_CMD = 0x104, O_AUX = 0x106,
        O_RNBYTES = 0x108, O_IADDR = 0x10A, O_RDATA = 0x110,
        O_ASEQ = 0x200, O_FLAGS = 0x202, O_FPSR = 0x204, O_FPCR = 0x208,
        O_ANBYTES = 0x20A, O_ADATA = 0x210 };
-
-enum { KIND_EXEC = 1, KIND_RESET = 2, KIND_COND = 3 };
 
 static volatile uint8_t *mb;
 static volatile sig_atomic_t quit;
@@ -101,30 +94,19 @@ static void on_signal(int sig)
 /* execute the request in the mailbox and write the reply */
 static void serve(uint16_t seq, int verbose)
 {
-	uint8_t in[MAX_BYTES], out[MAX_BYTES];
+	uint8_t in[FPU_REQ_MAX], out[FPE_MAXIO];
 	uint16_t kind = rd16(O_KIND), cmd = rd16(O_CMD), aux = rd16(O_AUX);
-	int n = rd16(O_RNBYTES), out_len = 0, flags = 0;
+	int n = rd16(O_RNBYTES), out_len = 0;
 	uint32_t iaddr = (uint32_t)rd16(O_IADDR) << 16 | rd16(O_IADDR + 2);
 
-	if (n > MAX_BYTES) n = MAX_BYTES;
+	if (n > FPU_REQ_MAX) n = FPU_REQ_MAX;
 	for (int i = 0; i < n; i++) in[i] = mb[O_RDATA + i];
 
-	if (kind == KIND_RESET)
-		fpe_reset();
-	else if (kind == KIND_COND) {
-		int r = fpe_cond(cmd & 0x3f);
-		if (r == -2) {              /* BSUN enabled: the bridge raises it now */
-			flags = 2;
-			fpe_clear_exception();
-		} else if (r)
-			flags = 4;
-	} else
-		flags = fpe_exec(cmd, in, n, aux, iaddr, out, &out_len);
-	if (out_len < 0 || out_len > MAX_BYTES) out_len = 0;
+	uint16_t flags = fpu_request(kind, cmd, aux, iaddr, in, n, out, &out_len);
 
 	for (int i = 0; i < out_len; i++) mb[O_ADATA + i] = out[i];
 	uint32_t fpsr = fpe_fpsr();
-	wr16(O_FLAGS, (uint16_t)flags);
+	wr16(O_FLAGS, flags);
 	wr16(O_FPSR, (uint16_t)(fpsr >> 16));
 	wr16(O_FPSR + 2, (uint16_t)fpsr);
 	wr16(O_FPCR, (uint16_t)fpe_fpcr());
