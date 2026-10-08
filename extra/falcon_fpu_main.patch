@@ -1,0 +1,183 @@
+From 1c242ccdd877394fbf2e6a0cc92878ffc49999bc Mon Sep 17 00:00:00 2001
+From: Paul Kilar <pkilar@gmail.com>
+Date: Thu, 8 Oct 2026 00:01:17 -0400
+Subject: [PATCH] Falcon: run the 68882 FPU service falcon_fpu with the core
+
+The Falcon core (Falcon_MiSTer, rtl/falcon/falcon_fpu_bridge.sv) answers
+the 68030's coprocessor interface and has every FPU instruction executed
+on the ARM by the separate program falcon_fpu (Falcon_MiSTer
+tools/falcon_fpu, Hatari's 68882 emulation) through a DDR3 mailbox at
+0x30E90000.  Without the program the core has no FPU, as before.
+
+At core start, before the reset is released, run falcon_fpu from the
+directory of the running Main binary, on CPU 0 (Main has CPU 1) with
+SCHED_FIFO, output to /tmp/falcon_fpu.log; it exits with Main.  Before
+the FPGA is loaded with another core stop it and wait for it: its
+heartbeat writes into the mailbox would land in the next core's memory.
+---
+ fpga_io.cpp                   |  3 ++
+ support/falcon/falcon_fpu.cpp | 77 +++++++++++++++++++++++++++++++++++
+ support/falcon/falcon_fpu.h   | 25 ++++++++++++
+ user_io.cpp                   |  2 +
+ 4 files changed, 107 insertions(+)
+ create mode 100644 support/falcon/falcon_fpu.cpp
+ create mode 100644 support/falcon/falcon_fpu.h
+
+diff --git a/fpga_io.cpp b/fpga_io.cpp
+index b64cfe5..f2f015d 100644
+--- a/fpga_io.cpp
++++ b/fpga_io.cpp
+@@ -16,6 +16,7 @@
+ #include "menu.h"
+ #include "shmem.h"
+ #include "offload.h"
++#include "support/falcon/falcon_fpu.h"
+ 
+ #include "fpga_base_addr_ac5.h"
+ #include "fpga_manager.h"
+@@ -471,6 +472,8 @@ int fpga_load_rbf(const char *name, const char *cfg, const char *xml)
+ 			}
+ 			else
+ 			{
++				// the next core owns the DDR3 the FPU service writes to
++				falcon_fpu_stop();
+ 				fpga_core_reset(1);
+ 				if (read(rbf, buf, st.st_size)<st.st_size)
+ 				{
+diff --git a/support/falcon/falcon_fpu.cpp b/support/falcon/falcon_fpu.cpp
+new file mode 100644
+index 0000000..1269419
+--- /dev/null
++++ b/support/falcon/falcon_fpu.cpp
+@@ -0,0 +1,77 @@
++// Atari Falcon030 core: the MC68882 FPU service -- see falcon_fpu.h.
++
++#include <fcntl.h>
++#include <limits.h>
++#include <signal.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "../../fpga_io.h"
++#include "falcon_fpu.h"
++
++static pid_t fpu_pid = 0;
++
++void falcon_fpu_start()
++{
++	falcon_fpu_stop();
++
++	static char exe[PATH_MAX];
++	snprintf(exe, sizeof(exe), "%s", getappname());
++	char *slash = strrchr(exe, '/');
++	if (!slash) return;
++	snprintf(slash + 1, sizeof(exe) - (slash + 1 - exe), "falcon_fpu");
++	if (access(exe, X_OK))
++	{
++		printf("Falcon FPU: %s not found, the core has no FPU.\n", exe);
++		return;
++	}
++
++	// -c 0: CPU 0 (Main runs on CPU 1), -f: SCHED_FIFO, -d: die with Main
++	static char arg_c[] = "-c", arg_cpu[] = "0", arg_f[] = "-f", arg_d[] = "-d";
++	static char *argv[] = { exe, arg_c, arg_cpu, arg_f, arg_d, NULL };
++
++	pid_t pid = fork();
++	if (pid < 0)
++	{
++		perror("Falcon FPU: fork");
++		return;
++	}
++	if (!pid)
++	{
++		// only async-signal-safe calls between fork and exec (Main has threads)
++		int log = open("/tmp/falcon_fpu.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
++		if (log >= 0)
++		{
++			dup2(log, 1);
++			dup2(log, 2);
++		}
++		for (int fd = 3; fd < 1024; fd++) close(fd);
++		execv(exe, argv);
++		_exit(127);
++	}
++	fpu_pid = pid;
++	printf("Falcon FPU: started %s (pid %d)\n", exe, (int)pid);
++}
++
++void falcon_fpu_stop()
++{
++	if (fpu_pid <= 0) return;
++
++	// SIGTERM: the service clears its MAGIC word and exits
++	kill(fpu_pid, SIGTERM);
++	int i;
++	for (i = 0; i < 200; i++)
++	{
++		if (waitpid(fpu_pid, NULL, WNOHANG) == fpu_pid) break;
++		usleep(1000);
++	}
++	if (i == 200)
++	{
++		kill(fpu_pid, SIGKILL);
++		waitpid(fpu_pid, NULL, 0);
++	}
++	printf("Falcon FPU: stopped (pid %d)\n", (int)fpu_pid);
++	fpu_pid = 0;
++}
+diff --git a/support/falcon/falcon_fpu.h b/support/falcon/falcon_fpu.h
+new file mode 100644
+index 0000000..c786d88
+--- /dev/null
++++ b/support/falcon/falcon_fpu.h
+@@ -0,0 +1,25 @@
++// Atari Falcon030 core: the MC68882 FPU served by the ARM.
++//
++// The core (Falcon_MiSTer, rtl/falcon/falcon_fpu_bridge.sv) answers the
++// 68030's coprocessor interface and posts every FPU instruction into a DDR3
++// mailbox at 0x30E90000; the separate program falcon_fpu (Falcon_MiSTer
++// tools/falcon_fpu, Hatari's 68882 emulation) executes it.  Without it the
++// core has no FPU, as before.
++//
++// falcon_fpu_start() runs <directory of the running Main>/falcon_fpu on
++// CPU 0 (Main has CPU 1) with SCHED_FIFO; its output goes to
++// /tmp/falcon_fpu.log.  It dies with Main (PR_SET_PDEATHSIG).
++// falcon_fpu_stop() ends it before the FPGA is loaded with another core:
++// its heartbeat writes into the mailbox would otherwise land in the next
++// core's DDR3 memory.
++
++#ifndef FALCON_FPU_H
++#define FALCON_FPU_H
++
++// Core start (user_io_init, before the reset is released).
++void falcon_fpu_start();
++
++// Before the FPGA is reconfigured (fpga_load_rbf); harmless when not running.
++void falcon_fpu_stop();
++
++#endif
+diff --git a/user_io.cpp b/user_io.cpp
+index 8f41625..3b5e81e 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -28,6 +28,7 @@
+ #include "scaler.h"
+ #include "miniz.h"
+ #include "cheats.h"
++#include "support/falcon/falcon_fpu.h"
+ #include "game_docs.h"
+ #include "video.h"
+ #include "audio.h"
+@@ -1774,6 +1775,7 @@ void user_io_init(const char *path, const char *xml)
+ 
+ 		send_rtc(3);
+ 		if (is_marty() && xml && isXmlName(xml) == 2) marty_mgl_premount();
++		if (is_falcon()) falcon_fpu_start();
+ 
+ 		// release reset
+ 		if (!is_minimig() && !is_st()) user_io_status_set("[0]", 0);
+-- 
+2.56.0
+

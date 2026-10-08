@@ -1,7 +1,8 @@
 `timescale 1ns/1ps
 //============================================================================
 //  DMA memory types in the real falcon_memarb on the DDR3 model, driven at
-//  its DMA ports: d0 DMA sound, d1 disk DMA (FDC/SCSI), d2 blitter.
+//  its DMA ports: d0 DMA sound, d1 disk DMA (FDC/SCSI), d2 blitter, d3 the
+//  FPU bridge's HPS mailbox.
 //
 //  Expected results: Hatari 028dbf7f.  ST-RAM is read/written directly; ROM
 //  is never stored (ROMmem_wput); bus-error regions read $0000 and drop
@@ -10,18 +11,21 @@
 //  dropped (SysMem_wput), the disk DMA writes them (fdc.c FDC_DMA_FIFO_Push
 //  STMemory_SafeCopy, FDC_DMA_FIFO_Pull memcpy from STRam).
 //  The first 27 checks are the 2026-10-03 fix review's reproductions.
+//  d3 (docs/FPU_ARM.md): the mailbox at guest $E90000 lies in the ROM area,
+//  and the bridge and the ARM service exchange requests there, so d3 reads
+//  and writes are always DDR3 cycles.
 //============================================================================
 module tb_memarb;
 reg clk = 0;
 always #5 clk = ~clk;
 reg reset = 1;
 reg [3:0] ram_mb = 4;
-reg [2:0] req = 0;
+reg [3:0] req = 0;
 reg we = 0;
 reg [23:1] addr = 0;
 reg [15:0] data = 0;
-wire [2:0] ack;
-wire [15:0] rd[3];
+wire [3:0] ack;
+wire [15:0] rd[4];
 wire busy, dout_ready, ddr_rd, ddr_we;
 wire [7:0] burstcnt, be;
 wire [28:0] ddr_addr;
@@ -33,6 +37,7 @@ falcon_memarb dut(
  .d0_req(req[0]), .d0_we(we), .d0_addr(addr), .d0_be(2'b11), .d0_wdata(data), .d0_rdata(rd[0]), .d0_ack(ack[0]),
  .d1_req(req[1]), .d1_we(we), .d1_addr(addr), .d1_be(2'b11), .d1_wdata(data), .d1_rdata(rd[1]), .d1_ack(ack[1]),
  .d2_req(req[2]), .d2_we(we), .d2_addr(addr), .d2_be(2'b11), .d2_wdata(data), .d2_rdata(rd[2]), .d2_ack(ack[2]),
+ .d3_req(req[3]), .d3_we(we), .d3_addr(addr), .d3_be(2'b11), .d3_wdata(data), .d3_rdata(rd[3]), .d3_ack(ack[3]),
  .cpu_req(1'b0), .cpu_we(1'b0), .cpu_addr(22'd0), .cpu_be(4'd0), .cpu_wdata(32'd0),
  .snoop_we(snoop_we), .DDRAM_BUSY(busy), .DDRAM_BURSTCNT(burstcnt), .DDRAM_ADDR(ddr_addr),
  .DDRAM_DOUT(dout), .DDRAM_DOUT_READY(dout_ready), .DDRAM_RD(ddr_rd),
@@ -98,6 +103,11 @@ initial begin
   check(peek(2)==(m==1 ? 'h7777 : 'h6666),$sformatf("DMA%0d write at two: backing=%04x expected %04x",m,peek(2),m==1 ? 'h7777 : 'h6666));
   check(peek('he00002)=='h4321,$sformatf("DMA%0d access at two leaves the ROM alone",m));
  end
+ // the FPU mailbox (d3) in the ROM area: written and read in DDR3
+ poke('he90100,'h0000); access(3,1,'he90100,'h1234);
+ check(peek('he90100)=='h1234,"DMA3 (FPU mailbox) write at $E90100 reaches DDR3");
+ poke('he90200,'habcd); access(3,0,'he90200,0);
+ check(result=='habcd,$sformatf("DMA3 (FPU mailbox) read at $E90200: %04x expected abcd",result));
  // a dropped access never shows up on the snoop port
  poke('h1000,0);
  fork

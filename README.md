@@ -19,7 +19,8 @@ frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 
 | Part | Module | Notes |
 |------|--------|-------|
-| 68030 | `rtl/AP68030` | 32 MHz core clock (twice a stock Falcon); no FPU (the 68881 does not fit) |
+| 68030 | `rtl/AP68030` | 32 MHz core clock (twice a stock Falcon) |
+| 68882 FPU | `falcon_fpu_bridge`, `tools/falcon_fpu` | the coprocessor interface in the FPGA, the arithmetic on the ARM (Hatari's 68882 emulation): `docs/FPU_ARM.md` |
 | Bus, decode, interrupts | `falcon_system`, `falcon_cpubus` | Falcon 24-bit map, Hatari's bus-error rules incl. STE-compatible bus mode |
 | ST-RAM, ROM | `falcon_memarb` | 4 or 14 MB in the HPS DDR3 (no SDRAM board needed) |
 | COMBEL | `falcon_combel` | $FF8001/6/7, DIP switches, Jaguar pads |
@@ -53,6 +54,27 @@ built on the ARM by a Falcon module in Main_MiSTer (`support/falcon`, branch
 stock Main, SCSI hard disks still work from built-in default responses; the
 CD-ROM needs the Falcon Main (`releases/MiSTer_falcon`).  Floppy and IDE work
 with any Main.
+
+### 68882 FPU
+
+A 68882 does not fit in the FPGA; the core answers the 68030's coprocessor
+interface and the program `falcon_fpu` executes the instructions on the ARM
+(Hatari's 68882 emulation; design and measurements in `docs/FPU_ARM.md`).
+Main starts it with the core and stops it before another core is loaded:
+
+1. Use a core with the bridge: `releases/Falcon-fpu_20261008.rbf` (it also has
+   the NVRAM store below).
+2. Copy `releases/falcon_fpu` to `/media/fat/` and make it executable.
+3. Use `releases/MiSTer_falcon_fpu.bin` as Main: the configuration-menu Main
+   below plus the FPU service (`extra/falcon_fpu_main.patch`, on top of
+   `extra/falcon_config_main.patch`).  Copy it as `/media/fat/MiSTer`, or as
+   `/media/fat/MiSTer_falcon` with `main=MiSTer_falcon` in the `[Falcon]`
+   section of `MiSTer.ini`; `falcon_fpu` must sit in the same directory.
+
+TOS then reports a 68881/68882.  Without `falcon_fpu` (or with another Main)
+the core has no FPU, as before.  `/tmp/falcon_fpu.log` holds its messages.
+Test programs for the machine: `tools/fputest` (FPUTEST.TOS checks results,
+FPUBENCH.TOS measures speed).
 
 ### Configuration menu
 
@@ -135,5 +157,5 @@ fitter can crash while exiting on newer Linux after a complete fit.
 
 - Hardware testing.
 - 16 MHz CPU option (the CPU runs from the 32 MHz system clock).
-- FPU (no room), SCC serial ports (registers only), Centronics printer,
+- SCC serial ports (registers only), Centronics printer,
   microphone input, `.MSA`/`.STX` floppy images.

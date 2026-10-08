@@ -35,3 +35,9 @@ ref/chorensha_src/
 tb/system/*.out
 tb/system/media/beers_content/
 tb/system/media/x1600_content/
+tools/mbox_ping/mbox_ping
+tools/mbox_ping/mbox_ping_host
+tools/falcon_fpu/falcon_fpu
+tools/falcon_fpu/falcon_fpu_host
+tools/falcon_fpu/engine/build/
+tools/fputest/build/

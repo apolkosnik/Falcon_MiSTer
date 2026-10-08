@@ -23,6 +23,19 @@ module ddr3_model
 
 reg [63:0] mem [0:(1<<21)-1];
 
+// the C++ driver reads and writes guest memory directly (e.g. to play the
+// HPS side of a mailbox); qaddr is the 64-bit word index in the 16 MB window
+export "DPI-C" function ddr_peek;
+export "DPI-C" function ddr_poke;
+function longint unsigned ddr_peek(input int unsigned qaddr);
+	ddr_peek = mem[qaddr[20:0]];
+endfunction
+function void ddr_poke(input int unsigned qaddr, input longint unsigned data, input byte unsigned be);
+	integer i;
+	for (i = 0; i < 8; i = i + 1)
+		if (be[i]) mem[qaddr[20:0]][8*i +: 8] = data[8*i +: 8];
+endfunction
+
 initial begin
 	string f;
 	integer i;

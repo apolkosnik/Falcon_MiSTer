@@ -1,0 +1,1 @@
+/* minimal Hatari config.h for the FPU engine */

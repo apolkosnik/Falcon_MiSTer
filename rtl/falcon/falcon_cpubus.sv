@@ -10,8 +10,13 @@
 //                            of docs/ARCHITECTURE.md.  D31..D24 is the even
 //                            byte, D23..D16 the odd byte.
 //    interrupt acknowledge   vectored (vector on every byte lane) or AVEC
-//    other CPU space         bus error (no FPU: coprocessor cycles end in
-//                            BERR and the CPU takes the F-line exception)
+//    coprocessor (CPU space  passed to the FPU bridge (cp_* port): the
+//      type 2, A19-16=0010)  word CIRs answer as a 16-bit port (DSACK1,
+//                            data on D31..D16) like the MC68881/882, the
+//                            operand, instruction address and operand
+//                            address CIRs ($10/$18/$1C) as a 32-bit port;
+//                            the bridge may ask for BERR instead (no FPU)
+//    other CPU space         bus error (breakpoint, MMU access level)
 //
 //  Decoding follows the Falcon's 24-bit address bus (A31..A24 ignored):
 //    000000-000007  reads: ROM (reset vectors), writes: bus error.  A RAM TOS
@@ -87,10 +92,21 @@ module falcon_cpubus
 	input             iack_spur,   //   no source: bus error (spurious)
 	input       [7:0] iack_vector,
 
+	// coprocessor interface registers (falcon_fpu_bridge)
+	output reg        cp_req,      // one clock, with the fields below
+	output reg        cp_we,
+	output reg  [2:0] cp_id,       // A15..A13
+	output reg  [4:0] cp_off,      // CIR select, A4..A0
+	output reg  [1:0] cp_siz,
+	output reg [31:0] cp_wdata,
+	input             cp_ack,      // one clock, with:
+	input             cp_berr,     //   end the cycle with BERR
+	input      [31:0] cp_rdata,    //   word CIRs on [31:16]
+
 	output reg        cycle_done   // one clock per completed CPU bus cycle
 );
 
-localparam S_IDLE = 3'd0, S_RAM = 3'd1, S_DEV = 3'd2, S_IACK = 3'd3, S_HOLD = 3'd4;
+localparam S_IDLE = 3'd0, S_RAM = 3'd1, S_DEV = 3'd2, S_IACK = 3'd3, S_HOLD = 3'd4, S_CP = 3'd5;
 reg  [2:0] st;
 reg  [9:0] tmo;
 
@@ -135,6 +151,7 @@ endtask
 always @(posedge clk) begin
 	dev_stb    <= 0;
 	iack_req   <= 0;
+	cp_req     <= 0;
 	cycle_done <= 0;
 
 	if (reset) begin
@@ -153,7 +170,16 @@ always @(posedge clk) begin
 					iack_level <= la[3:1];
 					st         <= S_IACK;
 				end
-				else finish_berr;          // breakpoint, coprocessor, MMU access level
+				else if (la[19:16] == 4'h2) begin
+					cp_req   <= 1;
+					cp_we    <= !rw;
+					cp_id    <= la[15:13];
+					cp_off   <= la[4:0];
+					cp_siz   <= siz;
+					cp_wdata <= d_o;
+					st       <= S_CP;
+				end
+				else finish_berr;          // breakpoint, MMU access level
 			end
 			else if (is_prot && !is_super) finish_berr;
 			else if (is_vec && !rw) finish_berr;   // SysMem_*put: the reset vectors are ROM
@@ -218,6 +244,18 @@ always @(posedge clk) begin
 				dsack1_n <= 0;
 			end
 			st <= S_HOLD;
+		end
+
+	S_CP:
+		if (cp_ack) begin
+			if (cp_berr) finish_berr;
+			else begin
+				d_i      <= cp_rdata;
+				dsack1_n <= 0;
+				// operand, instruction address, operand address: 32-bit port
+				if (la[4:0] == 5'h10 || la[4:0] == 5'h18 || la[4:0] == 5'h1C) dsack0_n <= 0;
+				st <= S_HOLD;
+			end
 		end
 
 	S_HOLD:
