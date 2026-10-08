@@ -14,7 +14,7 @@ core, how to get there, and what was decided.
 |------|--------|
 | Falcon CPU clock 16.042 MHz (32.084988 MHz / 2); $FF8007 bit 0 switches 8 / 16 MHz (68030 only), a read returns the current setting; bit 5 (bus mode) has no timing effect | Hatari clocks_timings.c:157,325-342; ioMemTabFalcon.c:103-155 |
 | The CPU's data bus to ST-RAM is 16 bits; Videl is the DRAM controller with its own 32-bit burst path; video modes cost the CPU only a few percent | Atari Falcon references (Wikipedia, DFB wiki, Robbins 1993); forum reports (unverified) |
-| Hatari's Falcon CPU model ("cycle exact", the default): ST-RAM is CHIP16 - an access starts on a 4-cycle slot boundary (cycle position mod 4: 2 or 3 waits to the next slot) and takes 3 cycles; a long is two 16-bit accesses (8 cycles back to back); ROM, cartridge, I/O are FAST16, 3 cycles per byte/word, 6 per long; device waits on top (MFP, YM, FDC +4, ACIA +6 and E-clock) | Hatari custom.c:329-426; newcpu.c:9664-9900; memory.c:1640,1778-1808; mfp.c, psg.c, acia.c |
+| Hatari's Falcon CPU model ("cycle exact", the default): ST-RAM is CHIP16 - an access at clock position 2 or 3 (mod 4) first waits 2 cycles, then takes 3; a long is two 16-bit accesses (8 cycles back to back); ROM, cartridge, I/O are FAST16, 3 cycles per byte/word, 6 per long; device waits on top (MFP, YM, FDC +4, ACIA +6 and E-clock) | Hatari custom.c:329-426; newcpu.c:9664-9900; memory.c:1640,1778-1808; mfp.c, psg.c, acia.c |
 | Hatari charges 2 internal cycles per instruction word consumed (overlapping the previous bus access), no bus time for I/D-cache hits, MULU/MULS.W 20, DIVU.W 34, DIVS.W 48, interrupt acknowledge 12 (MFP) / 10 (video) + 4; the MC68030 UM head/tail/cache-case timings are only comments in its generated code | Hatari newcpu.c:10627, cpu_prefetch.h:54-80, gencpu.c:605-670,8286-8399, newcpu.c:2905-3027 |
 | Hatari models no Videl, DMA sound, disk DMA or DSP contention; the blitter stops the CPU (4 cycles per word, 64/256 sharing outside hog mode) | Hatari videl.c, blitter.c:254-451 |
 | AP68030: one `clk`, no clock enable, both edges used (one bus S-state per half clock); bus cycles follow the UM state by state (asynchronous 3 clocks + waits, synchronous 2, burst 2-1-1-1, dynamic bus sizing); internal timing is as fast as its sequencer allows (MOVE.L Dn,Dn 1 clock, MULU.W 7, DIVU.L 22, about 5.5 clocks per instruction); real cache organisation (256-byte I/D, 16-byte lines, write-through D-cache) | rtl/AP68030 ap030_top.v:27, ap030_bus.v:14-25,104-699, README; measurements with its tb_prog bench |
@@ -92,8 +92,9 @@ falcon_memarb (unchanged priorities)  ->  DDR3
 - **Speed selection**: OSD "CPU: Falcon 16 MHz / 32 MHz turbo"; in the Falcon
   setting $FF8007 bit 0 switches 8/16 MHz as Hatari does (and reads back the
   current speed).  32 MHz turbo keeps today's behaviour exactly.
-- **Internal timing governor** (milestone 3): Hatari's rules - at least 2 cycles
-  per instruction word consumed, MUL/DIV constants, interrupt-acknowledge costs -
+- **Internal timing governor** (milestone 3): Hatari's rules - 2 cycles per
+  instruction word consumed, absorbed by the last bus access's window, MUL/DIV
+  constants, interrupt-acknowledge costs (section "Hatari's Falcon CPU timing") -
   as a stall on the AP68030's dispatch, from a small table.  The AP68030 is
   faster than Hatari in every measured cached case, so padding is enough; cases
   where it is slower are found by the timing benches.
@@ -124,6 +125,143 @@ falcon_memarb (unchanged priorities)  ->  DDR3
 3. Internal timing governor (Hatari's rules); exceptions and interrupt
    acknowledge; blitter cycle costs.
 4. Hardware: timing program, debt statistics, Quartus fit (the core is at 96%).
+
+## Hatari's Falcon CPU timing in detail (the reference for milestones 2 and 3)
+
+What Hatari charges for the 68030 in Falcon mode with its default "cycle
+exact" CPU (Falcon, 68030, cycle exact, data cache on, no MMU, no TT-RAM;
+configuration.c:726,841-844), read from its source (src/, paths relative to
+it).  The generated CPU file (cpuemu_23.c) is not in the source tree, so the
+per-instruction parts follow the generator, cpu/gencpu.c.  This is Hatari's
+"~cycle-exact" 68030, not the UM's head/tail model.
+
+**Time base.**  One unit is one CPU clock at the current frequency (8 or 16
+MHz): CYCLE_UNIT 512, cpucycleunit 256 (cpu/sysdeps.h:551, newcpu.c:2274).
+The position used by the slot rule is `CyclesGlobalClockCounter +
+currcycle*2/CYCLE_UNIT` (cycles.c:312-320), a free-running clock count with no
+relation to CPU reset or video.  `do_cycles_ce020` (cpu/custom.c:512-526)
+advances the visible time in 2-clock steps and keeps an odd clock owed for
+the next call, so the visible time is always even: in true time T the
+visible time is T & ~1.
+
+**Data accesses** (mem_access_delay_*_ce020, newcpu.c:9664-9900; bank types
+memory.c:1639-1640,1783-1808):
+
+| bank | regions | byte | word | long |
+|------|---------|------|------|------|
+| CHIP16 | ST-RAM, IDE, void and bus-error regions | 1 access | 1 access; 2 byte accesses if (addr & 3) == 3 | always 2 word accesses (addr, addr+2) |
+| FAST16 | ROM, cartridge, I/O ($FF0000-) | 3 | 3; 6 if (addr & 3) == 3 | 6 |
+
+- A CHIP16 access (cpu/custom.c:329-359 read, 407-426 write): `bus_pos =
+  position & 3; if (bus_pos & 2) wait (4 - bus_pos)`, then the access, then
+  3 clocks.  With the even visible time bus_pos is 0 or 2 (the 1-clock wait
+  for 3 is never reached), so in true time: **wait 2 if T & 2, then 3**.  A
+  byte/word costs 3 (T mod 4 = 0, 1) or 5 (2, 3); a long 8/6/10/8 for T mod 4
+  = 0/1/2/3; back-to-back words 3 then 5.  Writes time like reads.
+- FAST16: no slot rule (`do_cycles_ce020_mem`, 3 clocks per CPU020_MEM_CYCLE).
+  An I/O register handler runs inside the access and adds its device wait
+  before the 3/6 clocks; a word or long that spans several handlers pays each
+  handler's wait (ioMem.c:513-589; an MFP long = 2 handlers = +8).
+- TAS/CAS/CAS2: an ordinary read then an ordinary write, no lock
+  (gencpu.c:5451-5454); with the data cache on, the read can hit the cache.
+- Bus errors are taken at the end of the instruction (newcpu.c:5265-5272);
+  the cost is the format $B frame's timed writes (not counted yet).
+
+**Instruction fetch** (get_word_ce030_prefetch_2, newcpu.c:10597-10629): a
+3-word prefetch queue refilled by aligned longword fetches, one long per two
+words consumed, 6 bytes ahead.  After a jump, branch, RTE or exception
+`fill_prefetch_030_ntx` (newcpu.c:11428-11463) fetches the target's long and
+the next one, then consumes the first word (a third long for a target with
+pc & 2).  The next opcode is fetched at the end of the current instruction,
+so its cost goes to that instruction.
+- I-cache hit: 0 clocks.  Miss: one long through the bank rule (ROM 6, ST-RAM
+  two slot-ruled words); no burst on the Falcon (burst needs a FAST32 bank,
+  TT-RAM only), so a miss fills one longword, never a line
+  (fill_icache030, newcpu.c:9984-10105).
+- Quirk: a fetched long enters the I-cache only if the global
+  `mmu030_cache_state` has bit 7 (newcpu.c:10028), and with the data cache
+  on every data write overwrites it with the written address's cachability
+  (newcpu.c:859-871): after a write to I/O, instruction fills are not cached
+  until the next write to RAM or ROM.
+- **Each consumed instruction word costs 2 clocks** (`do_cycles_ce020_internal(2)`,
+  newcpu.c:10627), taken first from the window of the last bus access
+  (cpu_prefetch.h:54-80: the window is that access's visible duration; a new
+  access replaces it; cache hits leave it alone); only the excess is real
+  time.  I-cache-hit code with no recent bus access runs at 2 clocks per word;
+  after a 6-clock ROM fetch the next 3 words are free.
+
+**Data cache** (read_dcache030 / write_dcache030, newcpu.c:10208-10471): hit
+0 clocks; a miss on a cacheable address reads the whole aligned long (two
+slot-ruled words from ST-RAM) and validates that longword; writes are
+write-through at the full bus cost, then update the cache (write-allocate
+for long-aligned longs with CACR bit 13).  Stack accesses go the same way.
+
+**Internal cycles.**  The UM head/tail/cycles table is emitted only as C
+comments (gencpu.c:800-818; the emission is `#if 0`, gencpu.c:2653-2658, and
+`c = 0; // HACK`, 2578-2580, 2697).  The only run-time internal charges are
+DIVU.W 34, DIVS.W 48, MULU.W 20, MULS.W 20 (gencpu.c:8286, 8346, 8371,
+8399), charged in full, not absorbed by the window.  Shifts, MULL/DIVL, bit
+fields, MOVEM, the FPU and EA calculation cost only their instruction words
+and bus accesses.
+
+**Exceptions and interrupts** (Exception_normal, newcpu.c:3487-3790; no fixed
+start cycles for the 68030, newcpu.c:3409,3478): IACK (iack_cycle,
+newcpu.c:2901-3029) - MFP level 6: 12 clocks (CPU_IACK_CYCLES_MFP_CE,
+includes/m68000.h:192); HBL/VBL autovector: wait to the next multiple of 10
+clocks (M68000_WaitEClock, m68000.c:808-824: 0, 8, 6, 4 or 2) then 10;
+DSP and SCC vectors: none - then 4 idle clocks in every case.  Then the frame
+writes (word, long, word for format 0), the vector long read (ST-RAM page 0)
+and the prefetch refill.  RTE: 3 reads (plus the rest of a longer frame),
+then the refill.  An interrupt pending at an instruction boundary is taken
+after the next instruction (spcflags snapshot, newcpu.c:5133,5303-5333;
+inferred, not observed).
+
+**Device waits** (M68000_WaitState, m68000.c:791-798; clocks at the current
+frequency, never scaled):
+
+| device | wait | source |
+|--------|------|--------|
+| MFP registers | +4 per handler (USART registers none) | mfp.c |
+| YM2149 | +4 on the first access of an instruction (MOVEM: +4 on every 4th further access) | psg.c:475-503 |
+| FDC/DMA | $FF8604 write +4, read +4 (0 for the sector-count branch); $FF8606 write +4, read 0; $FF860E +4 | fdc.c:4744-5600 |
+| ACIA (IKBD, MIDI) | 6, plus an E-clock sync (to a multiple of 10) on the first ACIA access of an instruction | acia.c:546-561, midi.c |
+| DSP host port | +4 per byte after the first (word +4, long +12) | falcon/dsp.c:856-900 |
+| Videl, SCC, NVRAM, crossbar, blitter registers, joypad, IDE, SCSI | 0 (IDE pays the CHIP16 slot rule) | - |
+
+**8 vs 16 MHz** ($FF8007 bit 0, ioMemTabFalcon.c:113-155,
+configuration.c:1297-1325): only the real length of a clock changes.  The
+slot rule, the 3-clock access, 2 clocks per word, the device waits, IACK
+and the blitter costs are the same clock counts at both speeds.
+
+**Blitter** (blitter.c): not concurrent with the 68030 (BLITTER_RUN_CE is for
+the 68000 only).  It starts at an instruction boundary after
+`CurrentInstrCycles` (a generator constant, value unknown here) and the CPU
+is stopped while it runs: 4 clocks arbitration in, 4 per word read and 4 per
+word write (any bank, any alignment), 4 out.  Hog mode runs to the end;
+otherwise 64 bus accesses, then the CPU runs 256 clocks.
+
+**Not modelled by Hatari:** Videl, DMA sound, disk DMA, DRAM refresh, DSP or
+SCC bus contention, and FPU latency (an FPU instruction costs its words and
+EA accesses only).  The CHIP16 slot rule is the only stand-in for the
+memory controller.
+
+**Reference algorithm for the bus model** (true time T, window credit W):
+```
+CHIP16 access:  if (T & 2) T += 2;  access;  T += 3
+FAST16 access:  access (device waits added to T here);  T += 3 per word (6 for a long or an (addr&3)==3 word)
+after a bus access:   W = its visible duration (even), replacing the old W
+consume an instruction word:  fetch a long if due (I-cache miss only);  if (W >= 2) W -= 2; else T += 2
+MULU.W/MULS.W +20, DIVU.W +34, DIVS.W +48  (no window credit)
+interrupt: IACK (MFP 12 | autovector E-sync + 10) + 4; push word, long, word; read vector long; refill
+```
+Checks against a trace: a CHIP16 long from T mod 4 = 0/1/2/3 lasts 8/6/10/8
+clocks; two back-to-back words from an aligned start last 8.
+
+**Open points** (to settle against Hatari runs in milestone 2's timing bench):
+the generated per-instruction code (refill placement, MOVEM, CAS2); the
+interrupt recognition delay; the format $B frame cost; the blitter's start
+delay; STOP; CACR freeze/flush details; whether the I-cache fill quirk
+matters for TOS code.
 
 ## Decisions (2026-10-08)
 
