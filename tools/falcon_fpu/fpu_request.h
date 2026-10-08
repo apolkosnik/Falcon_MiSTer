@@ -14,7 +14,16 @@
  *   4 save     FSAVE: the result bytes are the frame image (format long first)
  *   5 restore  FRESTORE: AUX = format word, the operand bytes = the frame body
  *
- * Reply FLAGS (mailbox +$202):
+ * The bridge writes a header field only when the kind uses it (CMD: 1, 3;
+ * AUX, NBYTES and the operand bytes: 1, 5; IADDR: 1 with the PC asked for);
+ * the others hold whatever an earlier request left (fpu_kind_has_data).
+ *
+ * Reply STATUS (mailbox +$200, written last; the only word the bridge
+ * reads): fpu_status() of the FLAGS below, the FPSR and the RSEQ:
+ *   bits 15..12 RSEQ[3:0], 11..8 FPSR condition codes {N, Z, I, NAN},
+ *   7..5 vector - 48, 4..0 FLAGS bits 4..0
+ *
+ * Reply FLAGS (mailbox +$202, informational):
  *   bit 0      the instruction is not implemented (F-line)
  *   bit 1      EXC PEND: an enabled exception is pending; the next opclass
  *              000/010/011 instruction or conditional takes it (pre-instruction)
@@ -84,6 +93,21 @@ static inline uint16_t fpu_request(uint16_t kind, uint16_t cmd, uint16_t aux, ui
 	if (st & FPE_ST_PEND) flags |= 2;
 	if (st & FPE_ST_ENABLED) flags |= 8;
 	return (uint16_t)(flags | (vec & 0xff) << 8);
+}
+
+/* the kinds whose request carries AUX, NBYTES and operand bytes */
+static inline int fpu_kind_has_data(uint16_t kind)
+{
+	return kind == FPU_KIND_EXEC || kind == FPU_KIND_RESTORE;
+}
+
+/* the reply STATUS word: what the bridge needs, in one 16-bit read.  The
+ * vectors of FLAGS are the arithmetic ones, 48 (BSUN) .. 54 (SNAN). */
+static inline uint16_t fpu_status(uint16_t seq, uint16_t flags, uint32_t fpsr)
+{
+	unsigned vec = flags >> 8;
+	unsigned v3 = (vec >= 48 && vec <= 54) ? vec - 48 : 0;
+	return (uint16_t)((seq & 0xF) << 12 | ((fpsr >> 24) & 0xF) << 8 | v3 << 5 | (flags & 0x1F));
 }
 
 #endif

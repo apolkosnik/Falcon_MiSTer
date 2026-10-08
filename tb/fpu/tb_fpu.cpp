@@ -55,7 +55,7 @@ static const unsigned HB_PERIOD = CLK_HZ / 100;        // the ARM service: 10 ms
 static const unsigned MB_G = 0xE90000, MB_SIZE = 0x10000;
 static const uint64_t DDR_BYTE0 = 0x30000000ull, DDR_SIZE = 0x1000000ull;
 static const uint16_t MAGIC = 0x4650;
-static const uint16_t VERSION = 3;                     // mailbox protocol version of milestone 4
+static const uint16_t VERSION = 4;                     // mailbox protocol version (bridge header)
 
 //------------------------------------------------------------------ reporting
 static int n_pass = 0, n_fail = 0;
@@ -316,8 +316,10 @@ static void sample()
 	prev_d3_req = rq;
 	if (g_clk >= sb_eff) sb_exp = sb_next;
 	if (g_por) { sb_alive = 0; sb_unch = 0; sb_exp = sb_next = false; }
-	else if (T->o_d3_ack && T->o_d3_we && T->o_d3_addr == (0xE90102 >> 1)) {
-		unsigned kd = T->o_d3_wdata;
+	else if (T->o_d3_ack && T->o_d3_we && T->o_d3_addr == (0xE90100 >> 1)) {
+		// a request is posted (RSEQ written last): its KIND is in the mailbox, written now or
+		// left by an earlier request (the bridge writes a header field only when it changes)
+		unsigned kd = mb16(0x102);
 		if (kd < 8) n_kind[kd]++;
 	} else if (T->o_d3_ack && !T->o_d3_we) {
 		unsigned wa = T->o_d3_addr;
@@ -325,10 +327,10 @@ static void sample()
 		if (wa == (0xE90000 >> 1)) {                 // MAGIC
 			polls.push_back({g_clk, false, d});
 			if (d != MAGIC) sb_alive = 0;
-		} else if (wa == (0xE90204 >> 1) && getenv("M2_SEQ")) {   // debugging: reply FPSR high words
-			static FILE *df = fopen("obj/d3_fpsr.log", "w");
-			if (df) fprintf(df, "%llu reply FPSR[31:16]=%04x\n", (unsigned long long)g_clk, d);
-		} else if (wa == (0xE90004 >> 1)) {          // VERSION: anything but 2 means absent
+		} else if (wa == (0xE90200 >> 1) && getenv("M2_SEQ")) {   // debugging: reply STATUS words
+			static FILE *df = fopen("obj/d3_status.log", "w");
+			if (df) fprintf(df, "%llu reply STATUS=%04x\n", (unsigned long long)g_clk, d);
+		} else if (wa == (0xE90004 >> 1)) {          // VERSION: anything but VERSION means absent
 			polls.push_back({g_clk, false, d});
 			if (d != VERSION) sb_alive = 0;
 		} else if (wa == (0xE90002 >> 1)) {          // HEARTBEAT
@@ -830,7 +832,7 @@ static void sc_detect(const char *name, const char *mode)
 	}
 	if (real) {
 		check_eq("service", "MAGIC word the real falcon_fpu wrote at mailbox +0", MAGIC, mb16(0), "tools/falcon_fpu header: MAGIC $4650", 4);
-		check_eq("service", "VERSION word the real falcon_fpu wrote at mailbox +4", 3, mb16(4), "tools/falcon_fpu: FPU_VERSION 3 (bridge header: VERSION 3)", 4);
+		check_eq("service", "VERSION word the real falcon_fpu wrote at mailbox +4", VERSION, mb16(4), "tools/falcon_fpu: FPU_VERSION 4 (bridge header: VERSION 4)", 4);
 		check_true("service", fmt("HEARTBEAT advanced (now %u)", mb16(2)), mb16(2) != 0, "tools/falcon_fpu: +2 incremented every 10 ms");
 		child_reap();
 		check_true("service", "falcon_fpu_host exited cleanly on SIGTERM", child_exited && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
@@ -918,8 +920,13 @@ static void sc_watch_cpp_freeze()
 	hb_on = true; hb_next = g_clk + HB_PERIOD;
 	uint64_t t_resume = g_clk;
 	uint64_t rise = wait_rise(6 * POLL_CLKS + HB_PERIOD);
-	check_true("presence", fmt("`present` rises again %llu clocks after the heartbeat resumed", (unsigned long long)(rise - t_resume)), rise != 0 && rise - t_resume <= 3 * POLL_CLKS,
-	           "bridge header: HEARTBEAT changed -> present");
+	// the first new heartbeat is written HB_PERIOD after resuming; the next poll comes within POLL_CLKS and
+	// needs its three mailbox reads (random DDR latency here, well under POLL_CLKS / 10); a missed poll
+	// would add a whole POLL_CLKS
+	check_true("presence", fmt("`present` rises again %llu clocks after the heartbeat resumed (limit %u)", (unsigned long long)(rise - t_resume),
+	                           HB_PERIOD + POLL_CLKS + POLL_CLKS / 10),
+	           rise != 0 && rise - t_resume <= HB_PERIOD + POLL_CLKS + POLL_CLKS / 10,
+	           "bridge header: HEARTBEAT changed -> present at the first poll that sees it");
 	if (watch_cpu) run_until([] { return status_now() == 1; }, 6000);
 	if (watch_cpu) check_eq("watch", "FNOP loop STATUS after the heartbeat resumed", 1, status_now(), "MC68882 UM: FNOP completes", 1);
 	if (watch_cpu) { gw32(A_STOP, 1); finish_program(30000); }

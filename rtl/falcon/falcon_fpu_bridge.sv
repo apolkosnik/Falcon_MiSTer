@@ -6,7 +6,7 @@
 // docs/FPU_ARM.md.  References: MC68881/MC68882 User's Manual (UM) ch. 6-7,
 // MC68030 UM ch. 10 as implemented by the AP68030 (core/ap030_exec_c.vh).
 //
-// Presence: the service writes MAGIC, VERSION (3) and increments HEARTBEAT
+// Presence: the service writes MAGIC, VERSION (4) and increments HEARTBEAT
 // about every 10 ms.  Polled every 5 ms; the FPU exists while HEARTBEAT has
 // changed within the last 100 ms.  Without it the first CIR access of an
 // instruction (command, condition or restore write, save read) ends in BERR
@@ -91,18 +91,24 @@
 //
 // Mailbox (guest $E90000, DDR3 0x30E90000; 16-bit words big endian, bytes
 // in memory order: DDR3 byte k = guest byte k):
-//   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (3)   ARM -> FPGA
+//   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (4)   ARM -> FPGA
 //   request, RSEQ written last (FPGA -> ARM):
 //   +$100 RSEQ  +$102 KIND (1 execute, 2 reset, 3 condition, 4 save, 5 restore)
-//   +$104 CMD  +$106 AUX (Dn for a dynamic list or k-factor; restore: the
-//   format word)  +$108 NBYTES  +$10A IADDR (when the PC was asked for)
+//   +$104 CMD (execute; condition: the predicate)  +$106 AUX (execute: Dn
+//   for a dynamic list or k-factor; restore: the format word)  +$108 NBYTES
+//   (execute, restore)  +$10A IADDR (execute, when the PC was asked for)
 //   +$110..+$1FF operand bytes (restore: the frame body)
-//   reply, ASEQ written last (ARM -> FPGA):
-//   +$200 ASEQ  +$202 FLAGS  +$204 FPSR[31:16]  +$206 FPSR[15:0]
-//   +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes (save: the frame)
-//   FLAGS: 0 not implemented, 1 exception pending, 2 condition true,
-//   3 arithmetic exception enabled, 4 this request raised the exception
-//   itself (FMOVE out, BSUN); 15..8 the vector (tools/falcon_fpu/fpu_request.h)
+//   A field is written only when the kind uses it and it differs from what
+//   the mailbox holds (shadow registers; all unknown at power on and while
+//   no service is present): a run of like instructions posts RSEQ alone.
+//   reply, STATUS written last (ARM -> FPGA):
+//   +$200 STATUS  +$202 FLAGS  +$204 FPSR  +$208 FPCR[15:0]  +$20A NBYTES
+//   +$210.. result bytes (save: the frame)
+//   STATUS, all the bridge reads: 15..12 the request's RSEQ[3:0], 11..8 FPSR
+//   condition codes, 7..5 vector - 48 (48..54), 4 this request raised the
+//   exception itself (FMOVE out, BSUN), 3 arithmetic exception enabled,
+//   2 condition true, 1 exception pending, 0 not implemented; FLAGS, FPSR,
+//   FPCR and NBYTES are informational (tools/falcon_fpu/fpu_request.h)
 // Operand and result words move between the operand CIR and the mailbox
 // directly (a CIR access waits for its one or two 16-bit DDR3 accesses).
 module falcon_fpu_bridge #(
@@ -161,19 +167,17 @@ localparam [23:0] A_AUX   = MB + 24'h106;
 localparam [23:0] A_RNB   = MB + 24'h108;
 localparam [23:0] A_IADR  = MB + 24'h10A;
 localparam [23:0] A_RDATA = MB + 24'h110;
-localparam [23:0] A_ASEQ  = MB + 24'h200;
-localparam [23:0] A_FLAGS = MB + 24'h202;
-localparam [23:0] A_FPSRH = MB + 24'h204;
+localparam [23:0] A_STAT  = MB + 24'h200;
 localparam [23:0] A_ADATA = MB + 24'h210;
 localparam [15:0] MAGIC   = 16'h4650;
-localparam [15:0] VERSION = 16'd3;
+localparam [15:0] VERSION = 16'd4;
 
 localparam int POLL_CLKS   = CLK_HZ / 200;          // presence poll, 5 ms
 localparam int ALIVE_POLLS = 20;                    // 100 ms without a heartbeat
 localparam int WD_CLKS     = CLK_HZ / 10;           // reply watchdog, 100 ms
 localparam int PW          = $clog2(POLL_CLKS + 1);
 localparam int WW          = $clog2(WD_CLKS + 1);
-localparam [5:0] GAP_WAIT  = 6'd4;                  // ASEQ poll gap, CPU waiting
+localparam [5:0] GAP_WAIT  = 6'd4;                  // STATUS poll gap, CPU waiting
 localparam [5:0] GAP_BG    = 6'd32;                 // ... CPU running (leave it the bus)
 
 // dialog states
@@ -186,8 +190,7 @@ localparam [4:0] T_IDLE  = 5'd0,  T_CIR   = 5'd1,  T_DMA   = 5'd2,
                  T_PKIND = 5'd7,  T_PCMD  = 5'd8,  T_PAUX  = 5'd9,  T_PNB   = 5'd10,
                  T_PSEQ  = 5'd11, T_PDONE = 5'd12, T_PIAH = 5'd22, T_PIAL = 5'd23,
                  T_SFMT  = 5'd24,
-                 T_QSEQ  = 5'd13, T_QFLG  = 5'd14, T_QFPSR = 5'd15,
-                 T_QDONE = 5'd18,
+                 T_QSTAT = 5'd13, T_QDONE = 5'd18,
                  T_SMAG  = 5'd19, T_SVER  = 5'd20, T_SHB   = 5'd21;
 
 // ---------------------------------------------------------------------------
@@ -279,6 +282,13 @@ reg           post_req = 1'b0;      // post the request built in the mailbox
 reg  [2:0]    post_kind;            // 1 execute, 2 reset, 3 condition, 4 save, 5 restore
 reg           rst_req = 1'b0;       // the ARM FPU has to be reset
 reg  [15:0]   rseq = 16'd0;
+// what the mailbox request header holds (a field is written only when it
+// changes; valid bits cleared at power on and while the FPU is absent)
+reg  [2:0]    sh_kind;
+reg  [15:0]   sh_cmd, sh_aux;
+reg  [7:0]    sh_nb;
+reg  [31:0]   sh_ia;
+reg  [4:0]    sh_v = 5'd0;          // valid: {iaddr, nbytes, aux, cmd, kind}
 reg           r_unimpl;
 reg           r_exc;                // reply: the condition raised BSUN
 reg           r_tf;                 // reply: condition result
@@ -320,6 +330,7 @@ wire        exc_cls  = opclass == 3'b000 || opclass == 3'b010 || opclass == 3'b0
 wire        pc_req   = exc_en && !pc_done && exc_cls;
 wire [15:0] pcb      = pc_req ? 16'h4000 : 16'h0000;      // PC bit of the first primitive
 wire        rest_wr  = cr_pend && cr_we && cr_off == CIR_REST;
+wire [15:0] p_cmd    = post_kind == 3'd3 ? {10'd0, cond[5:0]} : cmd;
 
 // bytes of an operand CIR access (SIZ: 01 byte, 10 word, 11 three, 00 long)
 wire [2:0]  acc_n    = (cr_siz == 2'b01) ? 3'd1 : (cr_siz == 2'b10) ? 3'd2 :
@@ -467,7 +478,7 @@ always @(posedge clk) begin
                 rst_req   <= 1'b0;
                 st        <= T_PKIND;
             end
-            else if (busy && gap == 6'd0)               dma(1'b0, A_ASEQ, 16'd0, 2'b11, T_QSEQ);
+            else if (busy && gap == 6'd0)               dma(1'b0, A_STAT, 16'd0, 2'b11, T_QSTAT);
             else if (ptmr == PW'(POLL_CLKS)) begin
                 ptmr <= '0;
                 dma(1'b0, A_MAGIC, 16'd0, 2'b11, T_SMAG);
@@ -725,13 +736,39 @@ always @(posedge clk) begin
             if (dst == D_SAVE) out_base <= out_base - 8'd4;
         end
 
-        // ---- post a request: header, RSEQ last ----
-        T_PKIND: dma(1'b1, A_KIND, {13'd0, post_kind}, 2'b11, T_PCMD);
-        T_PCMD:  dma(1'b1, A_CMD, post_kind == 3'd3 ? {10'd0, cond[5:0]} : cmd, 2'b11, T_PAUX);
-        T_PAUX:  dma(1'b1, A_AUX, aux, 2'b11, T_PNB);
-        T_PNB:   dma(1'b1, A_RNB, {8'd0, in_len}, 2'b11, (post_ia && post_kind == 3'd1) ? T_PIAH : T_PSEQ);
-        T_PIAH:  dma(1'b1, A_IADR, iaddr[31:16], 2'b11, T_PIAL);
-        T_PIAL:  dma(1'b1, A_IADR + 24'd2, iaddr[15:0], 2'b11, T_PSEQ);
+        // ---- post a request: the header fields the kind uses, each only when it
+        // differs from what the mailbox holds; RSEQ last ----
+        T_PKIND:
+            if (sh_v[0] && sh_kind == post_kind) st <= T_PCMD;
+            else begin
+                sh_kind <= post_kind; sh_v[0] <= 1'b1;
+                dma(1'b1, A_KIND, {13'd0, post_kind}, 2'b11, T_PCMD);
+            end
+        T_PCMD:                             // execute: command; condition: predicate
+            if (!(post_kind == 3'd1 || post_kind == 3'd3) || (sh_v[1] && sh_cmd == p_cmd)) st <= T_PAUX;
+            else begin
+                sh_cmd <= p_cmd; sh_v[1] <= 1'b1;
+                dma(1'b1, A_CMD, p_cmd, 2'b11, T_PAUX);
+            end
+        T_PAUX:                             // execute: Dn; restore: format word
+            if (!(post_kind == 3'd1 || post_kind == 3'd5) || (sh_v[2] && sh_aux == aux)) st <= T_PNB;
+            else begin
+                sh_aux <= aux; sh_v[2] <= 1'b1;
+                dma(1'b1, A_AUX, aux, 2'b11, T_PNB);
+            end
+        T_PNB:                              // execute, restore: operand bytes
+            if (!(post_kind == 3'd1 || post_kind == 3'd5) || (sh_v[3] && sh_nb == in_len)) st <= T_PIAH;
+            else begin
+                sh_nb <= in_len; sh_v[3] <= 1'b1;
+                dma(1'b1, A_RNB, {8'd0, in_len}, 2'b11, T_PIAH);
+            end
+        T_PIAH:                             // execute with the PC asked for: the address
+            if (!(post_ia && post_kind == 3'd1) || (sh_v[4] && sh_ia == iaddr)) st <= T_PSEQ;
+            else dma(1'b1, A_IADR, iaddr[31:16], 2'b11, T_PIAL);
+        T_PIAL: begin
+            sh_ia <= iaddr; sh_v[4] <= 1'b1;
+            dma(1'b1, A_IADR + 24'd2, iaddr[15:0], 2'b11, T_PSEQ);
+        end
         T_PSEQ:  dma(1'b1, A_RSEQ, rseq + 1'd1, 2'b11, T_PDONE);
         T_PDONE: begin
             if (post_kind == 3'd1 || post_kind == 3'd3 || post_kind == 3'd5)
@@ -743,32 +780,28 @@ always @(posedge clk) begin
             st       <= T_IDLE;
         end
 
-        // ---- poll for the reply ----
-        T_QSEQ:
-            if (busy && rd_q == rseq) dma(1'b0, A_FLAGS, 16'd0, 2'b11, T_QFLG);
-            else begin
+        // ---- poll for the reply: one STATUS word ----
+        T_QSTAT:
+            if (busy && rd_q[15:12] == rseq[3:0]) begin
+                // STATUS: 15..12 sequence, 11..8 FPSR condition codes {N, Z, I, NAN},
+                // 7..5 vector - 48, 4 this request raised the exception itself
+                // (FMOVE out, BSUN of a condition), 3 an arithmetic exception is
+                // enabled, 2 condition true, 1 exception pending, 0 not implemented
+                r_unimpl <= rd_q[0];
+                r_exc    <= rd_q[4];
+                r_tf     <= rd_q[2];
+                r_mid    <= rd_q[4];
+                r_vec    <= 8'd48 + {5'd0, rd_q[7:5]};
+                exc_pend <= rd_q[1];
+                exc_vec  <= 8'd48 + {5'd0, rd_q[7:5]};
+                exc_en   <= rd_q[3];
+                fcc      <= rd_q[11:8];
+                if (post_kind == 3'd4) save_rdy <= 1'b1;
+                st       <= T_QDONE;
+            end else begin
                 gap <= (dst == D_WAIT || dst == D_CMD || dst == D_COND) ? GAP_WAIT : GAP_BG;
                 st  <= T_IDLE;
             end
-        T_QFLG: begin
-            // FLAGS: 0 not implemented, 1 exception pending (EXC PEND), 2 condition
-            // true, 3 arithmetic exceptions enabled, 4 the instruction raised its
-            // exception itself (FMOVE out, BSUN of a condition); 15..8 vector
-            r_unimpl <= rd_q[0];
-            r_exc    <= rd_q[4];
-            r_tf     <= rd_q[2];
-            r_mid    <= rd_q[4];
-            r_vec    <= rd_q[15:8];
-            exc_pend <= rd_q[1];
-            exc_vec  <= rd_q[15:8];
-            exc_en   <= rd_q[3];
-            if (post_kind == 3'd4) save_rdy <= 1'b1;
-            dma(1'b0, A_FPSRH, 16'd0, 2'b11, T_QFPSR);
-        end
-        T_QFPSR: begin                      // (FPCR and the result length are not needed)
-            fcc <= rd_q[11:8];
-            st  <= T_QDONE;
-        end
         T_QDONE: begin
             busy <= 1'b0;
             if ((resp & 16'hBFFF) == R_REL) resp <= R_IDLE;  // the background instruction is done
@@ -811,7 +844,9 @@ always @(posedge clk) begin
             st != T_PIAL && st != T_PSEQ)
             post_req <= 1'b0;
     end
+    if (!present) sh_v <= 5'd0;         // a new service: the header is unknown
     if (por) begin
+        sh_v     <= 5'd0;
         st       <= T_IDLE;
         dma_req  <= 1'b0;
         cr_pend  <= 1'b0;

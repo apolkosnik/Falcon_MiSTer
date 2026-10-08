@@ -15,7 +15,7 @@
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
 //     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC,
-//                       VERSION 3 and a heartbeat every 10 ms in the mailbox
+//                       VERSION 4 and a heartbeat every 10 ms in the mailbox
 //                       at $E90000, and every request executed by the same
 //                       68882 engine (libfpe) the ARM service uses
 //     --cptrace         print every coprocessor (FPU) interface register access
@@ -81,7 +81,7 @@ static void fpu_serve(void)
     fpu_seen = seq;
     uint8_t in[FPU_REQ_MAX], out[FPE_MAXIO];
     uint16_t kind = guest_rd16(MB + 0x102), cmd = guest_rd16(MB + 0x104), aux = guest_rd16(MB + 0x106);
-    int n = guest_rd16(MB + 0x108), out_len = 0;
+    int n = fpu_kind_has_data(kind) ? guest_rd16(MB + 0x108) : 0, out_len = 0;
     uint32_t iaddr = (uint32_t)guest_rd16(MB + 0x10A) << 16 | guest_rd16(MB + 0x10C);
     if (n > FPU_REQ_MAX) n = FPU_REQ_MAX;
     for (int i = 0; i < n; i++) in[i] = guest_rd8(MB + 0x110 + i);
@@ -93,7 +93,7 @@ static void fpu_serve(void)
     guest_wr16(MB + 0x206, (uint16_t)fpsr);
     guest_wr16(MB + 0x208, (uint16_t)fpe_fpcr());
     guest_wr16(MB + 0x20A, (uint16_t)out_len);
-    guest_wr16(MB + 0x200, seq);
+    guest_wr16(MB + 0x200, fpu_status(seq, flags, fpsr));      // STATUS last
 }
 
 int main(int argc, char **argv) {
@@ -287,7 +287,7 @@ int main(int argc, char **argv) {
             fpe_reset();
             fpu_seen = guest_rd16(0xE90100);
             guest_wr16(0xE90200, fpu_seen);
-            guest_wr16(0xE90004, 3);          // VERSION
+            guest_wr16(0xE90004, 4);          // VERSION
             guest_wr16(0xE90000, 0x4650);     // MAGIC "FP"
         }
         if (fpu_service && cyc % 320000 == 0) guest_wr16(0xE90002, ++fpu_hb);   // 10 ms

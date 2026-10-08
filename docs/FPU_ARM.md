@@ -99,15 +99,20 @@ back to sleeping polls after ~1 ms idle so an idle FPU does not take a core
 **Mailbox.**  Guest $E90000 (DDR3 0x30E90000), next to the probe's $E80000
 so the two never mix; 16-bit words, Falcon byte order.  +$000 MAGIC $4650
 ("FP", written by the service, cleared when it stops), +$002 HEARTBEAT
-(incremented every 10 ms), +$004 VERSION (3).  One request at a time:
+(incremented every 10 ms), +$004 VERSION (4).  One request at a time:
 +$100 RSEQ (written last), KIND (1 execute, 2 reset, 3 condition, 4 save,
 5 restore), CMD, AUX (Dn of a dynamic list or k-factor; the restore format
 word), NBYTES, IADDR (+$10A, when the PC was asked for), operand bytes at
-+$110 (the restore body); the reply at +$200: ASEQ (written last), FLAGS
-(not implemented, exception pending, condition true, exception enabled,
-raised by this request, vector), FPSR, FPCR[15:0], NBYTES, result bytes at
-+$210 (the save frame).  `tools/falcon_fpu/fpu_request.h` executes a request
-for the service and for the system simulation alike.  Operand and result bytes are copied in
++$110 (the restore body).  The bridge writes a header field only when the
+kind uses it and it differs from what the mailbox holds, so a run of like
+instructions posts RSEQ alone.  The reply at +$200: STATUS (written last;
+the only word the bridge reads: RSEQ[3:0], the FPSR condition codes, the
+exception vector - 48 and the flags not implemented, exception pending,
+condition true, exception enabled, raised by this request), then FLAGS,
+FPSR, FPCR[15:0], NBYTES (informational), result bytes at +$210 (the save
+frame).  The service reads and writes it in 32-bit words (the mapping is
+uncached).  `tools/falcon_fpu/fpu_request.h` executes a request for the
+service and for the system simulation alike.  Operand and result bytes are copied in
 memory order between the operand CIR and the mailbox, so the bridge needs no
 buffer.
 
@@ -150,6 +155,68 @@ in BERR as before).
   move in/out, conditional and memory-operand instructions.  `sim.sh` runs
   either in the system simulation on a stand-in ROM (`simrom.s`: the few
   GEMDOS/BIOS/XBIOS calls they make, VBL interrupts) instead of TOS.
+
+### Measured speed
+
+Mailbox VERSION 3 (milestone 5 as committed): DE10-Nano, 2026-10-08,
+`releases/Falcon_20261008.rbf` with the service started by Main (CPU 0,
+SCHED_FIFO), FPUBENCH.TOS, 100,000 instructions each:
+
+| Instruction | us each | per second |
+|-------------|---------|------------|
+| FNOP | 0.95 | 1,052,631 |
+| FSGT D0 | 0.95 | 1,052,631 |
+| FADD FP1,FP0 | 9.65 | 103,626 |
+| FMUL FP1,FP0 | 9.50 | 105,263 |
+| FDIV FP1,FP0 | 9.45 | 105,820 |
+| FSQRT FP1,FP0 | 12.25 | 81,632 |
+| FSIN FP1,FP0 | 14.40 | 69,444 |
+| FETOX FP1,FP0 | 14.25 | 70,175 |
+| FMOVE.L D7,FP0 | 11.65 | 85,836 |
+| FMOVE.L FP1,D0 | 12.90 | 77,519 |
+| FMOVE.X FP0,(A4) | 18.45 | 54,200 |
+| FMOVE.D (A4),FP0 + FMUL.D (A4),FP0 | 13.45 | 74,349 |
+
+FNOP and FSGT are answered by the bridge alone (the predicate from the
+mirrored condition codes): ~1 us is the coprocessor dialogue itself.
+Every other row was one mailbox round trip per instruction with a fixed
+cost of about 9 us, against 0.59 us for the bare mailbox round trip
+(`tools/mbox_ping`): the request/reply framing.
+
+Mailbox VERSION 4 (a header field written only when it changes, one
+STATUS word as the reply, the service polling without system calls and
+accessing the mailbox in 32-bit words), same board, same day:
+
+| Instruction | VERSION 3 us | VERSION 4 us | per second |
+|-------------|--------------|--------------|------------|
+| FNOP | 0.95 | 1.00 | 1,000,000 |
+| FSGT D0 | 0.95 | 0.95 | 1,052,631 |
+| FADD FP1,FP0 | 9.65 | 5.00 | 200,000 |
+| FMUL FP1,FP0 | 9.50 | 4.90 | 204,081 |
+| FDIV FP1,FP0 | 9.45 | 4.90 | 204,081 |
+| FSQRT FP1,FP0 | 12.25 | 7.75 | 129,032 |
+| FSIN FP1,FP0 | 14.40 | 10.40 | 96,153 |
+| FETOX FP1,FP0 | 14.25 | 10.15 | 98,522 |
+| FMOVE.L D7,FP0 | 11.65 | 6.80 | 147,058 |
+| FMOVE.L FP1,D0 | 12.90 | 8.15 | 122,699 |
+| FMOVE.X FP0,(A4) | 18.45 | 12.95 | 77,220 |
+| FMOVE.D (A4),FP0 + FMUL.D (A4),FP0 | 13.45 | 8.70 | 114,942 |
+
+`falcon_fpu -s` during the run (A9 global timer): a mailbox read costs
+128 ns, a write 71 ns; while the reg-reg rows ran, a request spent 3.05 us
+in the service (2.16 us in the engine, 0.89 us mailbox and the rest) and
+2.23 us between its reply and the next request (the bridge noticing the
+STATUS, the 68030's next instruction, the bridge posting it, the service
+noticing RSEQ).  What is left, largest first:
+- the engine: FADD, FMUL and FDIV cost the same, so the time is
+  fpp.c's per-instruction work (decode, operand fetch through the shim,
+  status, exception checks), not the arithmetic;
+- the FPGA side: one STATUS read and one RSEQ write per request at about
+  0.32 us each through `falcon_memarb`, plus the 68030's dialogue;
+- the service's mailbox work: the IADDR read is needed only with an
+  enabled exception, FPSR/FPCR/NBYTES are informational, and the barrier
+  before STATUS is needed only after result bytes;
+- the FIFO duty cap: ~10% under a continuous FPU-bound run.
 
 ## Verification plan
 
