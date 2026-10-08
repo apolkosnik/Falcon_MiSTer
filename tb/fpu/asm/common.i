@@ -27,6 +27,7 @@ RESUME		equ	$0F34		; long: where an aborted case continues
 SAVESP		equ	$0F38		; long: stack pointer at the start of the case program
 ABORTMODE	equ	$0F3C		; long: non-zero: unexpected exceptions abort the current case
 IRQCNT		equ	$0F5C		; long: interrupts taken by h_irq
+HOLDW		equ	$0F60		; long: 1 while the program waits at a hold handshake (the bench clears it)
 HMODE		equ	$0F58		; long: 0 the FPU exception handler absorbs the exception, 1 it only returns
 SOFTEXC		equ	$0F54		; long: non-zero: an expected pre-instruction exception is stepped over (SKIP)
 MARK1		equ	$0F40		; longs: progress markers of the hand written M2 programs
@@ -111,8 +112,10 @@ logexc	macro
 	move.l	2(a0),(a1)+		; PC
 	moveq	#0,d2
 	cmp.l	#2,d1
+	beq.s	yia\@
+	cmp.l	#9,d1
 	bne.s	nia\@
-	move.l	8(a0),d2
+yia\@:	move.l	8(a0),d2
 nia\@:	move.l	d2,(a1)+		; IA
 	moveq	#0,d2
 	move.w	(a0),d2

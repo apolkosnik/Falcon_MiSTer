@@ -230,7 +230,7 @@ static uint32_t Tg(const char *n)
 
 // guest control block (asm/common.i)
 enum { A_GO = 0x0F00, A_STOP = 0x0F04, A_DONE = 0x0F08, A_EXCNT = 0x0F0C, A_EXLOGP = 0x0F10, A_STATUS = 0x0F18,
-       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_CASEIX = 0x0F30, A_MARK1 = 0x0F40, A_MARK2 = 0x0F44, A_MARK3 = 0x0F48, A_MARK4 = 0x0F4C, A_MODE = 0x0F50, A_EXLOG = 0x80000, A_RECLOG = 0x4000 };
+       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_CASEIX = 0x0F30, A_MARK1 = 0x0F40, A_MARK2 = 0x0F44, A_MARK3 = 0x0F48, A_MARK4 = 0x0F4C, A_MODE = 0x0F50, A_IRQCNT = 0x0F5C, A_HOLDW = 0x0F60, A_EXLOG = 0x80000, A_RECLOG = 0x4000 };
 
 //------------------------------------------------------------------ monitors
 // CIR bus cycles (CPU space type 2) seen on the 68030 pins
@@ -674,7 +674,8 @@ static void bus_checks(const char *tag)
 	if (!prim_bad.empty()) printf("        first: %s\n", prim_bad.c_str());
 
 	// refused opmodes (bridge header): opclass 000/010 command words with opmode $6E-$77 are answered with the F-line
-	// primitive ($1C0B), $78-$7F with vector 4 ($1C04), before any operand is transferred
+	// primitive ($1C0B), $78-$7F with vector 4 ($1C04), before any operand is transferred; while an earlier
+	// instruction still executes the response is come-again ($8900) first (bridge header "Busy", MC68881 UM 7.2.6)
 	unsigned n_ref = 0, n_ref_bad = 0;
 	std::string ref_bad;
 	for (size_t i = 0; i < cirs.size();) {
@@ -690,7 +691,8 @@ static void bus_checks(const char *tag)
 			bool operand = false;
 			for (size_t k = i + 1; k < j; k++) {
 				if (cirs[k].off == 0x10) operand = true;
-				if (cirs[k].off == 0x00 && cirs[k].rw && gotr == 0xFFFF) gotr = cirs[k].data >> 16;
+				if (cirs[k].off == 0x00 && cirs[k].rw && gotr == 0xFFFF && (cirs[k].data >> 16) != 0x8900)
+					gotr = cirs[k].data >> 16;
 			}
 			if (operand || gotr != want) {
 				n_ref_bad++;
@@ -699,8 +701,8 @@ static void bus_checks(const char *tag)
 		}
 		i = j;
 	}
-	check_eq("bus", fmt("refused opmodes ($6E-$7F, %u instructions): not answered with $1C0B/$1C04 or with an operand transfer", n_ref), 0, n_ref_bad,
-	         "bridge header: $6E-$77 F-line ($1C0B), $78-$7F vector 4 ($1C04), before any operand; Hatari fault_if_nonexisting_opmode", 1);
+	check_eq("bus", fmt("refused opmodes ($6E-$7F, %u instructions): not answered with $1C0B/$1C04 (after any come-again) or with an operand transfer", n_ref), 0, n_ref_bad,
+	         "bridge header: $6E-$77 F-line ($1C0B), $78-$7F vector 4 ($1C04), before any operand, come-again while busy; Hatari fault_if_nonexisting_opmode", 1);
 	if (!ref_bad.empty()) printf("        first: %s\n", ref_bad.c_str());
 	check_eq("bus", fmt("FSAVE/FRESTORE dialogues (%u saves, %u restores) whose operand CIR transfer count differs from the frame size", n_saves, n_rests), 0,
 	         n_frm_bad, "MC68030 UM 10.5.4/10.5.5: body = size byte of the format word ($38 = 14 longs; version $00 = null: none); Hatari accepted sizes $38/$18/$D4/$B4", 1);
@@ -1278,6 +1280,16 @@ static void sc_straddle()
 	check_eq("straddle", "presence loss/return cycles completed", 300, reps, "test harness", 3);
 	gw32(A_STOP, 1);
 	finish_program(60000);
+	{   // exceptions in the run: F-line (refused at the first access) and, for an instruction waiting for the ARM, the protocol violation
+		unsigned nfl = 0, npv = 0, nother = 0;
+		for (auto &e : exlog()) {
+			if (e.vec == 11 && e.fmt == 0) nfl++;
+			else if (e.vec == 13 && e.fmt == 9) npv++;
+			else nother++;
+		}
+		check_eq("straddle", fmt("exceptions other than F-line (%u) and coprocessor protocol violation, format 9 (%u)", nfl, npv), 0, nother,
+		         "bridge header: no FPU -> F-line; service stops answering or presence lost while an instruction waits -> $1D0D (vector 13)", 1);
+	}
 	// instructions whose CIR dialogue was cut by the loss of presence
 	unsigned straddled = 0, refused = 0, completed_after = 0;
 	for (size_t i = 0; i < cirs.size();) {
@@ -1341,11 +1353,11 @@ static std::vector<M2Exc> case_exc(const std::vector<ExEnt> &ex, int i)
 {
 	std::vector<M2Exc> v;
 	for (auto &e : ex)
-		if (e.ix == (uint32_t)i && !(e.vec == 7 && e.fmt == 2)) v.push_back({e.vec, e.fmt, e.pc});   // (taken FTRAPcc are counted by the program)
+		if (e.ix == (uint32_t)i && !(e.vec == 7 && e.fmt == 2)) v.push_back({e.vec, e.fmt, e.pc, e.ia});   // (taken FTRAPcc are counted by the program)
 	return v;
 }
 
-static void sc_cases()
+static void run_cases(bool irqmode)
 {
 	m2_build();
 	const char *G = "m2";
@@ -1356,7 +1368,7 @@ static void sc_cases()
 	for (int ch = 0; ch < m2_nchunks(); ch++) {
 		bool any = false;
 		for (int i = m2_chunk_first(ch); i < m2_chunk_end(ch); i++) any |= !m2_skip(i);
-		if (!any) continue;
+		if (!any || m2_chunk_irq(ch) != irqmode) continue;
 		std::string prog = fmt("t_cases%d", ch);
 		std::map<std::string, uint32_t> syms = load_syms(fmt("obj/%s.lst", prog.c_str()).c_str());
 		begin_test(fmt("M2/M3 generated cases vs the Hatari golden, chunk %d (cases %d-%d)", ch, m2_chunk_first(ch), m2_chunk_end(ch) - 1).c_str(), prog.c_str());
@@ -1371,6 +1383,25 @@ static void sc_cases()
 		run_until(is_ready, 800000);
 		steps(2000);
 		gw32(A_GO, 1);
+		if (irqmode) {
+			// hold the ARM at the case's hold point, wait until the instruction is in its come-again loop, raise the interrupt
+			bool hw = run_until([] { return gr32(A_HOLDW) == 1; }, 800000);
+			check_true("irqk", fmt("chunk %d: the program reached its hold point", ch), hw, "test harness");
+			child_signal(SIGSTOP);
+			steps(200);
+			gw32(A_HOLDW, 0);
+			bool ca = run_until([] { return ca_run >= 6; }, 100000);
+			check_true("irqk", fmt("chunk %d: the FPU instruction is in its come-again loop (%u consecutive come-again responses, ARM held)", ch, ca_run), ca, "bridge header: Busy / FSAVE while busy");
+			g_ipl = 3;
+			uint64_t t_irq = g_clk;
+			bool taken = run_until([] { return gr32(A_IRQCNT) != 0; }, 20000);
+			check_true("irqk", fmt("chunk %d: the level 3 interrupt was taken %llu clocks after it was raised, with the instruction still waiting for the ARM", ch,
+			                      (unsigned long long)(g_clk - t_irq)), taken && !is_done(),
+			           "MC68030 UM 10.4.8: interrupt on a come-again null primitive with IA stacks a format $9 frame; AP68030 iack_cpmid");
+			steps(1500);
+			check_true("irqk", fmt("chunk %d: the instruction is still waiting after the handler returned (re-reads the response CIR)", ch), !is_done(), "MC68030 UM 10.4.8");
+			child_signal(SIGCONT);
+		}
 		// run to the end; stop when no case makes progress for 5 watchdog periods
 		uint32_t last = ~0u;
 		uint64_t last_clk = g_clk;
@@ -1394,7 +1425,7 @@ static void sc_cases()
 				npass++;
 				grp[m2_group(i)].first++;
 				report(true, G, fmt("[%s: every FP register, FPCR, FPSR, integer registers, memory%s equal to the golden; expected %s got identical", tag.c_str(),
-				                   r.nexc ? " and the expected exceptions" : "", r.summary.c_str()), "Hatari fpp.c golden");
+				                   r.nexc ? " and the expected exceptions" : "", r.summary.c_str()), irqmode ? "Hatari fpp.c golden; MC68030 UM 10.4.8: interrupt during come-again = format $9 frame (IA = the FPU instruction, PC = next), RTE completes the instruction; regression for AP68030 iack_cpmid (ap030_core.v, exec_a.vh, exec_c.vh)" : "Hatari fpp.c golden");
 			} else {
 				nfail++;
 				grp[m2_group(i)].second++;
@@ -1405,7 +1436,7 @@ static void sc_cases()
 						if (e.ix == (uint32_t)i) d += fmt("; exception vector %u format %u at pc %08x", e.vec, e.fmt, e.pc);
 				}
 				for (auto &x : r.diffs) d += fmt("; %s expected %s got %s", x.what.c_str(), x.exp.c_str(), x.got.c_str());
-				report(false, G, fmt("[%s: %s%s", tag.c_str(), r.summary.c_str(), (" -> " + d).c_str()), "Hatari fpp.c golden");
+				report(false, G, fmt("[%s: %s%s", tag.c_str(), r.summary.c_str(), (" -> " + d).c_str()), irqmode ? "Hatari fpp.c golden; MC68030 UM 10.4.8; without AP68030 iack_cpmid the interrupt stacks format 0 and RTE skips the rest of the instruction" : "Hatari fpp.c golden");
 			}
 			if (r.fpiar_diff && r.done) {
 				ngap++;
@@ -1441,7 +1472,7 @@ static void sc_cases()
 	printf("  summary: %u cases pass, %u fail; #imm/multi-register immediate cases %u of which %u pass\n", npass, nfail, nimp, nimpok);
 	check_eq(G, "cases (that ran to their end) whose dumped FPIAR differs from the golden", 0, ngap, "Hatari fpp.c golden; bridge header: FPIAR not loaded from the instruction address yet", 1);
 	if (ngap) printf("        first: %s\n", gap_first.c_str());
-	check_true(G, fmt("BSUN/PC primitives ($5C30 etc.: PC bit, then CIR $18, then the exception acknowledge) seen in the CIR log: %u", tot_prim_pc), tot_prim_pc >= 20,
+	if (!irqmode) check_true(G, fmt("BSUN/PC primitives ($5C30 etc.: PC bit, then CIR $18, then the exception acknowledge) seen in the CIR log: %u", tot_prim_pc), tot_prim_pc >= 20,
 	           "bridge header: BSUN is a pre-instruction exception with the PC ($5C30); MC68030 UM 10.5.2");
 	check_eq(G, fmt("condition requests (KIND 3) posted to the ARM (of %u execute requests): only IEEE-nonaware predicates with NAN set", tot_exec),
 	         tot_gold3, tot_kind3, "bridge header: KIND 3 only for nonaware predicates with NAN; golden = count of fpp_cond evaluations with (cc & 0x10) and FPSR NAN", 1);
@@ -1512,6 +1543,9 @@ static void sc_m3()
 	}
 	printf("  m3 summary: %u groups (%u with differences), %u items, %u differing\n", tot_groups, tot_gbad, tot_items, tot_bad);
 }
+
+static void sc_cases() { run_cases(false); }
+static void sc_irqk() { run_cases(true); }
 
 // background execution, FSAVE while busy, watchdog -----------------------------------------------
 static bool wait_mark(uint32_t addr, uint64_t max, uint64_t *when = nullptr)
@@ -1833,6 +1867,7 @@ int main(int argc, char **argv)
 	    {"m2bg", sc_bg},
 	    {"m2busy", sc_busy},
 	    {"m4irq", sc_irq},
+	    {"m4irqk", sc_irqk},
 	    {"m4fsdie", sc_fsdie},
 	    {"m2wd_stop", [] { sc_wd(0); }},
 	    {"m2wd_nosvc", [] { sc_wd(1); }},

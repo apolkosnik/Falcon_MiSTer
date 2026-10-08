@@ -1,13 +1,20 @@
 # MC68882 FPU served by the ARM - design
 
-Status (branch `feature/fpu-arm`): milestones 1-4 done.  Presence, frames and detection; full instruction dialogs in
+Status (branch `feature/fpu-arm`): milestones 1-5 done; on the DE10-Nano
+(2026-10-08) FPUTEST.TOS passes and FPUBENCH.TOS runs with the service started
+by Main.  Presence, frames and detection; full instruction dialogs in
 `rtl/falcon/falcon_fpu_bridge.sv`, requests executed by `tools/falcon_fpu` with
 Hatari's `fpp.c` (`tools/falcon_fpu/engine`), verified by `tb/fpu` against Hatari
 driven with real EAs.  Milestone 4: enabled exceptions (pending, pre- and
 mid-instruction), FPIAR through the PC primitive, FSAVE/FRESTORE frames
 owned by the ARM.  Milestone 2 needed two
 AP68030 coprocessor fixes (immediate operands in the "memory" EA category, cpScc
-byte size), committed in the submodule on branch `fix/coprocessor-imm-cpscc`.  The core has no FPU today
+byte size), committed in the submodule on branch `fix/coprocessor-imm-cpscc`;
+milestone 5 a third: an interrupt taken while an FPU instruction waits on
+come-again (null, CA, IA) must stack a coprocessor mid-instruction frame
+(format $9) whose RTE resumes the dialogue (UM 10.4.8); the core stacked a
+normal frame past the instruction, so its remaining transfers were lost
+(found by FPUTEST in the system simulation with VBL interrupts).  The core has no FPU today
 (README: "the 68881 does not fit"; `falcon_cpubus` ends every coprocessor
 cycle in a bus error, so the 68030 takes the F-line exception).  ~3,100 ALMs
 are free, far too few for an FPU, but enough for a protocol bridge: the
@@ -118,6 +125,32 @@ build (`FALCON_BRINGUP="MBOX_TEST"`) gives d3 to the probe and has no FPU,
 and `FALCON_BRINGUP="NO_FPU"` leaves the bridge out (coprocessor cycles end
 in BERR as before).
 
+## Running it (milestone 5)
+
+- **Start/stop** (`main_patch/0003`, Main_MiSTer `support/falcon/falcon_fpu.cpp`):
+  at core start, before the reset is released, Main runs `falcon_fpu -c 0 -f -d`
+  from the directory of its own binary (output to `/tmp/falcon_fpu.log`);
+  `fpga_load_rbf` stops it (SIGTERM, wait, SIGKILL after 200 ms) before the
+  FPGA is loaded with another core, since its heartbeat writes would land in
+  the next core's DDR3.  `-d` (PR_SET_PDEATHSIG) ends it when Main exits for
+  any other reason (Main restarts itself on every core load).  Only one
+  instance serves the mailbox (`flock` on `/tmp/falcon_fpu.lock`).
+- **CPU policy**: CPU 0 (Main owns CPU 1), SCHED_FIFO; spin while requests
+  keep coming, poll every 50 us after 1 ms without one.  Under SCHED_FIFO a
+  busy spin is broken every 1.8 ms by a 200 us sleep, so ~10% of CPU 0 stays
+  with Linux, under the RT throttling limit (95%) that would otherwise stop
+  the service for 50 ms at a time under a long FPU-bound run.
+- **Hardware tests** (`tools/fputest`, `build.sh`): FPUTEST.TOS runs a
+  generated sequence (every opmode, operand format, rounding mode, FMOVECR
+  constant, predicate, FMOVEM; 3,850 results) 20 times and compares it with
+  the results of the same engine on the host, so a difference is a fault of
+  the FPGA/DDR3/ARM path; then an enabled DZ (pre-instruction, FPIAR,
+  FSAVE/FRESTORE with BIU bit 27) and OPERR (FMOVE out, mid-instruction)
+  exception round trip.  FPUBENCH.TOS times reg-reg, transcendental,
+  move in/out, conditional and memory-operand instructions.  `sim.sh` runs
+  either in the system simulation on a stand-in ROM (`simrom.s`: the few
+  GEMDOS/BIOS/XBIOS calls they make, VBL interrupts) instead of TOS.
+
 ## Verification plan
 
 - Bridge unit: the AP68030 scripted-coprocessor style (`tb_cp_model.svh`),
@@ -140,7 +173,8 @@ in BERR as before).
 4. Exceptions (pending, pre/mid-instruction, BSUN with PC), FPIAR, FSAVE/FRESTORE
    frames from the ARM.  (Background execution and condition-code mirroring
    came with milestones 2 and 3.)
-5. Main integration (start/stop the service), CPU-0 policy, hardware tests.
+5. Main integration (start/stop the service), CPU-0 policy, hardware tests
+   (see "Running it").
 
 ## Open decisions
 

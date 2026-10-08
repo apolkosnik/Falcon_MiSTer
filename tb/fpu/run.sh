@@ -18,12 +18,12 @@
 #   ONLY=name                   run one scenario: detect_real detect_nosvc detect_badmagic detect_hb0
 #                               detect_badversion watch_freeze watch_magic watch_real frames cond gen
 #                               cpid_alive cpid_absent absent reset raw rawna straddle
-#                               m2cases m3sweeps m4irq m4fsdie m2bg m2busy m2wd_stop m2wd_nosvc m2wd_presence
+#                               m2cases m3sweeps m4irq m4irqk m4fsdie m2bg m2busy m2wd_stop m2wd_nosvc m2wd_presence
 set -e
 cd "$(dirname "$0")"
 ROOT=../..
 RTL=$ROOT/rtl
-CPU=$RTL/AP68030/rtl
+CPU=${CPU_DIR:-$RTL/AP68030/rtl}      # (CPU_DIR: alternative AP68030 sources, mutation experiments)
 ENG=$ROOT/tools/falcon_fpu/engine
 VASM=${VASM:-vasmm68k_mot}
 HATARI=${HATARI:-$HOME/Devel/Atari/hatari}
@@ -47,7 +47,7 @@ cc -std=gnu99 -O2 -w -fwrapv -I$ENG -I$ENG/shim -I$H/cpu -I$H/cpu/softfloat -I$H
 cc -O2 -Wall -Wextra -I$ROOT/tools/falcon_fpu -o obj/falcon_fpu_host $ROOT/tools/falcon_fpu/falcon_fpu.c $LIBFPE -lm \
 	|| { echo "RESULT: FAIL (falcon_fpu host build)"; exit 1; }
 
-if [ "${NOBUILD:-0}" != 1 ] || [ ! -x obj/vl/tb_fpu ] || [ -n "$BRIDGE_SV$CPUBUS_SV$MEMARB_SV" ]; then
+if [ "${NOBUILD:-0}" != 1 ] || [ ! -x obj/vl/tb_fpu ] || [ -n "$BRIDGE_SV$CPUBUS_SV$MEMARB_SV$CPU_DIR" ]; then
 	echo "== verilating (CLK_HZ=$CLK_HZ) =="
 	rm -rf obj/vl
 	verilator --cc --exe --build -j "${JOBS:-8}" -O2 -Wall -Wno-fatal \

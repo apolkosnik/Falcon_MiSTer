@@ -12,7 +12,7 @@
 #include <vector>
 
 struct M2Exc {
-	uint32_t vec, fmt, pc;
+	uint32_t vec, fmt, pc, ia = 0;
 };
 struct M2Mismatch {
 	std::string what;
@@ -30,7 +30,8 @@ struct M2Result {
 
 void m2_build();                                             // fill the case table
 int m2_ncases();
-bool m2_skip(int i);                                         // M2_ONLY debugging filter
+bool m2_skip(int i);
+bool m2_chunk_irq(int c);                                    // the chunk holds an interrupt-choreography case                                         // M2_ONLY debugging filter
 const char *m2_group(int i);
 const char *m2_name(int i);
 int m2_nchunks();

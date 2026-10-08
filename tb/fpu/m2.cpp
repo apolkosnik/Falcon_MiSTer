@@ -47,9 +47,12 @@ struct Insn {
 	uint32_t bset_addr = 0;                                // window offset of the byte
 	std::vector<uint8_t> pcdata;                           // data pool for (d16,PC): the extension word is generated
 	bool pcrel = false;
+	bool irq = false;                                      // an interrupt is raised by the bench while this instruction waits (come-again); the handler logs its frame
+	bool hold = false;                                     // pseudo instruction: handshake with the bench, which holds the ARM service (SIGSTOP)
 };
 
 struct Case {
+	bool irqcase = false;                                  // runs with the bench's service-hold / interrupt choreography (own image)
 	std::string group, name;
 	uint32_t d[8], a[6];
 	std::vector<uint8_t> mem;                              // CASE_STRIDE bytes
@@ -791,6 +794,130 @@ void g_m4()
 	}
 }
 
+// -------------------------------------------------------------- group 12: interrupts during come-again
+// An interrupt taken while an FPU instruction waits on a come-again response must stack a coprocessor mid-instruction
+// frame (format $9, PC = the next instruction, instruction address = this FPU instruction; MC68030 UM 10.4.8) so that
+// RTE re-reads the response CIR and the instruction completes.  Regression test for AP68030 iack_cpmid (rtl/ap030_core.v,
+// core/ap030_exec_a.vh, core/ap030_exec_c.vh).  The bench holds the ARM service (SIGSTOP) at the hold point, waits for the
+// come-again loop of the instruction, raises a level 3 interrupt and releases the service after the handler has run.
+void g_irqk()
+{
+	g_isolate = true;
+	auto mk = [&](const std::string &name, uint32_t fpcr = 0) -> Case & {
+		Case &c = new_case("m4-irq", name, 0, fpcr);
+		c.irqcase = true;
+		return c;
+	};
+	auto sync = [&](Case &c) { c.body.push_back(make(c, cmd_out(F_X, 0, 0), M_IND, 3, 0x700, 12, nullptr)); };   // FMOVE.X FP0,(A3): waits for the ARM
+	auto holdp = [&](Case &c) { Insn h; h.hold = true; c.body.push_back(h); };
+	auto test = [&](Case &c, Insn n) { n.irq = true; c.body.push_back(n); };
+	const std::string pre = "interrupt during come-again: ";
+	// opclass 011
+	{
+		Case &c = mk(pre + "FMOVE.X FP6,(A0)"); sync(c); holdp(c); test(c, make(c, cmd_out(F_X, 6, 0), M_IND, 0, DST, 12, nullptr));
+	}
+	{
+		Case &c = mk(pre + "FMOVE.L FP6,(A0)"); sync(c); holdp(c); test(c, make(c, cmd_out(F_L, 6, 0), M_IND, 0, DST, 4, nullptr));
+	}
+	{
+		Case &c = mk(pre + "FMOVE.D FP6,-(A0)"); sync(c); holdp(c); test(c, make(c, cmd_out(F_D, 6, 0), M_PRE, 0, DST, 8, nullptr));
+	}
+	{
+		Case &c = mk(pre + "FMOVE.P FP6,(A0){5}"); sync(c); holdp(c); test(c, make(c, cmd_out(F_P, 6, 5), M_IND, 0, DST, 12, nullptr));
+	}
+	{
+		Case &c = mk(pre + "FMOVE.P FP6,(A0){D3}");
+		sync(c); holdp(c);
+		Insn n = make(c, cmd_out(7, 6, 3 << 4), M_IND, 0, DST, 12, nullptr);
+		n.pre.push_back({3, 0xAB000003u});
+		c.d[3] = 0xAB000003u;
+		test(c, n);
+	}
+	// opclass 101
+	{
+		struct Cr { const char *n; int l; int m; };
+		static const Cr crs[] = {{"FMOVE.L FPSR,(A1)", 2, M_IND}, {"FMOVE.L FPCR,(A1)", 1, M_IND}, {"FMOVE.L FPIAR,(A1)", 4, M_IND},
+		                         {"FMOVE.L FPCR/FPSR,(A1)", 3, M_IND}, {"FMOVEM.L FPCR/FPSR/FPIAR,-(A1)", 7, M_PRE}, {"FMOVE.L FPSR,D1", 2, M_DN}};
+		for (const Cr &r : crs) {
+			Case &c = mk(pre + r.n, 0x20);
+			Bytes sv = be(0x0F000018u, 4), iv = be(0x12345678u, 4);
+			c.body.push_back(make(c, 0x8800, M_IMM, 0, 0, 4, &sv));         // a known FPSR and FPIAR
+			c.body.push_back(make(c, 0x8400, M_IMM, 0, 0, 4, &iv));
+			sync(c);
+			holdp(c);
+			int nreg = ((r.l & 1) ? 1 : 0) + ((r.l & 2) ? 1 : 0) + ((r.l & 4) ? 1 : 0);
+			test(c, make(c, (uint16_t)(0xA000 | crlist(r.l)), r.m, 1, DST, 4 * nreg, nullptr));
+		}
+	}
+	// opclass 111: FMOVEM.X out
+	{
+		auto rev = [](int m) { int r = 0; for (int b = 0; b < 8; b++) if (m & (1 << b)) r |= 1 << (7 - b); return r; };
+		struct Mm { const char *n; int mode; bool dyn; };
+		static const Mm mms[] = {{"FMOVEM.X FP0-FP7 static,(A0)", M_IND, false}, {"FMOVEM.X static,-(A0)", M_PRE, false}, {"FMOVEM.X dynamic,(A0)", M_IND, true},
+		                         {"FMOVEM.X dynamic,-(A0)", M_PRE, true}, {"FMOVEM.X static,d16(A0)", M_D16, false}};
+		for (const Mm &m : mms) {
+			Case &c = mk(pre + m.n);
+			int mask = 0xA5, nr = 4;
+			int use = m.mode == M_PRE ? rev(mask) : mask;
+			sync(c);
+			holdp(c);
+			c.d[2] = 0xCD000000u | (uint32_t)use;
+			uint16_t base = m.mode == M_PRE ? (m.dyn ? 0xE800 : 0xE000) : (m.dyn ? 0xF800 : 0xF000);
+			Insn n = make(c, m.dyn ? (uint16_t)(base | (2 << 4)) : (uint16_t)(base | use), m.mode, 0, DST, 12 * nr, nullptr);
+			if (m.dyn) n.pre.push_back({2, 0xCD000000u | (uint32_t)use});
+			test(c, n);
+		}
+	}
+	// a new arithmetic instruction while a background one is still running (D_CMD busy come-again)
+	{
+		Case &c = mk(pre + "FADD reg-reg while FMUL runs"); sync(c); holdp(c);
+		c.body.push_back(regreg(2, 6, 0x23));
+		test(c, regreg(6, 7, 0x22));
+	}
+	{
+		Case &c = mk(pre + "FADD.X (A0),FP5 while FMUL runs"); sync(c); holdp(c);
+		c.body.push_back(regreg(2, 6, 0x23));
+		Bytes xv = xval(0x4000, 0xA000000000000000ull);
+		test(c, make(c, cmd_in(F_X, 5, 0x22), M_IND, 0, SRC, 12, &xv));
+	}
+	{
+		Case &c = mk(pre + "FMOVE.X FP6,(A0) while FMUL runs"); sync(c); holdp(c);
+		c.body.push_back(regreg(2, 6, 0x23));
+		test(c, make(c, cmd_out(F_X, 6, 0), M_IND, 0, DST, 12, nullptr));
+	}
+	{   // FSAVE while a background instruction runs
+		Case &c = mk(pre + "FSAVE -(A1) while FMUL runs"); sync(c); holdp(c);
+		c.body.push_back(regreg(2, 6, 0x23));
+		test(c, fsave_i(c, M_PRE, FR_OFF));
+	}
+	// conditionals asked of the ARM
+	for (int kind = 1; kind <= 4; kind++) {
+		const char *kn[5] = {"", "FScc", "FBcc", "FDBcc", "FTRAPcc"};
+		{   // IEEE-nonaware predicate with NAN set (FPSR from a real FMOVE.S of a quiet NaN)
+			Case &c = mk(pre + kn[kind] + " nonaware predicate with NAN");
+			Bytes nan = be(0x7FC00000ull, 4);
+			c.body.push_back(make(c, cmd_in(F_S, 0, 0), M_IND, 0, SRC, 4, &nan));
+			sync(c);
+			holdp(c);
+			Insn n;
+			n.ckind = kind; n.pred = 0x12; n.slot = kind == 1 ? 0 : BPA; n.irq = true;
+			c.body.push_back(n);
+		}
+		{   // the first conditional after FRESTORE null
+			Case &c = mk(pre + kn[kind] + " first conditional after FRESTORE null");
+			sync(c);
+			holdp(c);
+			Insn r;
+			r.reset = true;
+			c.body.push_back(r);
+			Insn n;
+			n.ckind = kind; n.pred = 0x0F; n.slot = kind == 1 ? 0 : BPA; n.irq = true;
+			c.body.push_back(n);
+		}
+	}
+	g_isolate = false;
+}
+
 // -------------------------------------------------------------- group 10: random streams
 static const int DOCOPS[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x14, 0x15, 0x16,
                              0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
@@ -953,6 +1080,8 @@ struct Sink {
 	virtual void setreg(int r, uint32_t v) = 0;
 	virtual void fpu(const Insn &n, int k, const Case &c) = 0;
 	virtual void reset() = 0;
+	virtual void hold() = 0;
+	virtual void irq_next(bool on) = 0;                      // the next conditional is run while the bench raises an interrupt
 	virtual void scc(int p, uint32_t a5, bool soft) = 0;
 	virtual void mbcc(int p, uint32_t addr) = 0;
 	virtual void mdbcc(int p, uint32_t addr) = 0;
@@ -982,6 +1111,8 @@ void walk(int i, Sink &s)
 	uint32_t a5 = W(i) + CND;
 	for (const Insn &n : c.body) {
 		for (auto &pr : n.pre) s.setreg(pr.first, pr.second);
+		if (n.hold) { s.hold(); continue; }
+		if (n.ckind) s.irq_next(n.irq);
 		if (n.reset) { s.setreg(14, W(i) + NULLF); s.reset(); }
 		else if (n.ckind == 1) { s.scc(n.pred, a5, true); a5++; }
 		else if (n.ckind == 2) s.mbcc(n.pred, W(i) + n.slot);
@@ -1038,11 +1169,13 @@ struct AsmSink : Sink {
 			if (soft) fprintf(f, "\tclr.l\tSOFTEXC\n");
 			return;
 		}
+		if (n.irq) fprintf(f, "\tmove.w\t#$2000,sr\n");
 		fprintf(f, "L%d_%d:\tdc.w\t$%04X", ci, k, n.op);
 		if (!n.frame) fprintf(f, ",$%04X", n.cmd);
 		for (uint16_t e : n.ext) fprintf(f, ",$%04X", e);
 		fprintf(f, "\n");
 		if (n.pcrel) fprintf(f, "\tdc.w\tD%d_%d-*\n", ci, k);
+		if (n.irq) fprintf(f, "\tmove.w\t#$2700,sr\n");
 		if (soft) fprintf(f, "\tclr.l\tSOFTEXC\n");
 		if (n.pcrel) {
 			fprintf(f, "\tbra.s\tP%d_%d\nD%d_%d:\tdc.b\t", ci, k, ci, k);
@@ -1051,22 +1184,30 @@ struct AsmSink : Sink {
 		}
 	}
 	void reset() override { fprintf(f, "\tdc.w\t$F356\t\t; frestore (a6)\n"); }
+	bool irq_on = false;
+	void irq_next(bool on) override { irq_on = on; }
+	int nh = 0;
+	void hold() override { fprintf(f, "\tmove.l\t#1,HOLDW\nhw%d_%d:\ttst.l\tHOLDW\n\tbne.s\thw%d_%d\n", ci, nh, ci, nh); nh++; }
+	void irq_en() { if (irq_on) fprintf(f, "\tmove.w\t#$2000,sr\n"); }
+	void irq_dis() { if (irq_on) fprintf(f, "\tmove.w\t#$2700,sr\n"); irq_on = false; }
 	void scc(int p, uint32_t, bool soft) override
 	{
 		if (soft) fprintf(f, "\tmove.l\t#4,SKIP\n\tmove.l\t#1,SOFTEXC\n");
+		irq_en();
 		fprintf(f, "L%d_c%d:\tdc.w\t$F255,$%04X\t; fscc (a5)\n", ci, nc++, p);
+		irq_dis();
 		if (soft) fprintf(f, "\tclr.l\tSOFTEXC\n");
 		fprintf(f, "\taddq.l\t#1,a5\n");
 	}
-	void mbcc(int p, uint32_t a) override { fprintf(f, "\tM2BCC\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); }
-	void mdbcc(int p, uint32_t a) override { fprintf(f, "\tM2DBCC\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); }
-	void mtrap(int p, uint32_t a) override { fprintf(f, "\tM2TRAP\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); }
+	void mbcc(int p, uint32_t a) override { irq_en(); fprintf(f, "\tM2BCC\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); irq_dis(); }
+	void mdbcc(int p, uint32_t a) override { irq_en(); fprintf(f, "\tM2DBCC\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); irq_dis(); }
+	void mtrap(int p, uint32_t a) override { irq_en(); fprintf(f, "\tM2TRAP\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); irq_dis(); }
 	void dumpregs(uint32_t a) override { fprintf(f, "\tmovem.l\td0-d7/a0-a6,$%X\n", a); }
 	void marker(uint32_t a, uint32_t v) override { fprintf(f, "\tmove.l\t#$%08X,$%X\n", v, a); }
 	void end(int i) override { fprintf(f, "end%d:\n", i); }
 };
 
-struct ExpExc { int vec; int fmt; uint32_t pc_off; std::string label; };   // pc: label address + pc_off
+struct ExpExc { int vec; int fmt; uint32_t pc_off; std::string label; bool ia = false; };   // ia: the frame's instruction address is the label   // pc: label address + pc_off
 std::vector<std::string> gold_notes;                       // golden exceptions per case
 std::vector<std::vector<ExpExc> > gold_exc;                // exceptions the case must take (refused opmodes, BSUN, FPU exceptions)
 std::vector<uint32_t> mask_addrs;                          // frame images: byte whose low 6 bits (EA field of the CCR long) are not compared
@@ -1092,6 +1233,8 @@ struct GoldSink : Sink {
 		uint32_t addr = sym("L%d_%d", ci, k);
 		if (n.bset27) { gold_ram()[W(ci) + n.bset_addr] |= 0x08; return; }
 		std::vector<uint16_t> ext = n.ext;
+		if (n.irq) if (n.frame == 1) gold_exc[(size_t)ci].push_back({27, 0, 0, lb, false});      // cpSAVE come-again is restartable: a pre-instruction frame (format 0, PC = the FSAVE), RTE runs it again (MC68030 UM 10.5.4, AP68030 existing rule)
+		else gold_exc[(size_t)ci].push_back({27, 9, 4, lb, true});      // the interrupt: format 9, IA = this instruction, PC = the first word not yet scanned (opcode + command word; an EA extension word is read after the response, so RTE finds it)
 		if (n.pcrel) ext.push_back((uint16_t)(sym("D%d_%d", ci, k) - (addr + 2 * (uint32_t)(insn_words(n) - 1))));   // PC = address of the extension word
 		const uint16_t *ep = ext.empty() ? nullptr : ext.data();
 		bool soft = n.soft || c.softall;
@@ -1134,6 +1277,9 @@ struct GoldSink : Sink {
 		}
 	}
 	void reset() override { gold_reset(); }
+	void hold() override {}
+	bool irq_pending_next = false;
+	void irq_next(bool on) override { irq_pending_next = on; }
 	void count_cond(int p)
 	{
 		// the bridge asks the ARM for a conditional when the FPU may be null (first conditional after a reset),
@@ -1155,6 +1301,7 @@ struct GoldSink : Sink {
 	{
 		char lb[32];
 		snprintf(lb, sizeof lb, "L%d_c%d", ci, nc++);
+		if (irq_pending_next) { irq_pending_next = false; gold_exc[(size_t)ci].push_back({27, 9, cond_bytes, lb, true}); }
 		count_cond(p);
 		int r = gold_cond(p);
 		if (getenv("M2_SEQ")) fprintf(stderr, "golden cond %s pred %02x -> %d\n", lb, p, r);
@@ -1162,14 +1309,17 @@ struct GoldSink : Sink {
 		return r;
 	}
 	const Case *cc = nullptr;
+	uint32_t cond_bytes = 4;
 	void scc(int p, uint32_t a5, bool) override
 	{
+		cond_bytes = 4;
 		int r = cond(p, *cc);
 		if (r >= 0) gold_ram()[a5] = r ? 0xFF : 0x00;
 		gold_setreg(13, a5 + 1);
 	}
 	void mbcc(int p, uint32_t a) override
 	{
+		cond_bytes = 2;                                   // FBcc: the opcode word is the condition; the displacement is read after the reply
 		int r = cond(p, *cc);
 		int tf = r > 0 ? 1 : 0;
 		gold_setreg(7, (uint32_t)tf);
@@ -1177,6 +1327,7 @@ struct GoldSink : Sink {
 	}
 	void mdbcc(int p, uint32_t a) override
 	{
+		cond_bytes = 4;                                   // opcode + condition word; the displacement is read after the reply
 		int r = cond(p, *cc);
 		int tf = r != 0 ? 1 : 0;                          // exception: stepped over, same registers as "true"
 		gold_setreg(6, tf ? 5u : 4u);
@@ -1186,6 +1337,7 @@ struct GoldSink : Sink {
 	}
 	void mtrap(int p, uint32_t a) override
 	{
+		cond_bytes = 4;
 		int r = cond(p, *cc);
 		gold_ram()[a] = r > 0 ? 1 : 0;
 	}
@@ -1224,6 +1376,7 @@ void m2_build()
 		g_fscc_ea();
 		g_reset();
 		g_m4();
+		g_irqk();
 	}
 	g_random(2200);
 	if (getenv("M2_ONLY"))
@@ -1232,6 +1385,7 @@ void m2_build()
 	gold_exc.assign(cases.size(), {});
 }
 bool m2_skip(int i) { return cases[(size_t)i].skip; }
+bool m2_chunk_irq(int c) { return cases[(size_t)chunk_start[(size_t)c]].irqcase; }
 int m2_ncases() { return (int)cases.size(); }
 int m2_nchunks() { return (int)chunk_start.size(); }
 int m2_chunk_first(int c) { return chunk_start[(size_t)c]; }
@@ -1294,7 +1448,7 @@ static void golden_child(const std::map<std::string, uint32_t> &syms, int chunk,
 	for (int i = lo; i < hi; i++) {
 		wrs(out, gold_notes[(size_t)i]);
 		wr32(out, (uint32_t)gold_exc[(size_t)i].size());
-		for (auto &x : gold_exc[(size_t)i]) { wr32(out, (uint32_t)x.vec); wr32(out, (uint32_t)x.fmt); wr32(out, x.pc_off); wrs(out, x.label); }
+		for (auto &x : gold_exc[(size_t)i]) { wr32(out, (uint32_t)x.vec); wr32(out, (uint32_t)x.fmt); wr32(out, x.pc_off); wr32(out, x.ia ? 1 : 0); wrs(out, x.label); }
 	}
 	// the data windows and dump areas are all the compare needs
 	wr(out, gold_ram() + WBASE, (size_t)CHUNK * CASE_STRIDE);
@@ -1332,7 +1486,7 @@ void m2_run_golden(const std::map<std::string, uint32_t> &syms, int chunk, const
 		gold_exc[(size_t)i].clear();
 		for (uint32_t k = 0; k < n; k++) {
 			ExpExc x;
-			x.vec = (int)rd32(in); x.fmt = (int)rd32(in); x.pc_off = rd32(in); x.label = rds(in);
+			x.vec = (int)rd32(in); x.fmt = (int)rd32(in); x.pc_off = rd32(in); x.ia = rd32(in) != 0; x.label = rds(in);
 			gold_exc[(size_t)i].push_back(x);
 		}
 	}
@@ -1399,11 +1553,12 @@ M2Result m2_compare(const uint8_t *ram, int i, const std::vector<M2Exc> &got)
 	for (size_t k = 0; exok && k < ex.size(); k++) {
 		auto it = cur_syms.find(ex[k].label);
 		if ((int)got[k].vec != ex[k].vec || (int)got[k].fmt != ex[k].fmt || it == cur_syms.end() || got[k].pc != it->second + ex[k].pc_off) exok = false;
+		else if (ex[k].ia && got[k].ia != it->second) exok = false;
 	}
 	if (!exok) {
 		bad = true;
 		std::string e, gt;
-		for (auto &x : ex) { auto it = cur_syms.find(x.label); e += " vec" + std::to_string(x.vec) + "/fmt" + std::to_string(x.fmt) + "@" + (it == cur_syms.end() ? x.label : std::to_string(it->second + x.pc_off)); }
+		for (auto &x : ex) { auto it = cur_syms.find(x.label); e += " vec" + std::to_string(x.vec) + "/fmt" + std::to_string(x.fmt) + "@" + (it == cur_syms.end() ? x.label : std::to_string(it->second + x.pc_off)) + (x.ia ? " ia=" + (it == cur_syms.end() ? x.label : std::to_string(it->second)) : std::string()); }
 		for (auto &x : got) gt += " vec" + std::to_string(x.vec) + "/fmt" + std::to_string(x.fmt) + "@" + std::to_string(x.pc);
 		add("exceptions", e.empty() ? "none" : e, gt.empty() ? "none" : gt);
 	}

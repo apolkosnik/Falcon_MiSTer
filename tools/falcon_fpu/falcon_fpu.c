@@ -8,11 +8,23 @@
  * heartbeat in the mailbox: while the heartbeat moves the core reports an
  * FPU.  On SIGINT/SIGTERM MAGIC is cleared, so the FPU disappears at once.
  *
- *   falcon_fpu [-m file] [-c cpu] [-f] [-v]
+ *   falcon_fpu [-m file] [-c cpu] [-f] [-d] [-v]
  *     -m FILE  map FILE instead of /dev/mem, offset 0 = mailbox (simulation)
  *     -c CPU   pin to one CPU core (Main_MiSTer runs on CPU 1: use 0)
  *     -f       SCHED_FIFO real-time priority
+ *     -d       exit when the parent (Main_MiSTer) exits
  *     -v       print a line per request
+ *
+ * Main_MiSTer (support/falcon/falcon_fpu.cpp) starts it as "-c 0 -f -d"
+ * when the Falcon core starts and stops it before the FPGA is loaded with
+ * another core.  Only one instance may serve the mailbox (/dev/mem use takes
+ * an exclusive lock on /tmp/falcon_fpu.lock).
+ *
+ * Polling: spin while requests keep arriving, poll every NAP_NS after
+ * SPIN_NS without one.  Under SCHED_FIFO a busy spin longer than RUN_NS is
+ * broken by a GIVE_NS sleep: about 10% of CPU 0 stays with Linux, below
+ * the RT throttling limit (sched_rt_runtime_us, 95%), which would otherwise
+ * stop the service for 50 ms at a time.
  *
  * Mailbox (DDR3 0x30E90000 = guest $E90000).  Words are 16 bit in the
  * Falcon's big-endian byte order; operand and result bytes are stored in
@@ -35,7 +47,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,6 +62,8 @@
 #define HB_PERIOD_NS 10000000L      /* heartbeat every 10 ms */
 #define SPIN_NS      1000000L       /* spin this long after a request ... */
 #define NAP_NS       50000L         /* ... then poll every 50 us */
+#define RUN_NS       1800000L       /* SCHED_FIFO: at most this long without sleeping ... */
+#define GIVE_NS      200000L        /* ... then leave CPU 0 to Linux this long */
 
 enum { O_MAGIC = 0x000, O_HB = 0x002, O_VERSION = 0x004,
        O_RSEQ = 0x100, O_KIND = 0x102, O_CMD = 0x104, O_AUX = 0x106,
@@ -124,18 +140,31 @@ static void serve(uint16_t seq, int verbose)
 
 int main(int argc, char **argv)
 {
-	int cpu = -1, fifo = 0, verbose = 0, opt;
+	int cpu = -1, fifo = 0, verbose = 0, parent = 0, opt;
 	const char *map = NULL;
 
-	while ((opt = getopt(argc, argv, "m:c:fvh")) != -1) {
+	while ((opt = getopt(argc, argv, "m:c:fdvh")) != -1) {
 		switch (opt) {
 		case 'm': map = optarg; break;
 		case 'c': cpu = atoi(optarg); break;
 		case 'f': fifo = 1; break;
+		case 'd': parent = 1; break;
 		case 'v': verbose = 1; break;
 		default:
-			fprintf(stderr, "usage: %s [-m file] [-c cpu] [-f] [-v]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-m file] [-c cpu] [-f] [-d] [-v]\n", argv[0]);
 			return 2;
+		}
+	}
+
+	if (parent) {
+		/* also when Main_MiSTer restarts itself for another core */
+		if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() == 1) return 1;
+	}
+	if (!map) {
+		int lk = open("/tmp/falcon_fpu.lock", O_RDWR | O_CREAT, 0644);
+		if (lk < 0 || flock(lk, LOCK_EX | LOCK_NB)) {
+			fprintf(stderr, "falcon_fpu: another instance is running\n");
+			return 1;
 		}
 	}
 
@@ -184,7 +213,7 @@ int main(int argc, char **argv)
 	wr16(O_MAGIC, FPU_MAGIC);
 	barrier();
 
-	int64_t t = now_ns(), next_hb = t, last_req = t;
+	int64_t t = now_ns(), next_hb = t, last_req = t, last_nap = t;
 	while (!quit) {
 		uint16_t seq = rd16(O_RSEQ);
 		t = now_ns();
@@ -202,6 +231,11 @@ int main(int argc, char **argv)
 		if (t - last_req > SPIN_NS) {   /* idle: stop spinning */
 			struct timespec nap = { 0, NAP_NS };
 			nanosleep(&nap, NULL);
+			last_nap = t;
+		} else if (fifo && t - last_nap > RUN_NS) {
+			struct timespec give = { 0, GIVE_NS };
+			nanosleep(&give, NULL);
+			last_nap = now_ns();
 		}
 	}
 

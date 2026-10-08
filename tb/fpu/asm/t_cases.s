@@ -9,6 +9,8 @@ main:
 	move.l	#1,ABORTMODE
 	lea	h_exc,a0		; expected soft exceptions: vector 4 (refused opmodes)
 	move.l	a0,(4*4).w
+	lea	h_irq,a0		; level 3 autovector: the interrupt-during-come-again cases
+	move.l	a0,(27*4).w
 	lea	h_fpexc,a0		; vectors 48-54: BSUN and the FPU exceptions
 	moveq	#6,d0
 	lea	(48*4).w,a1
@@ -41,4 +43,11 @@ hf2:	tst.l	d1
 	move.l	SKIP,d2
 	add.l	d2,2(a0)
 hf3:	movem.l	(sp)+,d0-d2/a0-a1
+	rte
+
+; level 3 interrupt (vector 27): logged with its frame (format 9 when it hit a come-again), counted
+h_irq:
+	logexc
+	addq.l	#1,IRQCNT
+	movem.l	(sp)+,d0-d2/a0-a1
 	rte

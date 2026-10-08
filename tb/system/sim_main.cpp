@@ -20,6 +20,8 @@
 //                       68882 engine (libfpe) the ARM service uses
 //     --cptrace         print every coprocessor (FPU) interface register access
 //     --cookies         print the TOS cookie jar at the end
+//     --text ADDR       print the NUL-terminated text at guest ADDR (hex) at the end
+//     --done ADDR       end the run once the long at guest ADDR (hex) reads $D0E0600D
 #include "Vtb_top.h"
 #include "Vtb_top__Dpi.h"
 #include "verilated.h"
@@ -107,6 +109,7 @@ int main(int argc, char **argv) {
     double io_from = 0;
     Disk disk[7];
     bool fpu_service = false, cptrace = false, cookies = false;
+    uint32_t text_addr = 0, done_addr = 0;
     std::vector<Event> events;
 
     for (int i = 1; i < argc; i++) {
@@ -140,6 +143,8 @@ int main(int argc, char **argv) {
         else if (a == "--fpu") fpu_service = true;
         else if (a == "--cptrace") cptrace = true;
         else if (a == "--cookies") cookies = true;
+        else if (a == "--text") text_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
+        else if (a == "--done") done_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
     }
     if (!frames_dir.empty()) mkdir(frames_dir.c_str(), 0755);
     svSetScope(svGetScopeFromName("TOP.tb_top.ddr"));
@@ -349,10 +354,23 @@ int main(int argc, char **argv) {
         }
 
         if (top->dbg_halted) { printf("[%9.3f ms] CPU HALTED (double bus fault) pc=%08x\n", now_ms, top->dbg_pc); break; }
+        if (done_addr && (cyc & 32767) == 0 && guest_rd32(done_addr) == 0xD0E0600Du) {
+            printf("[%9.3f ms] done marker at %06x\n", now_ms, done_addr);
+            break;
+        }
     }
     printf("simulated %.3f ms, %llu clocks\n", cyc / CLK_HZ * 1e3, (unsigned long long)cyc);
     if (fpu_service)
         printf("FPU mailbox: MAGIC %04x HEARTBEAT %04x\n", guest_rd32(0xE90000) >> 16, guest_rd32(0xE90000) & 0xFFFF);
+    if (text_addr) {
+        printf("text at %06x:\n", text_addr);
+        for (uint32_t i = 0; i < 65536; i++) {
+            uint8_t c = guest_rd8(text_addr + i);
+            if (!c) break;
+            if (c != 13) putchar(c >= 32 || c == 10 ? c : '?');
+        }
+        printf("\n");
+    }
     if (cookies) {
         uint32_t jar = guest_rd32(0x5A0) & 0xFFFFFF;
         printf("cookie jar at %06x\n", jar);

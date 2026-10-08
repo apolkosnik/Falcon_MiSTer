@@ -19,7 +19,8 @@ frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 
 | Part | Module | Notes |
 |------|--------|-------|
-| 68030 | `rtl/AP68030` | 32 MHz core clock (twice a stock Falcon); no FPU (the 68881 does not fit) |
+| 68030 | `rtl/AP68030` | 32 MHz core clock (twice a stock Falcon) |
+| 68882 FPU | `falcon_fpu_bridge`, `tools/falcon_fpu` | the coprocessor interface in the FPGA, the arithmetic on the ARM (Hatari's 68882 emulation): `docs/FPU_ARM.md` |
 | Bus, decode, interrupts | `falcon_system`, `falcon_cpubus` | Falcon 24-bit map, Hatari's bus-error rules incl. STE-compatible bus mode |
 | ST-RAM, ROM | `falcon_memarb` | 4 or 14 MB in the HPS DDR3 (no SDRAM board needed) |
 | COMBEL | `falcon_combel` | $FF8001/6/7, DIP switches, Jaguar pads |
@@ -54,6 +55,21 @@ stock Main, SCSI hard disks still work from built-in default responses; the
 CD-ROM needs the Falcon Main (`releases/MiSTer_falcon`).  Floppy and IDE work
 with any Main.
 
+### 68882 FPU
+
+A 68882 does not fit in the FPGA; the core answers the 68030's coprocessor
+interface and the program `falcon_fpu` executes the instructions on the ARM.
+Main starts it with the core (patch `main_patch/0003`):
+
+1. Copy `releases/MiSTer_falcon` and `releases/falcon_fpu` to `/media/fat/`
+   (falcon_fpu must sit next to the Main binary that runs).
+2. In `MiSTer.ini`, section `[Falcon]`: `main=MiSTer_falcon`.
+
+TOS then reports a 68881/68882.  Without `falcon_fpu` (or with another Main)
+the core has no FPU, as before.  `/tmp/falcon_fpu.log` holds its messages.
+Test programs for the machine: `tools/fputest` (FPUTEST.TOS checks results,
+FPUBENCH.TOS measures speed).
+
 ## Building
 
 ```
@@ -76,5 +92,5 @@ fitter can crash while exiting on newer Linux after a complete fit.
 
 - Hardware testing.
 - 16 MHz CPU option (the CPU runs from the 32 MHz system clock).
-- FPU (no room), SCC serial ports (registers only), Centronics printer,
+- SCC serial ports (registers only), Centronics printer,
   microphone input, NVRAM saving, `.MSA`/`.STX` floppy images.

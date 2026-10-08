@@ -5,7 +5,12 @@
 ; The bench checks this on the pin-level bus log of the whole run.
 	include	"common.i"
 
+; An instruction that waits for the ARM when presence is lost ends with the protocol violation
+; exception (vector 13, bridge header: watchdog or presence lost): h_pv logs it and restarts the loop.
 main:
+	move.l	sp,SAVESP
+	lea	h_pv,a0
+	move.l	a0,(13*4).w
 	WAITGO
 loop:	tst.l	STOPF
 	bne	finish
@@ -16,4 +21,8 @@ loop:	tst.l	STOPF
 	dc.w	$f320			; fsave -(a0)
 	dc.w	$f358			; frestore (a0)+
 	addq.l	#1,ITER
+	bra	loop
+
+h_pv:	logexc
+	movea.l	SAVESP,sp
 	bra	loop
