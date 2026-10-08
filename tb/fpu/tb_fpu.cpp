@@ -39,6 +39,7 @@
 
 #include "Vtb_fpu_top.h"
 #include "verilated.h"
+#include "m2.h"
 
 #ifndef TB_CLK_HZ
 #define TB_CLK_HZ 200000
@@ -51,6 +52,7 @@ static const unsigned HB_PERIOD = CLK_HZ / 100;        // the ARM service: 10 ms
 static const unsigned MB_G = 0xE90000, MB_SIZE = 0x10000;
 static const uint64_t DDR_BYTE0 = 0x30000000ull, DDR_SIZE = 0x1000000ull;
 static const uint16_t MAGIC = 0x4650;
+static const uint16_t VERSION = 2;                     // mailbox protocol version of milestone 2
 
 //------------------------------------------------------------------ reporting
 static int n_pass = 0, n_fail = 0;
@@ -224,7 +226,7 @@ static uint32_t Tg(const char *n)
 
 // guest control block (asm/common.i)
 enum { A_GO = 0x0F00, A_STOP = 0x0F04, A_DONE = 0x0F08, A_EXCNT = 0x0F0C, A_EXLOGP = 0x0F10, A_STATUS = 0x0F18,
-       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_EXLOG = 0x1000, A_RECLOG = 0x4000 };
+       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_CASEIX = 0x0F30, A_MARK1 = 0x0F40, A_MARK2 = 0x0F44, A_MARK3 = 0x0F48, A_MARK4 = 0x0F4C, A_MODE = 0x0F50, A_EXLOG = 0x1000, A_RECLOG = 0x4000 };
 
 //------------------------------------------------------------------ monitors
 // CIR bus cycles (CPU space type 2) seen on the 68030 pins
@@ -237,7 +239,7 @@ struct Cir {
 };
 static std::vector<Cir> cirs;
 static uint64_t instr_idx = 0, other_berr = 0, n_cycles = 0, n_halted_seen = 0;
-static bool prev_as = false, cur_term = false, cur_is_cir = false;
+static bool prev_as = false, cur_term = false, cur_is_cir = false, cur_ack_seen = false, prev_present = false;
 static Cir cur;
 
 // mailbox polls seen on the arbiter's d3 port, and the presence scoreboard
@@ -277,10 +279,13 @@ static void sample()
 		cur_is_cir = T->o_fc == 7 && ((a >> 16) & 0xF) == 2;
 		cur.id = (a >> 13) & 7; cur.off = a & 0x1F; cur.siz = T->o_siz; cur.rw = T->o_rw;
 		cur_term = false;
+		cur_ack_seen = false;
 		n_cycles++;
 	}
 	if (as) {
-		if (cur_is_cir && T->o_cp_req) cur.present = T->o_present;   // the value the bridge sees with cp_req
+		// the bridge decides BERR/no BERR when it processes the access (T_CIR): the value of
+		// `present` it used is the one before the clock in which cp_ack/cp_berr appears
+		if (cur_is_cir && T->o_cp_ack && !cur_ack_seen) { cur.present = prev_present; cur_ack_seen = true; }
 		bool b = !T->o_berr_n, d0 = !T->o_dsack0_n, d1 = !T->o_dsack1_n;
 		if (!cur_term && (b || d0 || d1)) {
 			cur_term = true;
@@ -304,6 +309,9 @@ static void sample()
 		if (wa == (0xE90000 >> 1)) {                 // MAGIC
 			polls.push_back({g_clk, false, d});
 			if (d != MAGIC) sb_alive = 0;
+		} else if (wa == (0xE90004 >> 1)) {          // VERSION: anything but 2 means absent
+			polls.push_back({g_clk, false, d});
+			if (d != VERSION) sb_alive = 0;
 		} else if (wa == (0xE90002 >> 1)) {          // HEARTBEAT
 			polls.push_back({g_clk, true, d});
 			if (d != sb_last_hb) { sb_alive = ALIVE_POLLS; sb_unch = 0; }
@@ -322,6 +330,7 @@ static void sample()
 	if (pr && !pr_prev) { pr_rise = g_clk; pr_rises.push_back(g_clk); }
 	if (!pr && pr_prev) { pr_fall = g_clk; pr_falls.push_back(g_clk); pr_fall_unch.push_back(sb_unch); }
 	pr_prev = pr;
+	prev_present = pr;
 }
 
 //------------------------------------------------------------------ heartbeat sources
@@ -342,7 +351,7 @@ static uint64_t pace_clk0 = 0;
 
 static void hb_start(uint16_t hb0 = 1)
 {
-	mb_w16(0x004, 1);
+	mb_w16(0x004, VERSION);
 	hb_val = hb0;
 	mb_w16(0x002, hb_val);
 	mb_w16(0x000, MAGIC);
@@ -523,14 +532,14 @@ static bool expect(const char *grp, uint32_t tag, const std::string &what, uint3
 	return check_eq(grp, what, exp, it->second[0], src, digits);
 }
 
-struct ExEnt { uint32_t vec, fmt, pc, ia, sr; };
+struct ExEnt { uint32_t vec, fmt, pc, ia, sr, ix; };
 static std::vector<ExEnt> exlog()
 {
 	std::vector<ExEnt> v;
 	uint32_t n = gr32(A_EXCNT);
 	for (uint32_t i = 0; i < n && i < 256; i++) {
 		uint32_t a = A_EXLOG + 32 * i;
-		v.push_back({gr32(a), gr32(a + 4), gr32(a + 8), gr32(a + 12), gr32(a + 16)});
+		v.push_back({gr32(a), gr32(a + 4), gr32(a + 8), gr32(a + 12), gr32(a + 16), gr32(a + 20)});
 	}
 	return v;
 }
@@ -591,7 +600,9 @@ static void bus_checks(const char *tag)
 	for (size_t i = 0; i < cirs.size();) {
 		size_t j = i;
 		while (j < cirs.size() && cirs[j].instr == cirs[i].instr) j++;
-		const Cir &f = cirs[i];
+		Cir f = cirs[i];
+		for (size_t k = i; k < j; k++)                // FSAVE: the last save CIR read carries the frame format (earlier ones may be come-again $0118)
+			if (cirs[k].rw && cirs[k].off == 0x04 && f.rw && f.off == 0x04) f = cirs[k];
 		if (f.id == 1 && !f.berr && ((f.rw && f.off == 0x04) || (!f.rw && f.off == 0x06))) {
 			unsigned fmtw = (f.data >> 16) & 0xFFFF;
 			unsigned nops = 0;
@@ -706,11 +717,11 @@ static void sc_detect(const char *name, const char *mode)
 	begin_test(name, "t_detect");
 	bool real = !strcmp(mode, "real");
 	uint32_t exp = 0;
-	if (!strcmp(mode, "alive") || real) exp = 0x00060000;
-	if (!strcmp(mode, "alive")) hb_start();
-	else if (real) { set_pacing(true); child_start(); }
+	if (real) exp = 0x00060000;
+	if (real) { set_pacing(true); child_start(); }
 	else if (!strcmp(mode, "badmagic")) { hb_start(); mb_w16(0x000, 0x4651); }
-	else if (!strcmp(mode, "hb0")) { mb_w16(0x004, 1); mb_w16(0x002, 0); mb_w16(0x000, MAGIC); }
+	else if (!strcmp(mode, "hb0")) { mb_w16(0x004, VERSION); mb_w16(0x002, 0); mb_w16(0x000, MAGIC); }
+	else if (!strcmp(mode, "badversion")) { hb_start(); mb_w16(0x004, 1); }
 	release_reset();
 	if (exp) {
 		bool ok = run_until(present, 6 * POLL_CLKS + 5000);
@@ -735,7 +746,7 @@ static void sc_detect(const char *name, const char *mode)
 	}
 	if (real) {
 		check_eq("service", "MAGIC word the real falcon_fpu wrote at mailbox +0", MAGIC, mb16(0), "tools/falcon_fpu header: MAGIC $4650", 4);
-		check_eq("service", "VERSION word the real falcon_fpu wrote at mailbox +4", 1, mb16(4), "tools/falcon_fpu: FPU_VERSION 1", 4);
+		check_eq("service", "VERSION word the real falcon_fpu wrote at mailbox +4", 2, mb16(4), "tools/falcon_fpu: FPU_VERSION 2 (bridge header: VERSION must be 2)", 4);
 		check_true("service", fmt("HEARTBEAT advanced (now %u)", mb16(2)), mb16(2) != 0, "tools/falcon_fpu: +2 incremented every 10 ms");
 		child_reap();
 		check_true("service", "falcon_fpu_host exited cleanly on SIGTERM", child_exited && WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
@@ -905,16 +916,20 @@ static void sc_watch_real()
 	presence_checks(true);
 }
 
-static void run_alive_program(const char *name, const char *prog, uint64_t max_clks)
+// program that executes FPU instructions: needs the real ARM service (the C++
+// heartbeat writer cannot answer requests)
+static void run_alive_program(const char *name, const char *prog, uint64_t max_clks, bool allow_unexp = false)
 {
 	begin_test(name, prog);
-	hb_start();
+	set_pacing(true);
+	child_start();
 	release_reset();
-	run_until(present, 6 * POLL_CLKS);
-	run_until(is_ready, 100000);
-	steps(100);
+	bool ok = run_until(present, 20 * POLL_CLKS);
+	check_true("presence", fmt("`present` rises with the real service (clk %llu)", (unsigned long long)g_clk), ok, "bridge header");
+	run_until(is_ready, 400000);
+	steps(2000);
 	gw32(A_GO, 1);
-	finish_program(max_clks);
+	finish_program(max_clks, allow_unexp);
 }
 
 static void sc_frames()
@@ -1006,20 +1021,19 @@ static void sc_cond()
 
 static void sc_gen()
 {
-	run_alive_program("cpGEN/F-line", "t_gen", 600000);
+	run_alive_program("F-line from the bridge (reserved opclass, empty register list)", "t_gen", 600000);
 	const char *G = "gen";
-	const char *S = "bridge header: cpGEN not implemented -> pre-instruction exception, vector 11; MC68030 UM 10.4.2";
-	const char *names[14] = {"FMOVE.L D0,FP0", "FADD.X FP1,FP0", "FMOVEM.X FP0-FP3,(A0)", "FMOVE.L #imm,FP0", "FMOVEM.L D0,FPCR", "FMOVE.X FP0,-(A7)",
-	                         "FMOVECR #0,FP0", "FMOVE.X (abs).L,FP1", "FSQRT.X FP0,FP1", "FCMP.X FP1,FP0", "FTST.X FP0", "FMOVE.S FP0,D1",
-	                         "FMOVEM.L FPCR/FPSR/FPIAR,(A0)", "FMOVE.D (8,A0),FP7"};
-	for (unsigned i = 0; i < 14; i++) {
+	const char *S = "bridge header: opclass 001 and an empty control register list answer F-line ($1C0B); MC68881 UM 7.? / MC68030 UM 10.4.2 pre-instruction exception";
+	const char *names[4] = {"cpGEN command $2000 (opclass 001)", "cpGEN command $2400 (opclass 001)", "FMOVE <ea>,<empty list> ($8000)",
+	                        "FMOVE <empty list>,<ea> ($A000)"};
+	for (unsigned i = 0; i < 4; i++) {
 		uint32_t b = Tg("T_GEN") + 4 * i;
 		expect(G, b + 0, fmt("%s: exception vector (F-line)", names[i]), 11, S, 2);
 		expect(G, b + 1, fmt("%s: stack frame format (pre-instruction)", names[i]), 0, S, 1);
 		expect(G, b + 2, fmt("%s: stacked PC is the FPU instruction (1 = yes)", names[i]), 1, S, 1);
 		expect(G, b + 3, fmt("%s: execution continued after the handler skipped it (1 = yes)", names[i]), 1, "test harness", 1);
 	}
-	expect(G, Tg("T_GEN_COUNT"), "exceptions taken in all", 14, S, 2);
+	expect(G, Tg("T_GEN_COUNT"), "exceptions taken in all", 4, S, 2);
 	bus_checks("gen");
 	ddr_checks();
 	presence_checks(false);
@@ -1108,8 +1122,8 @@ static void sc_raw()
 	expect(G, Tg("T_RAW_TF1B"), "... TF bit", 1, "MC68881/2 UM conditional tests: T is true", 1);
 	expect(G, Tg("T_RAW_TF0H"), "response after condition word $0000 (F): primitive high byte (null, CA=0)", 0x08, H, 2);
 	expect(G, Tg("T_RAW_TF0"), "... TF bit", 0, "MC68881/2 UM conditional tests: F is false", 1);
-	expect(G, Tg("T_RAW_CMD"), "response after a command word (cpGEN not implemented): take pre-instruction exception, vector 11", 0x1C0B, H, 4);
-	expect(G, Tg("T_RAW_CMD2"), "... read once more: the exception primitive is not repeated, null/PF", 0x0802, "bridge header: a non-null primitive reads once", 4);
+	expect(G, Tg("T_RAW_CMD"), "response after command word $0000 (FMOVE FP0,FP0): released, null with IA", 0x0900, "bridge header: reg-to-reg released at once ($0900); MC68881 UM 7.? null primitive IA", 4);
+	expect(G, Tg("T_RAW_CMD2"), "... the response CIR later: idle (null, PF) once the ARM has finished", 0x0802, "bridge header", 4);
 	expect(G, Tg("T_RAW_DONE"), "program ran to its end", 1, "test harness", 1);
 	check_eq(G, "exceptions taken by raw accesses", 0, exlog().size(), "test harness", 1);
 	check_eq(G, "CIR cycles with BERR (service present)", 0, [] { unsigned n = 0; for (auto &c : cirs) n += c.berr; return n; }(), "bridge header", 1);
@@ -1143,7 +1157,8 @@ static void sc_rawna()
 static void sc_straddle()
 {
 	begin_test("presence lost in the middle of FPU instructions", "t_straddle");
-	hb_start();
+	set_pacing(true);
+	child_start();
 	release_reset();
 	run_until(present, 6 * POLL_CLKS);
 	run_until(is_ready, 100000);
@@ -1183,6 +1198,293 @@ static void sc_straddle()
 	presence_checks(false);
 }
 
+//------------------------------------------------------------------ milestone 2
+static std::map<std::string, uint32_t> load_syms(const char *lst)
+{
+	std::map<std::string, uint32_t> m;
+	FILE *f = fopen(lst, "r");
+	if (!f) { fprintf(stderr, "cannot open %s\n", lst); exit(2); }
+	char line[512];
+	while (fgets(line, sizeof line, f)) {
+		char nm[256], sec[8];
+		unsigned a;
+		if (sscanf(line, "%255s %2[0-9]:%x", nm, sec, &a) == 3) m[nm] = a;
+	}
+	fclose(f);
+	return m;
+}
+
+// the 16-bit response words returned in CIR read cycles ($00) between two clocks
+static unsigned count_resp(uint64_t from, uint64_t to, unsigned word)
+{
+	unsigned n = 0;
+	for (auto &c : cirs)
+		if (c.id == 1 && c.rw && c.off == 0x00 && c.clk0 >= from && c.clk0 <= to && (c.data >> 16) == word) n++;
+	return n;
+}
+static const Cir *find_cir(uint64_t from, bool rw, unsigned off, int hiword = -1)
+{
+	for (auto &c : cirs)
+		if (c.id == 1 && c.clk0 >= from && c.rw == rw && c.off == off && (hiword < 0 || (int)(c.data >> 16) == hiword)) return &c;
+	return nullptr;
+}
+static std::string ram_hex(uint32_t a, int n)
+{
+	std::string s;
+	char b[4];
+	for (int i = 0; i < n; i++) { snprintf(b, sizeof b, "%02x", ddr[a + i]); s += b; }
+	return s;
+}
+
+static void sc_cases()
+{
+	m2_build();
+	std::map<std::string, uint32_t> syms = load_syms("obj/t_cases.lst");
+	begin_test("M2 generated cases vs the Hatari golden", "t_cases");
+	m2_load_ram(ddr.data());
+	m2_run_golden(syms);
+	set_pacing(true);
+	child_start();
+	release_reset();
+	bool ok = run_until(present, 20 * POLL_CLKS);
+	check_true("presence", "`present` rises with the real service", ok, "bridge header");
+	run_until(is_ready, 800000);
+	steps(2000);
+	gw32(A_GO, 1);
+	// run to the end; stop when no case makes progress for 5 watchdog periods
+	uint32_t last = ~0u;
+	uint64_t last_clk = g_clk;
+	while (!is_done() && g_clk < 400000000ull) {
+		steps(1000);
+		uint32_t cx = gr32(A_CASEIX);
+		if (cx != last) { last = cx; last_clk = g_clk; }
+		else if (g_clk - last_clk > 5ull * CLK_HZ / 10) break;
+	}
+	check_true("run", fmt("program reached its done marker (clk %llu, case %u of %d)", (unsigned long long)g_clk, gr32(A_CASEIX), m2_ncases()),
+	           is_done(), "test harness");
+	collect();
+	auto ex = exlog();
+	const char *G = "m2";
+	unsigned npass = 0, nfail = 0, nimp = 0, nimpok = 0, ngap = 0;
+	std::string gap_first;
+	FILE *fpl = fopen("obj/m2_fpiar.log", "w");
+	for (int i = 0; i < m2_ncases(); i++) {
+		M2Result r = m2_compare(ddr.data(), i);
+		if (fpl && r.done) fprintf(fpl, "%d %s: FPIAR golden %08x device %08x\n", i, m2_name(i), r.fpiar_exp, r.fpiar_got);
+		std::string tag = std::string(m2_group(i)) + "] " + m2_name(i);
+		bool imm = m2_expects_imm(i);
+		if (imm) { nimp++; if (r.ok) nimpok++; }
+		if (r.ok) {
+			npass++;
+			report(true, G, fmt("[%s: every FP register, FPCR, FPSR, integer registers and memory equal to the golden; expected %s got identical", tag.c_str(), r.summary.c_str()),
+			       imm ? "Hatari fpp.c golden; #imm D/X/P/multi accepted per MC68881 UM 7.4" : "Hatari fpp.c golden");
+		} else {
+			nfail++;
+			std::string d;
+			if (!r.done) {
+				d = "case did not run to its end";
+				for (auto &e : ex)
+					if (e.ix == (uint32_t)i) d += fmt("; exception vector %u format %u at pc %08x", e.vec, e.fmt, e.pc);
+			}
+			for (auto &x : r.diffs) d += fmt("; %s expected %s got %s", x.what.c_str(), x.exp.c_str(), x.got.c_str());
+			report(false, G, fmt("[%s: %s%s", tag.c_str(), r.summary.c_str(), (" -> " + d).c_str()),
+			       imm ? "Hatari fpp.c golden; #imm D/X/P/multi accepted per MC68881 UM 7.4 (AP68030 cp_ea_ok category 110 = ea_mem excludes #imm?)" : "Hatari fpp.c golden");
+		}
+		if (r.fpiar_diff && r.done) {
+			ngap++;
+			if (gap_first.empty()) gap_first = fmt("case %d %s: expected FPIAR %08x got %08x", i, m2_name(i), r.fpiar_exp, r.fpiar_got);
+		}
+	}
+	if (fpl) fclose(fpl);
+	printf("  summary: %u cases pass, %u fail; #imm/multi-register immediate cases %u of which %u pass\n", npass, nfail, nimp, nimpok);
+	// FPIAR is part of the dump compared with the golden (Hatari leaves FPIAR alone except for
+	// FMOVE to FPIAR, so the golden value is the one the program wrote); mismatches among cases that ran to their end:
+	check_eq(G, "cases (that ran to their end) whose dumped FPIAR differs from the golden", 0, ngap, "Hatari fpp.c golden; bridge header: FPIAR not loaded from the instruction address yet", 1);
+	if (ngap) printf("        first: %s\n", gap_first.c_str());
+	bus_checks("m2_cases");
+	ddr_checks();
+	check_eq("run", "ARM service still alive at the end (child not exited)", 0, child_exited ? 1 : 0, "tools/falcon_fpu", 1);
+}
+
+// background execution, FSAVE while busy, watchdog -----------------------------------------------
+static bool wait_mark(uint32_t addr, uint64_t max, uint64_t *when = nullptr)
+{
+	bool r = run_until([&] { return gr32(addr) != 0; }, max);
+	if (when) *when = g_clk;
+	return r;
+}
+
+static void real_start(const char *name, const char *prog)
+{
+	begin_test(name, prog);
+	set_pacing(true);
+	child_start();
+}
+
+static void sc_bg()
+{
+	real_start("background execution (service held with SIGSTOP)", "t_bg");
+	release_reset();
+	run_until(present, 20 * POLL_CLKS);
+	bool ok = wait_mark(A_MARK1, 800000);
+	check_true("bg", "program synchronised (first FPU instructions done)", ok, "test harness");
+	steps(500);
+	child_signal(SIGSTOP);                       // the ARM can no longer reply
+	steps(200);
+	gw32(A_GO, 1);
+	uint64_t t_m2 = 0, t_m4 = 0;
+	run_until([&] {
+		if (!t_m2 && gr32(A_MARK2)) t_m2 = g_clk;
+		if (!t_m4 && gr32(A_MARK4)) { t_m4 = g_clk; return true; }
+		return false;
+	}, 60000);
+	check_true("bg", fmt("non-FPU instructions after the released FADD ran to the next FPU instruction (marker 2 at clk %llu, marker 4 at clk %llu) while the ARM was held",
+	                    (unsigned long long)t_m2, (unsigned long long)t_m4), t_m2 && t_m4, "bridge header: reg-to-reg released at once ($0900); MC68882 UM 7.5 (reg-to-reg runs concurrently)");
+	check_eq("bg", "instructions counted by the CPU while the FADD was outstanding", 8, gr32(A_MARK3), "test harness", 1);
+	// the second FADD is told to come again until the reply
+	run_until([&] { return count_resp(t_m4, ~0ull, 0x8900) >= 8; }, 60000);
+	unsigned ca = count_resp(t_m4, ~0ull, 0x8900);
+	check_true("bg", fmt("come-again responses ($8900) read by the second FPU instruction while no reply exists: %u (expected at least 8)", ca), ca >= 8,
+	           "bridge header: a later instruction gets come-again $8900 until the reply; MC68882 UM 7.2.6");
+	check_eq("bg", "DONE marker not yet set while the second FADD still waits", 0, is_done() ? 1 : 0, "test harness", 1);
+	uint64_t t_cont = g_clk;
+	child_signal(SIGCONT);
+	finish_program(300000, true);
+	// the first FADD command write ($0422) is answered with $0900
+	const Cir *w1 = find_cir(1, false, 0x0A, 0x0422);
+	const Cir *r1 = w1 ? find_cir(w1->clk1, true, 0x00) : nullptr;
+	check_eq("bg", "first response read after the FADD command write", 0x0900, r1 ? (r1->data >> 16) : 0xFFFF,
+	         "bridge header: R_REL $0900 = null, IA, CA=0 (released)", 4);
+	check_true("bg", fmt("the CPU wrote marker 2 (clk %llu) before the service was released (SIGCONT at clk %llu)", (unsigned long long)t_m2, (unsigned long long)t_cont),
+	           t_m2 && t_m2 < t_cont, "background execution");
+	const Cir *w2 = find_cir(1, false, 0x0A, 0x00A2);
+	const Cir *rl = nullptr;
+	if (w2)
+		for (auto &c : cirs)
+			if (c.id == 1 && c.rw && c.off == 0 && c.clk0 > w2->clk1 && (c.data >> 16) != 0x8900) { rl = &c; break; }
+	check_eq("bg", "response after the come-agains of the second FADD", 0x0900, rl ? (rl->data >> 16) : 0xFFFF, "bridge header: released once the reply is in", 4);
+	check_true("bg", fmt("FP0 image expected 40010000e000000000000000 got %s", ram_hex(0x8100, 12).c_str()), ram_hex(0x8100, 12) == "40010000e000000000000000", "3 + 4 = 7 = 1.75 * 2^2");
+	check_true("bg", fmt("FP1 image expected 40020000b000000000000000 got %s", ram_hex(0x810C, 12).c_str()), ram_hex(0x810C, 12) == "40020000b000000000000000", "4 + 7 = 11 = 1.375 * 2^3");
+	bus_checks("bg");
+	ddr_checks();
+}
+
+static void sc_busy()
+{
+	real_start("FSAVE while a request is outstanding", "t_busy");
+	release_reset();
+	run_until(present, 20 * POLL_CLKS);
+	wait_mark(A_MARK1, 800000);
+	steps(500);
+	child_signal(SIGSTOP);
+	steps(200);
+	gw32(A_GO, 1);
+	wait_mark(A_MARK2, 60000);
+	uint64_t t0 = g_clk;
+	run_until([&] {
+		unsigned n = 0;
+		for (auto &c : cirs)
+			if (c.id == 1 && c.rw && c.off == 0x04 && c.clk0 >= t0 && (c.data >> 16) == 0x0118) n++;
+		return n >= 6;
+	}, 60000);
+	unsigned nca = 0;
+	for (auto &c : cirs)
+		if (c.id == 1 && c.rw && c.off == 0x04 && c.clk0 >= t0 && (c.data >> 16) == 0x0118) nca++;
+	check_true("busy", fmt("save CIR reads returning the come-again format $0118 while the FADD is outstanding: %u (expected at least 6)", nca), nca >= 6,
+	           "MC68881 UM 6.4.3 / bridge header: FSAVE while busy -> $0118");
+	check_eq("busy", "DONE marker not yet set while FSAVE waits", 0, is_done() ? 1 : 0, "test harness", 1);
+	child_signal(SIGCONT);
+	finish_program(300000, true);
+	collect();
+	expect("busy", Tg("T_BUSY_FMT"), "FSAVE after the come-agains: format word (idle)", 0x1F38, "MC68882 UM 6.4.2: idle frame $1F38", 4);
+	expect("busy", Tg("T_BUSY_DELTA"), "FSAVE after the come-agains: frame size", 60, "MC68882 UM 6.4.2: 4 + 56 bytes");
+	check_true("busy", fmt("FP0 image after FSAVE expected 40010000e000000000000000 got %s", ram_hex(0x8100, 12).c_str()), ram_hex(0x8100, 12) == "40010000e000000000000000",
+	           "3 + 4 = 7: the background FADD finished before the idle frame");
+	bus_checks("busy");
+	ddr_checks();
+}
+
+// variant: 0 service held with SIGSTOP, 1 no service at all (C++ heartbeat), 2 service held and MAGIC cleared (presence lost)
+static void sc_wd(int variant)
+{
+	static const char *names[3] = {"watchdog: service held with SIGSTOP", "watchdog: no service answers (C++ heartbeat only)",
+	                               "watchdog: presence lost while the CPU waits"};
+	begin_test(names[variant], "t_wd");
+	gw32(A_MODE, variant == 1 ? 0 : 1);
+	if (variant == 1) hb_start();
+	else { set_pacing(true); child_start(); }
+	release_reset();
+	run_until(present, 20 * POLL_CLKS);
+	if (variant != 1) {
+		bool ok = wait_mark(A_MARK1, 800000);
+		check_true("wd", "program synchronised", ok, "test harness");
+		steps(500);
+		child_signal(SIGSTOP);
+		steps(200);
+	} else {
+		run_until(is_ready, 800000);
+		steps(500);
+	}
+	gw32(A_GO, 1);
+	uint64_t t_go = g_clk;
+	const uint64_t WD = CLK_HZ / 10;
+	uint64_t t_clear = 0;
+	if (variant == 2) {
+		run_until([&] { return find_cir(t_go, false, 0x0A, 0x6800) != nullptr; }, 100000);
+		steps(3000);
+		mb_w16(0x000, 0);                              // presence lost
+		t_clear = g_clk;
+	}
+	bool got = wait_mark(A_MARK3, 3 * WD + 100000);
+	uint64_t t_exc = g_clk;
+	check_true("wd", fmt("the waiting FMOVE FP0,(a2) ended (marker 3 at clk %llu)", (unsigned long long)t_exc), got, "bridge header: watchdog -> mid-instruction exception");
+	check_eq("wd", "instruction after the FMOVE was not executed (marker 2)", 0, gr32(A_MARK2), "the exception abandons the instruction", 1);
+	auto ex = exlog();
+	check_eq("wd", "exceptions taken", 1, ex.size(), "bridge header: one protocol violation", 1);
+	if (!ex.empty()) {
+		check_eq("wd", "exception vector (coprocessor protocol violation)", 13, ex[0].vec, "MC68030 UM Table 8-1 vector 13; bridge header $1D0D", 2);
+		check_eq("wd", "stack frame format (coprocessor mid-instruction)", 9, ex[0].fmt, "MC68030 UM 8.2: format $9", 1);
+	}
+	const Cir *cw = find_cir(t_go, false, 0x0A, 0x6800);
+	const Cir *ack = cw ? find_cir(cw->clk1, false, 0x02) : nullptr;
+	if (cw && ack) {
+		uint64_t dt = ack->clk0 - cw->clk0;
+		if (variant == 0)
+			check_true("wd", fmt("command write to exception acknowledge took %llu clocks; expected about CLK_HZ/10 = %llu (within -10%% / +%u)", (unsigned long long)dt,
+			                    (unsigned long long)WD, 6000u), dt >= WD * 9 / 10 && dt <= WD + 6000,
+			           "bridge header: ~100 ms at the bridge's CLK_HZ");
+		else if (variant == 1)
+			check_true("wd", fmt("command write to exception acknowledge took %llu clocks; at most CLK_HZ/10 = %llu plus the dialog", (unsigned long long)dt, (unsigned long long)WD),
+			           dt <= WD + 6000, "bridge header: ~100 ms");
+		else
+			check_true("wd", fmt("exception %llu clocks after MAGIC was cleared (limit one poll + dialog = %u, far below the watchdog %llu)", (unsigned long long)(ack->clk0 - t_clear),
+			                    POLL_CLKS + 3000, (unsigned long long)WD), ack->clk0 >= t_clear && ack->clk0 - t_clear <= POLL_CLKS + 3000,
+			           "bridge header: or presence lost");
+		unsigned nca = count_resp(cw->clk1, ack->clk0, 0x8900), npr = count_resp(cw->clk1, ack->clk0, 0x1D0D);
+		check_true("wd", fmt("response reads during the wait: %u come-again ($8900) then %u protocol violation ($1D0D)", nca, npr), nca >= 1 && npr == 1,
+		           "bridge header: come-again until the watchdog, then $1D0D");
+	} else
+		check_true("wd", "command write and acknowledge found in the CIR log", false, "test harness");
+	if (variant != 1) {
+		if (variant == 2) mb_w16(0x000, MAGIC);
+		child_signal(SIGCONT);
+		if (variant == 2) {
+			bool back = run_until(present, 6 * POLL_CLKS + HB_PERIOD);
+			check_true("wd", "presence returns after MAGIC is restored and the service runs", back, "bridge header");
+		}
+		steps(3000);
+		gw32(A_STOP, 1);
+		finish_program(400000, true);
+		check_eq("wd", "recovery: later instructions completed (marker 4)", 1, gr32(A_MARK4), "bridge header: later instructions work", 1);
+		check_true("wd", fmt("recovery: FP0+FP0 image expected 40010000c000000000000000 got %s", ram_hex(0x810C, 12).c_str()),
+		           ram_hex(0x810C, 12) == "40010000c000000000000000", "3 + 3 = 6 = 1.5 * 2^2");
+	} else {
+		finish_program(100000, true);
+	}
+	bus_checks(variant == 0 ? "wd_stop" : variant == 1 ? "wd_nosvc" : "wd_presence");
+	ddr_checks();
+}
+
 //------------------------------------------------------------------ main
 int main(int argc, char **argv)
 {
@@ -1190,6 +1492,16 @@ int main(int argc, char **argv)
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	std::string only;
 	for (int i = 1; i < argc; i++) {
+		if (!strncmp(argv[i], "--gen=", 6)) {          // write the generated cases as 68k assembly and stop
+			m2_build();
+			FILE *f = fopen(argv[i] + 6, "w");
+			if (!f) { perror("gen"); return 2; }
+			fprintf(f, "; generated by tb_fpu --gen (tb/fpu/m2.cpp): %d cases\n", m2_ncases());
+			m2_emit_asm(f);
+			fclose(f);
+			printf("generated %d cases\n", m2_ncases());
+			return 0;
+		}
 		if (!strncmp(argv[i], "--host=", 7)) host_exe = argv[i] + 7;
 		else if (!strncmp(argv[i], "--only=", 7)) only = argv[i] + 7;
 	}
@@ -1212,11 +1524,11 @@ int main(int argc, char **argv)
 	printf("FPU bridge milestone 1 co-simulation: CLK_HZ=%u poll=%u clocks alive window=%u polls heartbeat=%u clocks\n", CLK_HZ, POLL_CLKS,
 	       ALIVE_POLLS, HB_PERIOD);
 	struct { const char *name; void (*fn)(); } sc[] = {
-	    {"detect_alive", [] { sc_detect("EmuTOS detect/service alive (C++ heartbeat)", "alive"); }},
+	    {"detect_real", [] { sc_detect("EmuTOS detect/real falcon_fpu_host", "real"); }},
 	    {"detect_nosvc", [] { sc_detect("EmuTOS detect/no service", "none"); }},
 	    {"detect_badmagic", [] { sc_detect("EmuTOS detect/wrong MAGIC $4651", "badmagic"); }},
 	    {"detect_hb0", [] { sc_detect("EmuTOS detect/MAGIC ok, heartbeat stuck at 0", "hb0"); }},
-	    {"detect_real", [] { sc_detect("EmuTOS detect/real falcon_fpu_host", "real"); }},
+	    {"detect_badversion", [] { sc_detect("EmuTOS detect/VERSION 1 (old service)", "badversion"); }},
 	    {"watch_freeze", sc_watch_cpp_freeze},
 	    {"watch_magic", sc_watch_cpp_magic},
 	    {"watch_real", sc_watch_real},
@@ -1230,6 +1542,12 @@ int main(int argc, char **argv)
 	    {"raw", sc_raw},
 	    {"rawna", sc_rawna},
 	    {"straddle", sc_straddle},
+	    {"m2cases", sc_cases},
+	    {"m2bg", sc_bg},
+	    {"m2busy", sc_busy},
+	    {"m2wd_stop", [] { sc_wd(0); }},
+	    {"m2wd_nosvc", [] { sc_wd(1); }},
+	    {"m2wd_presence", [] { sc_wd(2); }},
 	};
 	for (auto &s : sc) {
 		if (!only.empty() && only != s.name) continue;

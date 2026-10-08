@@ -1,20 +1,31 @@
 /*
  * falcon_fpu - HPS side of the Falcon core's MC68882 (docs/FPU_ARM.md)
  *
- * Milestone 1: presence only.  Writes MAGIC and VERSION into the FPU
- * mailbox and increments HEARTBEAT every 10 ms; the FPGA bridge
- * (rtl/falcon/falcon_fpu_bridge.sv) reports an FPU to the 68030 while the
- * heartbeat moves.  On SIGINT/SIGTERM MAGIC is cleared, so the FPU
- * disappears at once instead of after the bridge's 100 ms timeout.
+ * The FPGA bridge (rtl/falcon/falcon_fpu_bridge.sv) answers the 68030's
+ * coprocessor interface and posts one request per FPU instruction into a
+ * DDR3 mailbox; this program executes it with Hatari's 68882 emulation
+ * (engine/, libfpe) and writes the reply.  It also keeps MAGIC and a
+ * heartbeat in the mailbox: while the heartbeat moves the core reports an
+ * FPU.  On SIGINT/SIGTERM MAGIC is cleared, so the FPU disappears at once.
  *
  *   falcon_fpu [-m file] [-c cpu] [-f] [-v]
  *     -m FILE  map FILE instead of /dev/mem, offset 0 = mailbox (simulation)
  *     -c CPU   pin to one CPU core (Main_MiSTer runs on CPU 1: use 0)
  *     -f       SCHED_FIFO real-time priority
- *     -v       print the heartbeat once a second
+ *     -v       print a line per request
  *
- * Mailbox: DDR3 0x30E90000 (guest $E90000), 16-bit words in the Falcon's
- * big-endian byte order.
+ * Mailbox (DDR3 0x30E90000 = guest $E90000).  Words are 16 bit in the
+ * Falcon's big-endian byte order; operand and result bytes are stored in
+ * memory order (DDR3 byte k = guest byte k), so they are copied as is.
+ *   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (2)
+ *   request (FPGA -> ARM), RSEQ written last:
+ *   +$100 RSEQ  +$102 KIND (1 execute, 2 reset)  +$104 CMD  +$106 AUX
+ *   +$108 NBYTES  +$10A IADDR[31:16]  +$10C IADDR[15:0]  +$110.. operand bytes
+ *   reply (ARM -> FPGA), ASEQ written last:
+ *   +$200 ASEQ  +$202 FLAGS  +$204 FPSR[31:16]  +$206 FPSR[15:0]
+ *   +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes
+ * FLAGS: bit 0 the instruction is not implemented (the bridge answers it
+ * with the F-line exception), bit 1 an exception is pending (milestone 4).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -29,13 +40,24 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "engine/falcon_fpu_engine.h"
+
 #define FPU_MB_PHYS  0x30E90000u
 #define FPU_MB_SIZE  0x10000u
 #define FPU_MAGIC    0x4650u        /* "FP" */
-#define FPU_VERSION  1u
-#define HB_PERIOD_NS 10000000L      /* 10 ms */
+#define FPU_VERSION  2u
+#define HB_PERIOD_NS 10000000L      /* heartbeat every 10 ms */
+#define SPIN_NS      1000000L       /* spin this long after a request ... */
+#define NAP_NS       50000L         /* ... then poll every 50 us */
+#define MAX_BYTES    96
 
-enum { O_MAGIC = 0x000, O_HB = 0x002, O_VERSION = 0x004 };
+enum { O_MAGIC = 0x000, O_HB = 0x002, O_VERSION = 0x004,
+       O_RSEQ = 0x100, O_KIND = 0x102, O_CMD = 0x104, O_AUX = 0x106,
+       O_RNBYTES = 0x108, O_IADDR = 0x10A, O_RDATA = 0x110,
+       O_ASEQ = 0x200, O_FLAGS = 0x202, O_FPSR = 0x204, O_FPCR = 0x208,
+       O_ANBYTES = 0x20A, O_ADATA = 0x210 };
+
+enum { KIND_EXEC = 1, KIND_RESET = 2 };
 
 static volatile uint8_t *mb;
 static volatile sig_atomic_t quit;
@@ -58,13 +80,54 @@ static inline uint16_t rd16(unsigned off)
 static inline void wr16(unsigned off, uint16_t v)
 {
 	*(volatile uint16_t *)(mb + off) = (uint16_t)((v >> 8) | (v << 8));
-	barrier();
+}
+
+static int64_t now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
 }
 
 static void on_signal(int sig)
 {
 	(void)sig;
 	quit = 1;
+}
+
+/* execute the request in the mailbox and write the reply */
+static void serve(uint16_t seq, int verbose)
+{
+	uint8_t in[MAX_BYTES], out[MAX_BYTES];
+	uint16_t kind = rd16(O_KIND), cmd = rd16(O_CMD), aux = rd16(O_AUX);
+	int n = rd16(O_RNBYTES), out_len = 0, flags = 0;
+	uint32_t iaddr = (uint32_t)rd16(O_IADDR) << 16 | rd16(O_IADDR + 2);
+
+	if (n > MAX_BYTES) n = MAX_BYTES;
+	for (int i = 0; i < n; i++) in[i] = mb[O_RDATA + i];
+
+	if (kind == KIND_RESET)
+		fpe_reset();
+	else
+		flags = fpe_exec(cmd, in, n, aux, iaddr, out, &out_len);
+	if (out_len < 0 || out_len > MAX_BYTES) out_len = 0;
+
+	for (int i = 0; i < out_len; i++) mb[O_ADATA + i] = out[i];
+	uint32_t fpsr = fpe_fpsr();
+	wr16(O_FLAGS, (uint16_t)flags);
+	wr16(O_FPSR, (uint16_t)(fpsr >> 16));
+	wr16(O_FPSR + 2, (uint16_t)fpsr);
+	wr16(O_FPCR, (uint16_t)fpe_fpcr());
+	wr16(O_ANBYTES, (uint16_t)out_len);
+	barrier();                      /* the reply is complete before ASEQ */
+	wr16(O_ASEQ, seq);
+	barrier();
+
+	if (verbose) {
+		printf("falcon_fpu: seq %04x kind %u cmd %04x aux %04x in %d -> out %d flags %x fpsr %08x\n",
+		       seq, kind, cmd, aux, n, out_len, flags, fpsr);
+		fflush(stdout);
+	}
 }
 
 int main(int argc, char **argv)
@@ -119,27 +182,38 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
+	fpe_reset();
+	/* answer nothing that was posted before we ran: catch up with RSEQ */
+	uint16_t seen = rd16(O_RSEQ);
+	wr16(O_ASEQ, seen);
 	uint16_t hb = rd16(O_HB);
 	wr16(O_VERSION, FPU_VERSION);
+	barrier();
 	wr16(O_MAGIC, FPU_MAGIC);
+	barrier();
 
-	struct timespec next;
-	clock_gettime(CLOCK_MONOTONIC, &next);
-	unsigned long ticks = 0;
+	int64_t t = now_ns(), next_hb = t, last_req = t;
 	while (!quit) {
-		wr16(O_HB, ++hb);
-		if (verbose && ++ticks % 100 == 0) {
-			printf("falcon_fpu: heartbeat %u\n", hb);
-			fflush(stdout);
+		uint16_t seq = rd16(O_RSEQ);
+		t = now_ns();
+		if (seq != seen) {
+			seen = seq;
+			serve(seq, verbose);
+			last_req = t;
 		}
-		next.tv_nsec += HB_PERIOD_NS;
-		if (next.tv_nsec >= 1000000000L) {
-			next.tv_nsec -= 1000000000L;
-			next.tv_sec++;
+		if (t >= next_hb) {
+			wr16(O_HB, ++hb);
+			barrier();
+			next_hb += HB_PERIOD_NS;
+			if (next_hb < t) next_hb = t + HB_PERIOD_NS;
 		}
-		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+		if (t - last_req > SPIN_NS) {   /* idle: stop spinning */
+			struct timespec nap = { 0, NAP_NS };
+			nanosleep(&nap, NULL);
+		}
 	}
 
 	wr16(O_MAGIC, 0);
+	barrier();
 	return 0;
 }

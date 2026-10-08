@@ -6,11 +6,13 @@
 	include	"common.i"
 
 main:
-	move.l	#2,SKIP			; FSAVE/FRESTORE are one word
 	WAITGO
 loop:	tst.l	STOPF
 	bne	finish
 	lea	BUF+128,a0
+	move.l	#4,SKIP
+	FNOP_				; the FPU is idle: FSAVE gives the 60 byte frame
+	move.l	#2,SKIP			; FSAVE/FRESTORE are one word
 	dc.w	$f320			; fsave -(a0)
 	dc.w	$f358			; frestore (a0)+
 	addq.l	#1,ITER

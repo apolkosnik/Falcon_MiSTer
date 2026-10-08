@@ -21,6 +21,15 @@ FLHIT		equ	$0F1C		; byte: a Line-F (vector 11) exception happened
 ITER		equ	$0F20		; long: watch loop iterations
 UNEXP		equ	$0F24		; long: non-zero when an unexpected vector was taken
 READY		equ	$0F28		; long: set when the program waits for GO
+TRAPCNT		equ	$0F2C		; long: TRAPcc (vector 7) exceptions counted in case mode
+CASEIX		equ	$0F30		; long: generated case being run
+RESUME		equ	$0F34		; long: where an aborted case continues
+SAVESP		equ	$0F38		; long: stack pointer at the start of the case program
+ABORTMODE	equ	$0F3C		; long: non-zero: unexpected exceptions abort the current case
+MARK1		equ	$0F40		; longs: progress markers of the hand written M2 programs
+MARK2		equ	$0F44
+MARK3		equ	$0F48
+MARK4		equ	$0F4C
 EXLOG		equ	$1000		; 32-byte entries: vector, format, PC, IA, SR
 RECLOG		equ	$4000		; (tag, value) longs, ends with tag 0
 BUF		equ	$8000
@@ -105,14 +114,21 @@ nia\@:	move.l	d2,(a1)+		; IA
 	moveq	#0,d2
 	move.w	(a0),d2
 	move.l	d2,(a1)+		; SR
-	lea	12(a1),a1
+	move.l	CASEIX,(a1)+
+	lea	8(a1),a1
 	move.l	a1,EXLOGP
 	addq.l	#1,EXCNT
 	endm
 
 h_exc:
 	logexc
-	cmp.l	#11,d0
+	tst.l	ABORTMODE
+	beq.s	hx0
+	cmp.l	#7,d0			; case mode: TRAPcc is counted, everything else aborts the case
+	bne	habort
+	addq.l	#1,TRAPCNT
+	bra.s	hx2
+hx0:	cmp.l	#11,d0
 	bne.s	hx1
 	move.b	#1,FLHIT
 hx1:	tst.l	d1
@@ -124,8 +140,14 @@ hx2:	movem.l	(sp)+,d0-d2/a0-a1
 
 h_unexp:
 	logexc
+	tst.l	ABORTMODE
+	bne	habort
 	move.l	#1,UNEXP
 	bra	finish
+
+habort:	movea.l	SAVESP,sp		; drop the exception frame, continue after the case
+	movea.l	RESUME,a0
+	jmp	(a0)
 
 finish:
 	move.l	#$D0E0600D,DONE

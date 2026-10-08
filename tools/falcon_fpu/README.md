@@ -5,12 +5,14 @@ interface; the FPU's registers and arithmetic run here, on the MiSTer's ARM,
 through a DDR3 mailbox at 0x30E90000.  Design and milestones:
 `docs/FPU_ARM.md`.
 
-Milestone 1: presence only.  The service writes MAGIC and a heartbeat every
-10 ms; while the heartbeat moves the core reports a 68882 (FSAVE/FRESTORE,
-FNOP and the conditionals work; arithmetic takes the F-line exception).
+The service writes MAGIC, VERSION 2 and a heartbeat every 10 ms (while the
+heartbeat moves the core reports a 68882) and executes every request posted
+by the bridge with the engine in `engine/` (Hatari's `fpp.c` + softfloat,
+built from the Hatari tree: `HATARI`, default `~/Devel/Atari/hatari`).  It
+spins for 1 ms after a request, then polls every 50 us.
 
 ```
-tools/falcon_fpu/build.sh                 # needs arm-none-linux-gnueabihf-gcc
+tools/falcon_fpu/build.sh                 # needs arm-none-linux-gnueabihf-gcc and Hatari's source
 /media/fat/falcon_fpu -c 0 &              # on the MiSTer, before or after loading the core
 ```
 

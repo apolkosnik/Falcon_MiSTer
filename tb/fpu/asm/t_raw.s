@@ -57,15 +57,20 @@ main:
 	REC	T_RAW_TF0H,d4
 	and.l	#1,d1
 	REC	T_RAW_TF0,d1
-;---- command word: not implemented yet -> take pre-instruction exception, vector 11
+;---- command word $0000 = FMOVE FP0,FP0 (register to register): released at once
+;     ($0900: null, IA), then the idle response when the ARM has finished
 	moveq	#0,d3
 	moves.w	d3,$A(a0)
 	moves.w	(a0),d1
 	and.l	#$FFFF,d1
 	REC	T_RAW_CMD,d1
-	moves.w	(a0),d1			; read again: a taken exception is reported once
+	move.w	#4000,d5
+rw1:	moves.w	(a0),d1
 	and.l	#$FFFF,d1
-	REC	T_RAW_CMD2,d1
+	cmp.w	#$0802,d1
+	beq.s	rw2
+	dbra	d5,rw1
+rw2:	REC	T_RAW_CMD2,d1
 ;---- control CIR abort write and a null restore
 	move.w	#$0001,d3
 	moves.w	d3,2(a0)

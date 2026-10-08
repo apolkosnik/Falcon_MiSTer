@@ -14,14 +14,17 @@
 //     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
-//     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC and
-//                       a heartbeat every 10 ms in the mailbox at $E90000
+//     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC,
+//                       VERSION 2 and a heartbeat every 10 ms in the mailbox
+//                       at $E90000, and every request executed by the same
+//                       68882 engine (libfpe) the ARM service uses
 //     --cptrace         print every coprocessor (FPU) interface register access
 //     --cookies         print the TOS cookie jar at the end
 #include "Vtb_top.h"
 #include "Vtb_top__Dpi.h"
 #include "verilated.h"
 #include "svdpi.h"
+#include "falcon_fpu_engine.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +62,37 @@ static void guest_wr16(uint32_t a, uint16_t v)   // a even
 {
     uint64_t d = ((uint64_t)(v >> 8) << (8 * (a & 7))) | ((uint64_t)(v & 0xFF) << (8 * ((a + 1) & 7)));
     ddr_poke(a >> 3, d, (uint8_t)(3u << (a & 7)));
+}
+static void guest_wr8(uint32_t a, uint8_t v)
+{
+    ddr_poke(a >> 3, (uint64_t)v << (8 * (a & 7)), (uint8_t)(1u << (a & 7)));
+}
+static uint16_t guest_rd16(uint32_t a) { return (uint16_t)(guest_rd8(a) << 8 | guest_rd8(a + 1)); }
+
+// the HPS FPU service (tools/falcon_fpu/falcon_fpu.c) on the DDR3 model
+static uint16_t fpu_seen;
+static void fpu_serve(void)
+{
+    const uint32_t MB = 0xE90000;
+    uint16_t seq = guest_rd16(MB + 0x100);
+    if (seq == fpu_seen) return;
+    fpu_seen = seq;
+    uint8_t in[FPE_MAXIO], out[FPE_MAXIO];
+    uint16_t kind = guest_rd16(MB + 0x102), cmd = guest_rd16(MB + 0x104), aux = guest_rd16(MB + 0x106);
+    int n = guest_rd16(MB + 0x108), out_len = 0, flags = 0;
+    if (n > FPE_MAXIO) n = FPE_MAXIO;
+    for (int i = 0; i < n; i++) in[i] = guest_rd8(MB + 0x110 + i);
+    if (kind == 2) fpe_reset();
+    else flags = fpe_exec(cmd, in, n, aux, 0, out, &out_len);
+    if (out_len < 0 || out_len > FPE_MAXIO) out_len = 0;
+    for (int i = 0; i < out_len; i++) guest_wr8(MB + 0x210 + i, out[i]);
+    uint32_t fpsr = fpe_fpsr();
+    guest_wr16(MB + 0x202, (uint16_t)flags);
+    guest_wr16(MB + 0x204, (uint16_t)(fpsr >> 16));
+    guest_wr16(MB + 0x206, (uint16_t)fpsr);
+    guest_wr16(MB + 0x208, (uint16_t)fpe_fpcr());
+    guest_wr16(MB + 0x20A, (uint16_t)out_len);
+    guest_wr16(MB + 0x200, seq);
 }
 
 int main(int argc, char **argv) {
@@ -246,10 +280,14 @@ int main(int argc, char **argv) {
         // the service starts after the DDR3 model's initial block has cleared
         // the memory (first evaluation)
         if (fpu_service && cyc == 100) {
-            guest_wr16(0xE90004, 1);          // VERSION
+            fpe_reset();
+            fpu_seen = guest_rd16(0xE90100);
+            guest_wr16(0xE90200, fpu_seen);
+            guest_wr16(0xE90004, 2);          // VERSION
             guest_wr16(0xE90000, 0x4650);     // MAGIC "FP"
         }
         if (fpu_service && cyc % 320000 == 0) guest_wr16(0xE90002, ++fpu_hb);   // 10 ms
+        if (fpu_service && cyc > 100 && (cyc & 31) == 0) fpu_serve();       // ~1 us poll
         if (top->dbg_fpu_present != fpu_was)
             printf("[%10.3f ms] FPU %s\n", cyc / CLK_HZ * 1e3, top->dbg_fpu_present ? "present" : "absent");
         if (cptrace) {

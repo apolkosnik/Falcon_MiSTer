@@ -1,7 +1,11 @@
 # MC68882 FPU served by the ARM - design
 
-Status: milestone 1 in progress (branch `feature/fpu-arm`): `rtl/falcon/falcon_fpu_bridge.sv`,
-`falcon_cpubus` routing coprocessor cycles to it, `tools/falcon_fpu` (heartbeat only).  The core has no FPU today
+Status (branch `feature/fpu-arm`): milestones 1-2 done.  Presence, frames and
+detection; full instruction dialogs in `rtl/falcon/falcon_fpu_bridge.sv`, requests
+executed by `tools/falcon_fpu` with Hatari's `fpp.c` (`tools/falcon_fpu/engine`),
+verified by `tb/fpu` against Hatari driven with real EAs.  Milestone 2 needed two
+AP68030 coprocessor fixes (immediate operands in the "memory" EA category, cpScc
+byte size), committed in the submodule on branch `fix/coprocessor-imm-cpscc`.  The core has no FPU today
 (README: "the 68881 does not fit"; `falcon_cpubus` ends every coprocessor
 cycle in a bus error, so the 68030 takes the F-line exception).  ~3,100 ALMs
 are free, far too few for an FPU, but enough for a protocol bridge: the
@@ -82,8 +86,21 @@ back to sleeping polls after ~1 ms idle so an idle FPU does not take a core
 **Mailbox.**  Guest $E90000 (DDR3 0x30E90000), next to the probe's $E80000
 so the two never mix; 16-bit words, Falcon byte order.  +$000 MAGIC $4650
 ("FP", written by the service, cleared when it stops), +$002 HEARTBEAT
-(incremented every 10 ms), +$004 VERSION; request and reply slots with
-sequence numbers follow in milestone 2 (one outstanding request at first).
+(incremented every 10 ms), +$004 VERSION (2).  One request at a time:
++$100 RSEQ (written last), KIND (1 execute, 2 reset), CMD, AUX (Dn of a
+dynamic list or k-factor), NBYTES, operand bytes at +$110; the reply at
++$200: ASEQ (written last), FLAGS (bit 0 not implemented), FPSR, FPCR[15:0],
+NBYTES, result bytes at +$210.  Operand and result bytes are copied in
+memory order between the operand CIR and the mailbox, so the bridge needs no
+buffer.
+
+**Engine.**  `tools/falcon_fpu/engine` builds Hatari's `fpp.c`, `fpp_softfloat.c`
+and softfloat unmodified with a shim (`libfpe`, host and ARM).  `fpp.c` is
+given a synthetic `(A0)` opcode (`-(A0)` for predecrement FMOVEM lists) and
+its memory accessors map onto the operand/result buffer, so the buffer is
+the memory image the 68030 transfers and every 68882 detail of `fpp.c`
+applies; `engine/fpe_selftest` compares this against `fpp.c` driven with
+real EAs (16,613 checks, host and qemu-arm).
 The bridge polls MAGIC/HEARTBEAT every 5 ms and reports an FPU while the
 heartbeat has moved within 100 ms.  It owns `falcon_memarb`'s d3 port
 (between the blitter and the CPU), which the probe proved; a measurement

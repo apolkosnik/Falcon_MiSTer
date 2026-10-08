@@ -80,3 +80,9 @@ T_RAW_TF0H	equ	$0705	; ... high byte
 T_RAW_CMD	equ	$0706	; response after a command word $0000: primitive (take exception, vector 11)
 T_RAW_CMD2	equ	$0707	; the response CIR read once more: a taken-exception primitive is not repeated
 T_RAW_DONE	equ	$07FF
+
+; t_bg / t_busy / t_wd (milestone 2 hand written programs)
+T_BG_FP0	equ	$0800
+T_BUSY_FMT	equ	$0810
+T_BUSY_DELTA	equ	$0811
+T_WD_AFTER	equ	$0820
