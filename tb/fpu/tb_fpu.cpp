@@ -40,6 +40,7 @@
 #include "Vtb_fpu_top.h"
 #include "verilated.h"
 #include "m2.h"
+#include "m3.h"
 
 #ifndef TB_CLK_HZ
 #define TB_CLK_HZ 200000
@@ -226,7 +227,7 @@ static uint32_t Tg(const char *n)
 
 // guest control block (asm/common.i)
 enum { A_GO = 0x0F00, A_STOP = 0x0F04, A_DONE = 0x0F08, A_EXCNT = 0x0F0C, A_EXLOGP = 0x0F10, A_STATUS = 0x0F18,
-       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_CASEIX = 0x0F30, A_MARK1 = 0x0F40, A_MARK2 = 0x0F44, A_MARK3 = 0x0F48, A_MARK4 = 0x0F4C, A_MODE = 0x0F50, A_EXLOG = 0x1000, A_RECLOG = 0x4000 };
+       A_ITER = 0x0F20, A_UNEXP = 0x0F24, A_READY = 0x0F28, A_CASEIX = 0x0F30, A_MARK1 = 0x0F40, A_MARK2 = 0x0F44, A_MARK3 = 0x0F48, A_MARK4 = 0x0F4C, A_MODE = 0x0F50, A_EXLOG = 0x80000, A_RECLOG = 0x4000 };
 
 //------------------------------------------------------------------ monitors
 // CIR bus cycles (CPU space type 2) seen on the 68030 pins
@@ -245,6 +246,7 @@ static Cir cur;
 // mailbox polls seen on the arbiter's d3 port, and the presence scoreboard
 struct Poll { uint64_t clk; bool hb; uint16_t data; };
 static std::vector<Poll> polls;
+static unsigned n_kind[8];                       // request KIND words posted (1 execute, 2 reset, 3 condition)
 static std::vector<uint64_t> req_start_magic;   // clock of each MAGIC read request
 static bool prev_d3_req = false;
 static bool pr_prev = false;
@@ -261,7 +263,7 @@ static int sb_last_was = 0;                      // 1 magic bad, 2 hb unchanged,
 static void monitors_reset()
 {
 	cirs.clear(); instr_idx = 0; other_berr = 0; n_cycles = 0; prev_as = false; cur_term = false; cur_is_cir = false;
-	polls.clear(); req_start_magic.clear(); prev_d3_req = false;
+	polls.clear(); req_start_magic.clear(); prev_d3_req = false; memset(n_kind, 0, sizeof n_kind);
 	pr_prev = false; pr_fall = pr_rise = 0; pr_falls.clear(); pr_rises.clear(); pr_fall_unch.clear();
 	sb_alive = 0; sb_unch = 0; sb_last_hb = 0; sb_exp = sb_next = false; sb_eff = 0; sb_mismatch = 0; sb_first_mismatch.clear();
 	sb_last_was = 0;
@@ -303,12 +305,18 @@ static void sample()
 	prev_d3_req = rq;
 	if (g_clk >= sb_eff) sb_exp = sb_next;
 	if (g_por) { sb_alive = 0; sb_unch = 0; sb_exp = sb_next = false; }
-	else if (T->o_d3_ack && !T->o_d3_we) {
+	else if (T->o_d3_ack && T->o_d3_we && T->o_d3_addr == (0xE90102 >> 1)) {
+		unsigned kd = T->o_d3_wdata;
+		if (kd < 8) n_kind[kd]++;
+	} else if (T->o_d3_ack && !T->o_d3_we) {
 		unsigned wa = T->o_d3_addr;
 		uint16_t d = T->o_d3_rdata;
 		if (wa == (0xE90000 >> 1)) {                 // MAGIC
 			polls.push_back({g_clk, false, d});
 			if (d != MAGIC) sb_alive = 0;
+		} else if (wa == (0xE90204 >> 1) && getenv("M2_SEQ")) {   // debugging: reply FPSR high words
+			static FILE *df = fopen("obj/d3_fpsr.log", "w");
+			if (df) fprintf(df, "%llu reply FPSR[31:16]=%04x\n", (unsigned long long)g_clk, d);
 		} else if (wa == (0xE90004 >> 1)) {          // VERSION: anything but 2 means absent
 			polls.push_back({g_clk, false, d});
 			if (d != VERSION) sb_alive = 0;
@@ -537,7 +545,7 @@ static std::vector<ExEnt> exlog()
 {
 	std::vector<ExEnt> v;
 	uint32_t n = gr32(A_EXCNT);
-	for (uint32_t i = 0; i < n && i < 256; i++) {
+	for (uint32_t i = 0; i < n && i < 8192; i++) {
 		uint32_t a = A_EXLOG + 32 * i;
 		v.push_back({gr32(a), gr32(a + 4), gr32(a + 8), gr32(a + 12), gr32(a + 16), gr32(a + 20)});
 	}
@@ -560,7 +568,7 @@ static void bus_checks(const char *tag)
 		bool firsttype = (!c.rw && (c.off == 0x0A || c.off == 0x0E || c.off == 0x06)) || (c.rw && c.off == 0x04);
 		bool lng = c.off == 0x10 || c.off == 0x18 || c.off == 0x1C;
 		const char *term = c.berr ? "BERR" : (c.ds0 && c.ds1) ? "DSACK1+0" : c.ds1 ? "DSACK1" : "DSACK0";
-		if (lf)
+		if (lf && i < 60000)
 			fprintf(lf, "%llu %llu %llu cp%u $%02X %s %08X %s %d\n", (unsigned long long)c.clk0, (unsigned long long)c.clk1,
 			        (unsigned long long)c.instr, c.id, c.off, c.rw ? "R" : "W", c.data, term, c.present);
 		auto bad = [&](const char *why) {
@@ -620,6 +628,35 @@ static void bus_checks(const char *tag)
 		}
 		i = j;
 	}
+	// refused opmodes (bridge header): opclass 000/010 command words with opmode $6E-$77 are answered with the F-line
+	// primitive ($1C0B), $78-$7F with vector 4 ($1C04), before any operand is transferred
+	unsigned n_ref = 0, n_ref_bad = 0;
+	std::string ref_bad;
+	for (size_t i = 0; i < cirs.size();) {
+		size_t j = i;
+		while (j < cirs.size() && cirs[j].instr == cirs[i].instr) j++;
+		const Cir &w = cirs[i];
+		unsigned cmdw = (w.data >> 16) & 0xFFFF;
+		unsigned opm = cmdw & 0x7F, cls = cmdw >> 13;
+		bool fmovecr = cls == 2 && ((cmdw >> 10) & 7) == 7;
+		if (w.id == 1 && !w.rw && w.off == 0x0A && !w.berr && (cls == 0 || cls == 2) && !fmovecr && opm >= 0x6E) {
+			n_ref++;
+			unsigned want = opm < 0x78 ? 0x1C0B : 0x1C04, gotr = 0xFFFF;
+			bool operand = false;
+			for (size_t k = i + 1; k < j; k++) {
+				if (cirs[k].off == 0x10) operand = true;
+				if (cirs[k].off == 0x00 && cirs[k].rw && gotr == 0xFFFF) gotr = cirs[k].data >> 16;
+			}
+			if (operand || gotr != want) {
+				n_ref_bad++;
+				if (ref_bad.empty()) ref_bad = fmt("clk %llu cmd %04X: response %04X expected %04X, operand transfer %d", (unsigned long long)w.clk0, cmdw, gotr, want, operand);
+			}
+		}
+		i = j;
+	}
+	check_eq("bus", fmt("refused opmodes ($6E-$7F, %u instructions): not answered with $1C0B/$1C04 or with an operand transfer", n_ref), 0, n_ref_bad,
+	         "bridge header: $6E-$77 F-line ($1C0B), $78-$7F vector 4 ($1C04), before any operand; Hatari fault_if_nonexisting_opmode", 1);
+	if (!ref_bad.empty()) printf("        first: %s\n", ref_bad.c_str());
 	check_eq("bus", fmt("FSAVE/FRESTORE dialogues (%u saves, %u restores) whose operand CIR transfer count differs from the frame size", n_saves, n_rests), 0,
 	         n_frm_bad, "MC68030 UM 10.5.4/10.5.5: body = size byte of the format word ($38 = 14 longs, null = none)", 1);
 	if (!frm_bad.empty()) printf("        first: %s\n", frm_bad.c_str());
@@ -1208,7 +1245,7 @@ static std::map<std::string, uint32_t> load_syms(const char *lst)
 	while (fgets(line, sizeof line, f)) {
 		char nm[256], sec[8];
 		unsigned a;
-		if (sscanf(line, "%255s %2[0-9]:%x", nm, sec, &a) == 3) m[nm] = a;
+		if (sscanf(line, "%255s %2[0-9A-Za-z]:%x", nm, sec, &a) == 3) m[nm] = a;
 	}
 	fclose(f);
 	return m;
@@ -1236,74 +1273,157 @@ static std::string ram_hex(uint32_t a, int n)
 	return s;
 }
 
+static std::vector<M2Exc> case_exc(const std::vector<ExEnt> &ex, int i)
+{
+	std::vector<M2Exc> v;
+	for (auto &e : ex)
+		if (e.ix == (uint32_t)i && !(e.vec == 7 && e.fmt == 2)) v.push_back({e.vec, e.fmt, e.pc});   // (taken FTRAPcc are counted by the program)
+	return v;
+}
+
 static void sc_cases()
 {
 	m2_build();
-	std::map<std::string, uint32_t> syms = load_syms("obj/t_cases.lst");
-	begin_test("M2 generated cases vs the Hatari golden", "t_cases");
-	m2_load_ram(ddr.data());
-	m2_run_golden(syms);
-	set_pacing(true);
-	child_start();
-	release_reset();
-	bool ok = run_until(present, 20 * POLL_CLKS);
-	check_true("presence", "`present` rises with the real service", ok, "bridge header");
-	run_until(is_ready, 800000);
-	steps(2000);
-	gw32(A_GO, 1);
-	// run to the end; stop when no case makes progress for 5 watchdog periods
-	uint32_t last = ~0u;
-	uint64_t last_clk = g_clk;
-	while (!is_done() && g_clk < 400000000ull) {
-		steps(1000);
-		uint32_t cx = gr32(A_CASEIX);
-		if (cx != last) { last = cx; last_clk = g_clk; }
-		else if (g_clk - last_clk > 5ull * CLK_HZ / 10) break;
-	}
-	check_true("run", fmt("program reached its done marker (clk %llu, case %u of %d)", (unsigned long long)g_clk, gr32(A_CASEIX), m2_ncases()),
-	           is_done(), "test harness");
-	collect();
-	auto ex = exlog();
 	const char *G = "m2";
-	unsigned npass = 0, nfail = 0, nimp = 0, nimpok = 0, ngap = 0;
+	unsigned npass = 0, nfail = 0, nimp = 0, nimpok = 0, ngap = 0, tot_kind3 = 0, tot_gold3 = 0, tot_exec = 0;
 	std::string gap_first;
+	std::map<std::string, std::pair<unsigned, unsigned> > grp;     // per group: pass, fail
 	FILE *fpl = fopen("obj/m2_fpiar.log", "w");
-	for (int i = 0; i < m2_ncases(); i++) {
-		M2Result r = m2_compare(ddr.data(), i);
-		if (fpl && r.done) fprintf(fpl, "%d %s: FPIAR golden %08x device %08x\n", i, m2_name(i), r.fpiar_exp, r.fpiar_got);
-		std::string tag = std::string(m2_group(i)) + "] " + m2_name(i);
-		bool imm = m2_expects_imm(i);
-		if (imm) { nimp++; if (r.ok) nimpok++; }
-		if (r.ok) {
-			npass++;
-			report(true, G, fmt("[%s: every FP register, FPCR, FPSR, integer registers and memory equal to the golden; expected %s got identical", tag.c_str(), r.summary.c_str()),
-			       imm ? "Hatari fpp.c golden; #imm D/X/P/multi accepted per MC68881 UM 7.4" : "Hatari fpp.c golden");
-		} else {
-			nfail++;
-			std::string d;
-			if (!r.done) {
-				d = "case did not run to its end";
-				for (auto &e : ex)
-					if (e.ix == (uint32_t)i) d += fmt("; exception vector %u format %u at pc %08x", e.vec, e.fmt, e.pc);
+	for (int ch = 0; ch < m2_nchunks(); ch++) {
+		std::string prog = fmt("t_cases%d", ch);
+		std::map<std::string, uint32_t> syms = load_syms(fmt("obj/%s.lst", prog.c_str()).c_str());
+		begin_test(fmt("M2/M3 generated cases vs the Hatari golden, chunk %d (cases %d-%d)", ch, m2_chunk_first(ch), m2_chunk_end(ch) - 1).c_str(), prog.c_str());
+		m2_load_ram(ddr.data(), ch);
+		m2_run_golden(syms, ch);
+		set_pacing(true);
+		child_start();
+		release_reset();
+		bool ok = run_until(present, 20 * POLL_CLKS);
+		check_true("presence", "`present` rises with the real service", ok, "bridge header");
+		run_until(is_ready, 800000);
+		steps(2000);
+		gw32(A_GO, 1);
+		// run to the end; stop when no case makes progress for 5 watchdog periods
+		uint32_t last = ~0u;
+		uint64_t last_clk = g_clk;
+		while (!is_done() && g_clk < 600000000ull) {
+			steps(1000);
+			uint32_t cx = gr32(A_CASEIX);
+			if (cx != last) { last = cx; last_clk = g_clk; }
+			else if (g_clk - last_clk > 5ull * CLK_HZ / 10) break;
+		}
+		check_true("run", fmt("chunk %d reached its done marker (clk %llu, case %u)", ch, (unsigned long long)g_clk, gr32(A_CASEIX)), is_done(), "test harness");
+		collect();
+		auto ex = exlog();
+		for (int i = m2_chunk_first(ch); i < m2_chunk_end(ch); i++) {
+			M2Result r = m2_compare(ddr.data(), i, case_exc(ex, i));
+			std::string tag = std::string(m2_group(i)) + "] " + m2_name(i);
+			bool imm = m2_expects_imm(i);
+			if (imm) { nimp++; if (r.ok) nimpok++; }
+			if (fpl && r.done) fprintf(fpl, "%d %s: FPIAR golden %08x device %08x\n", i, m2_name(i), r.fpiar_exp, r.fpiar_got);
+			if (r.ok) {
+				npass++;
+				grp[m2_group(i)].first++;
+				report(true, G, fmt("[%s: every FP register, FPCR, FPSR, integer registers, memory%s equal to the golden; expected %s got identical", tag.c_str(),
+				                   r.nexc ? " and the expected exceptions" : "", r.summary.c_str()), "Hatari fpp.c golden");
+			} else {
+				nfail++;
+				grp[m2_group(i)].second++;
+				std::string d;
+				if (!r.done) {
+					d = "case did not run to its end";
+					for (auto &e : ex)
+						if (e.ix == (uint32_t)i) d += fmt("; exception vector %u format %u at pc %08x", e.vec, e.fmt, e.pc);
+				}
+				for (auto &x : r.diffs) d += fmt("; %s expected %s got %s", x.what.c_str(), x.exp.c_str(), x.got.c_str());
+				report(false, G, fmt("[%s: %s%s", tag.c_str(), r.summary.c_str(), (" -> " + d).c_str()), "Hatari fpp.c golden");
 			}
-			for (auto &x : r.diffs) d += fmt("; %s expected %s got %s", x.what.c_str(), x.exp.c_str(), x.got.c_str());
-			report(false, G, fmt("[%s: %s%s", tag.c_str(), r.summary.c_str(), (" -> " + d).c_str()),
-			       imm ? "Hatari fpp.c golden; #imm D/X/P/multi accepted per MC68881 UM 7.4 (AP68030 cp_ea_ok category 110 = ea_mem excludes #imm?)" : "Hatari fpp.c golden");
+			if (r.fpiar_diff && r.done) {
+				ngap++;
+				if (gap_first.empty()) gap_first = fmt("case %d %s: expected FPIAR %08x got %08x", i, m2_name(i), r.fpiar_exp, r.fpiar_got);
+			}
 		}
-		if (r.fpiar_diff && r.done) {
-			ngap++;
-			if (gap_first.empty()) gap_first = fmt("case %d %s: expected FPIAR %08x got %08x", i, m2_name(i), r.fpiar_exp, r.fpiar_got);
-		}
+		tot_kind3 += n_kind[3];
+		tot_exec += n_kind[1];
+		tot_gold3 += m2_golden_cond_requests();
+		bus_checks(fmt("m2_cases%d", ch).c_str());
+		ddr_checks();
+		check_eq("run", "ARM service still alive at the end (child not exited)", 0, child_exited ? 1 : 0, "tools/falcon_fpu", 1);
+		child_reap();
 	}
 	if (fpl) fclose(fpl);
+	for (auto &g : grp) printf("  group %-12s %u pass, %u fail\n", g.first.c_str(), g.second.first, g.second.second);
 	printf("  summary: %u cases pass, %u fail; #imm/multi-register immediate cases %u of which %u pass\n", npass, nfail, nimp, nimpok);
-	// FPIAR is part of the dump compared with the golden (Hatari leaves FPIAR alone except for
-	// FMOVE to FPIAR, so the golden value is the one the program wrote); mismatches among cases that ran to their end:
 	check_eq(G, "cases (that ran to their end) whose dumped FPIAR differs from the golden", 0, ngap, "Hatari fpp.c golden; bridge header: FPIAR not loaded from the instruction address yet", 1);
 	if (ngap) printf("        first: %s\n", gap_first.c_str());
-	bus_checks("m2_cases");
-	ddr_checks();
-	check_eq("run", "ARM service still alive at the end (child not exited)", 0, child_exited ? 1 : 0, "tools/falcon_fpu", 1);
+	check_eq(G, fmt("condition requests (KIND 3) posted to the ARM (of %u execute requests): only IEEE-nonaware predicates with NAN set", tot_exec),
+	         tot_gold3, tot_kind3, "bridge header: KIND 3 only for nonaware predicates with NAN; golden = count of fpp_cond evaluations with (cc & 0x10) and FPSR NAN", 1);
+}
+
+static void gen_m3(const char *)
+{
+	m3_build();
+	for (int c = 0; c < m3_nchunks(); c++) {
+		std::string p = fmt("obj/gen_m3_%d.s", c);
+		FILE *f = fopen(p.c_str(), "w");
+		if (!f) { perror("gen m3"); exit(2); }
+		fprintf(f, "; generated by tb_fpu --gen (tb/fpu/m3.cpp): chunk %d\n", c);
+		m3_emit_asm(f, c);
+		fclose(f);
+	}
+}
+
+static void sc_m3()
+{
+	m3_build();
+	unsigned tot_items = 0, tot_bad = 0, tot_groups = 0, tot_gbad = 0;
+	for (int ch = 0; ch < m3_nchunks(); ch++) {
+		std::string prog = fmt("t_m3%d", ch);
+		std::map<std::string, uint32_t> syms = load_syms(fmt("obj/%s.lst", prog.c_str()).c_str());
+		begin_test(fmt("M3 arithmetic sweeps vs the Hatari golden, chunk %d of %d", ch, m3_nchunks()).c_str(), prog.c_str());
+		m3_load_ram(ddr.data(), ch);
+		m3_run_golden(syms, ch);
+		set_pacing(true);
+		child_start();
+		release_reset();
+		bool ok = run_until(present, 20 * POLL_CLKS);
+		check_true("presence", "`present` rises with the real service", ok, "bridge header");
+		run_until(is_ready, 800000);
+		steps(2000);
+		gw32(A_GO, 1);
+		size_t last_n = 0;
+		uint64_t last_clk = g_clk;
+		while (!is_done() && g_clk < 900000000ull) {
+			steps(2000);
+			if (cirs.size() != last_n) { last_n = cirs.size(); last_clk = g_clk; }
+			else if (g_clk - last_clk > 5ull * CLK_HZ / 10) break;
+		}
+		check_true("run", fmt("chunk %d reached its done marker (clk %llu, %zu CIR cycles)", ch, (unsigned long long)g_clk, cirs.size()), is_done() && m3_done(ddr.data(), ch), "test harness");
+		auto ex = exlog();
+		std::vector<M2Exc> ev;
+		for (auto &e : ex) ev.push_back({e.vec, e.fmt, e.pc});
+		std::string ed;
+		bool eok;
+		unsigned nsoft;
+		std::vector<M3Group> gs = m3_compare(ddr.data(), ch, ev, ed, eok, nsoft);
+		for (auto &g : gs) {
+			tot_groups++;
+			tot_items += g.items;
+			tot_bad += g.bad;
+			if (g.bad) tot_gbad++;
+			if (!g.bad)
+				report(true, "m3", fmt("%s: %u items, all 80-bit results, FPSR (cc, quotient, exception, accrued bytes) equal to the golden; expected identical got identical", g.name.c_str(), g.items), "Hatari fpp.c golden");
+			else
+				report(false, "m3", fmt("%s: %u of %u items differ%s", g.name.c_str(), g.bad, g.items, g.detail.c_str()), "Hatari fpp.c golden");
+		}
+		report(eok, "m3", fmt("exceptions at refused opmodes: %u expected (vector 11 / 4 at the instruction, format 0), got %zu%s", nsoft, ev.size(), eok ? ", identical" : (" -> " + ed).c_str()),
+		       "bridge header: $6E-$77 F-line, $78-$7F vector 4; Hatari fault_if_nonexisting_opmode");
+		bus_checks(fmt("m3_%d", ch).c_str());
+		ddr_checks();
+		check_eq("run", "ARM service still alive at the end (child not exited)", 0, child_exited ? 1 : 0, "tools/falcon_fpu", 1);
+		child_reap();
+	}
+	printf("  m3 summary: %u groups (%u with differences), %u items, %u differing\n", tot_groups, tot_gbad, tot_items, tot_bad);
 }
 
 // background execution, FSAVE while busy, watchdog -----------------------------------------------
@@ -1494,12 +1614,18 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (!strncmp(argv[i], "--gen=", 6)) {          // write the generated cases as 68k assembly and stop
 			m2_build();
-			FILE *f = fopen(argv[i] + 6, "w");
-			if (!f) { perror("gen"); return 2; }
-			fprintf(f, "; generated by tb_fpu --gen (tb/fpu/m2.cpp): %d cases\n", m2_ncases());
-			m2_emit_asm(f);
-			fclose(f);
-			printf("generated %d cases\n", m2_ncases());
+			for (int c = 0; c < m2_nchunks(); c++) {
+				std::string p = fmt("%s_%d.s", argv[i] + 6, c);
+				FILE *f = fopen(p.c_str(), "w");
+				if (!f) { perror("gen"); return 2; }
+				fprintf(f, "; generated by tb_fpu --gen (tb/fpu/m2.cpp): chunk %d, cases %d-%d\n", c, m2_chunk_first(c), m2_chunk_end(c) - 1);
+				m2_emit_asm(f, c);
+				fclose(f);
+			}
+			gen_m3(argv[i] + 6);
+			printf("generated %d cases in %d chunks\n", m2_ncases(), m2_nchunks());
+			FILE *nf = fopen("obj/gen_chunks.txt", "w");
+			if (nf) { fprintf(nf, "%d %d\n", m2_nchunks(), m3_nchunks()); fclose(nf); }
 			return 0;
 		}
 		if (!strncmp(argv[i], "--host=", 7)) host_exe = argv[i] + 7;
@@ -1543,6 +1669,7 @@ int main(int argc, char **argv)
 	    {"rawna", sc_rawna},
 	    {"straddle", sc_straddle},
 	    {"m2cases", sc_cases},
+	    {"m3sweeps", sc_m3},
 	    {"m2bg", sc_bg},
 	    {"m2busy", sc_busy},
 	    {"m2wd_stop", [] { sc_wd(0); }},

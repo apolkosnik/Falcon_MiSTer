@@ -54,14 +54,16 @@ void gold_scc(uint32_t iaddr, uint16_t op, uint16_t cond, const uint16_t *ext, i
 	fpe_shim_use_buffer();
 }
 
+/* fpp.c's own condition evaluation including its side effects (an IEEE-nonaware predicate with NAN set
+ * sets FPSR BSUN and accrued IOP; -2 = BSUN enabled: the instruction takes the exception).  The pending
+ * exception is dropped at once, as the service does for the condition request. */
 int gold_cond(int cc)
 {
-	uint32_t s = fpe_fpsr();
 	int r = fpe_cond(cc);
-	fpe_set_fpsr(s);                      /* a BSUN status bit set by the test is not part of the state */
 	fpe_clear_exception();
 	return r;
 }
+int gold_last_vector(void) { return (int)fpe_vector(); }
 
 uint32_t gold_fpsr(void) { return fpe_fpsr(); }
 uint32_t gold_fpcr(void) { return fpe_fpcr(); }

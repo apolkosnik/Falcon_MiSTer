@@ -7,6 +7,9 @@
 main:
 	move.l	sp,SAVESP
 	move.l	#1,ABORTMODE
+	lea	h_exc,a0		; expected soft exceptions: vector 4 (refused opmodes), 48 (BSUN)
+	move.l	a0,(4*4).w
+	move.l	a0,(48*4).w
 	WAITGO
 	include	"gen_cases.s"
 	jmp	finish

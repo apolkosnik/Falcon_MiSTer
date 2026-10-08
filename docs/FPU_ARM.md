@@ -1,6 +1,6 @@
 # MC68882 FPU served by the ARM - design
 
-Status (branch `feature/fpu-arm`): milestones 1-2 done.  Presence, frames and
+Status (branch `feature/fpu-arm`): milestones 1-3 done.  Presence, frames and
 detection; full instruction dialogs in `rtl/falcon/falcon_fpu_bridge.sv`, requests
 executed by `tools/falcon_fpu` with Hatari's `fpp.c` (`tools/falcon_fpu/engine`),
 verified by `tb/fpu` against Hatari driven with real EAs.  Milestone 2 needed two

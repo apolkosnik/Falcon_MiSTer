@@ -40,6 +40,12 @@
 //     (core/ap030_exec_c.vh S_CPMULT3): the reply holds the memory image in
 //     ascending order, so its 12-byte blocks are sent last block first.
 //   opclass 001 and an empty control register list: F-line ($1C0B).
+//   Opmodes (cmd[6:0]) of opclasses 000/010: as Hatari's fpp.c models the
+//     6888x (fault_if_nonexisting_opmode, after WinUAE's tests of the real
+//     chips) most undocumented opmodes execute as aliases; $42, $43,
+//     $46-$57, $59, $5B, $5D, $5F, $61, $65, $69-$6B, $6D-$77 are refused
+//     with F-line ($1C0B) and $78-$7F with illegal instruction (vector 4,
+//     $1C04), at the instruction, before any operand (OP_FLINE).
 //   A reply flagged "not implemented" for an instruction the CPU waits on:
 //     F-line.
 // Busy: a command or condition word written while a request is outstanding
@@ -57,18 +63,24 @@
 // (format error).
 //
 // Conditionals: the predicate is evaluated from the FPSR condition codes of
-// the last reply (N, Z, I, NAN) once no request is outstanding; BSUN
-// (IEEE-nonaware predicate, NAN set, FPCR BSUN enabled) answers the
-// pre-instruction exception primitive with vector 48.
+// the last reply (N, Z, I, NAN) with Hatari's 6888x table (COND_TAB) once no
+// request is outstanding.  An
+// IEEE-nonaware predicate ($10-$1F) with NAN set also sets BSUN and the
+// accrued IOP in the FPSR, and raises the BSUN exception if it is enabled
+// (Hatari fpp_cond/fpsr_set_bsun): that case goes to the ARM as a condition
+// request (KIND 3, the predicate in CMD); the reply's FLAGS bit 2 is the
+// result, bit 1 the BSUN exception (pre-instruction exception primitive,
+// vector 48, $1C30).
 //
 // Mailbox (guest $E90000, DDR3 0x30E90000; 16-bit words big endian, bytes
 // in memory order: DDR3 byte k = guest byte k):
 //   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (2)   ARM -> FPGA
 //   request, RSEQ written last (FPGA -> ARM):
-//   +$100 RSEQ  +$102 KIND (1 execute, 2 reset)  +$104 CMD  +$106 AUX (Dn
+//   +$100 RSEQ  +$102 KIND (1 execute, 2 reset, 3 condition)  +$104 CMD  +$106 AUX (Dn
 //   for a dynamic list or k-factor)  +$108 NBYTES  +$110.. operand bytes
 //   reply, ASEQ written last (ARM -> FPGA):
-//   +$200 ASEQ  +$202 FLAGS (bit 0 not implemented)  +$204 FPSR[31:16]
+//   +$200 ASEQ  +$202 FLAGS (bit 0 not implemented, 1 exception, 2 condition
+//   true)  +$204 FPSR[31:16]
 //   +$206 FPSR[15:0]  +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes
 // Operand and result words move between the operand CIR and the mailbox
 // directly (a CIR access waits for its one or two 16-bit DDR3 accesses).
@@ -111,6 +123,7 @@ localparam [15:0] R_CA    = 16'h8900;   // null, CA, IA: come again
 localparam [15:0] R_FLINE = 16'h1C0B;   // take pre-instruction exception, vector 11
 localparam [15:0] R_BSUN  = 16'h1C30;   // take pre-instruction exception, vector 48
 localparam [15:0] R_PROTO = 16'h1D0D;   // take mid-instruction exception, vector 13
+localparam [15:0] R_ILL   = 16'h1C04;   // take pre-instruction exception, vector 4
 localparam [15:0] R_MIN   = 16'h810C;   // transfer multiple coprocessor registers, to the FPU
 localparam [15:0] R_MOUT  = 16'hA10C;   // ... from the FPU
 
@@ -131,7 +144,6 @@ localparam [23:0] A_RDATA = MB + 24'h110;
 localparam [23:0] A_ASEQ  = MB + 24'h200;
 localparam [23:0] A_FLAGS = MB + 24'h202;
 localparam [23:0] A_FPSRH = MB + 24'h204;
-localparam [23:0] A_FPCR  = MB + 24'h208;
 localparam [23:0] A_ADATA = MB + 24'h210;
 localparam [15:0] MAGIC   = 16'h4650;
 localparam [15:0] VERSION = 16'd2;
@@ -152,34 +164,24 @@ localparam [4:0] T_IDLE  = 5'd0,  T_CIR   = 5'd1,  T_DMA   = 5'd2,
                  T_OST1  = 5'd3,  T_OSTD  = 5'd4,  T_OLD1  = 5'd5,  T_OLDD  = 5'd6,
                  T_PKIND = 5'd7,  T_PCMD  = 5'd8,  T_PAUX  = 5'd9,  T_PNB   = 5'd10,
                  T_PSEQ  = 5'd11, T_PDONE = 5'd12,
-                 T_QSEQ  = 5'd13, T_QFLG  = 5'd14, T_QFPSR = 5'd15, T_QFPCR = 5'd16,
+                 T_QSEQ  = 5'd13, T_QFLG  = 5'd14, T_QFPSR = 5'd15,
                  T_QDONE = 5'd18,
                  T_SMAG  = 5'd19, T_SVER  = 5'd20, T_SHB   = 5'd21;
 
 // ---------------------------------------------------------------------------
-// Conditional predicates (UM conditional tests): the low four bits select
-// the test; predicates $10-$1F are the IEEE-nonaware forms of $00-$0F.
+// Conditional predicates: Hatari's condition_table_6888x (fpp.c), indexed by
+// the FPSR condition codes {N, Z, I, NAN} and the predicate's low four bits
+// ($10-$1F repeat $00-$0F).  It is the UM's conditional test table for every
+// code combination arithmetic produces, plus the 6888x results for the
+// others (e.g. Z and NAN together, only from a move to the FPSR).
+// Generated from fpp.c; bit (cc * 16 + predicate).
 // ---------------------------------------------------------------------------
-function automatic pred_true(input [3:0] p, input n, input z, input nan);
-    case (p)
-        4'h0: pred_true = 1'b0;                       // F
-        4'h1: pred_true = z;                          // EQ
-        4'h2: pred_true = !(nan || z || n);           // OGT
-        4'h3: pred_true = z || !(nan || n);           // OGE
-        4'h4: pred_true = n && !(nan || z);           // OLT
-        4'h5: pred_true = z || (n && !nan);           // OLE
-        4'h6: pred_true = !(nan || z);                // OGL
-        4'h7: pred_true = !nan;                       // OR
-        4'h8: pred_true = nan;                        // UN
-        4'h9: pred_true = nan || z;                   // UEQ
-        4'hA: pred_true = nan || !(n || z);           // UGT
-        4'hB: pred_true = nan || z || !n;             // UGE
-        4'hC: pred_true = nan || (n && !z);           // ULT
-        4'hD: pred_true = nan || z || n;              // ULE
-        4'hE: pred_true = !z;                         // NE
-        default: pred_true = 1'b1;                    // T
-    endcase
-endfunction
+localparam [255:0] COND_TAB = 256'hffaaaaaaffaaaaaaff00f0f0ff00f0f0ffaaaaaaffaaaaaaff00ccccff00cccc;
+
+// Opmodes a 6888x refuses (Hatari fpp.c fault_if_nonexisting_opmode, with
+// fpu_no_unimplemented false): F-line for these, illegal instruction for
+// $78-$7F; every other opmode executes (documented, or as an alias).
+localparam [127:0] OP_FLINE = 128'h00ffee22aaffffcc0000000000000000;
 
 // operand size of a data format (UM table 2-?): L S X P W D B (P with a
 // dynamic k-factor, out only, as 7)
@@ -228,7 +230,6 @@ reg  [15:0]   cond;
 reg  [15:0]   aux;
 reg           phase2;               // the Dn of a dynamic list/k-factor is in
 reg  [3:0]    fcc;                  // FPSR condition codes {N, Z, I, NAN}
-reg           bsun_en;
 reg  [3:0]    frm_cnt;
 reg           frm_save;
 reg  [15:0]   rest_fmt;
@@ -244,10 +245,13 @@ reg  [2:0]    xn;                   // bytes in this operand access
 // requests and replies
 reg           busy = 1'b0;          // a request is outstanding
 reg           post_req = 1'b0;      // post the request built in the mailbox
-reg           post_kind;            // 0 execute, 1 reset
+reg  [1:0]    post_kind;            // 1 execute, 2 reset, 3 condition
 reg           rst_req = 1'b0;       // the ARM FPU has to be reset
 reg  [15:0]   rseq = 16'd0;
 reg           r_unimpl;
+reg           r_exc;                // reply: exception (BSUN of a condition request)
+reg           r_tf;                 // reply: condition result
+reg           cond_arm;             // the condition went to the ARM
 reg           dead;                 // the watchdog ended the last request
 reg  [WW-1:0] wd;
 reg  [5:0]    gap;
@@ -268,8 +272,11 @@ wire [7:0]  fsz      = fmt_size(fmt);
 wire [3:0]  nmask    = popcount8(mask);
 wire [7:0]  mm_len   = {nmask, 3'd0} + {1'b0, nmask, 2'd0};    // 12 per register
 
-wire        tf       = pred_true(cond[3:0], fcc[3], fcc[2], fcc[0]);
-wire        bsun     = cond[4] && fcc[0] && bsun_en;
+wire        tf       = COND_TAB[{fcc, cond[3:0]}];
+wire        cond_nan = cond[4] && fcc[0];       // IEEE-nonaware with NAN: BSUN
+wire [6:0]  opmode   = cmd[6:0];
+wire        op_fline = OP_FLINE[opmode];
+wire        op_ill   = opmode >= 7'h78;
 
 // offset in the reply data of the current output position
 wire [7:0]  oblk     = {4'd0, out_pd ? (nblk - 4'd1 - out_blk) : out_blk};
@@ -302,14 +309,19 @@ endtask
 // response of its dialog
 task automatic start_cmd;
     case (opclass)
-        3'b000: begin                                    // reg-to-reg
-            in_len <= 8'd0; post_req <= 1'b1; post_kind <= 1'b0;
-            resp <= R_REL; dst <= D_IDLE;
-        end
+        3'b000:                                          // reg-to-reg
+            if (op_fline || op_ill) begin
+                resp <= op_ill ? R_ILL : R_FLINE; dst <= D_IDLE;
+            end else begin
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
+                resp <= R_REL; dst <= D_IDLE;
+            end
         3'b010:
             if (fmt == 3'b111) begin                     // FMOVECR
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 1'b0;
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
                 resp <= R_REL; dst <= D_IDLE;
+            end else if (op_fline || op_ill) begin
+                resp <= op_ill ? R_ILL : R_FLINE; dst <= D_IDLE;
             end else begin
                 in_len <= fsz; in_pos <= 8'd0;
                 resp <= {fsz > 8'd4 ? 8'h96 : 8'h95, fsz}; dst <= D_IN;
@@ -318,7 +330,7 @@ task automatic start_cmd;
             if (fmt == 3'b111 && !phase2) begin          // packed, dynamic k
                 resp <= {13'h1180, dn_reg}; dst <= D_DN;
             end else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 1'b0;
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
                 resp <= R_CA; dst <= D_WAIT;
             end
         3'b100:
@@ -332,7 +344,7 @@ task automatic start_cmd;
         3'b101:
             if (ncr == 4'd0) begin resp <= R_FLINE; dst <= D_IDLE; end
             else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 1'b0;
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
                 resp <= R_CA; dst <= D_WAIT;
             end
         3'b110:
@@ -341,7 +353,7 @@ task automatic start_cmd;
         3'b111:
             if (dyn_list && !phase2) begin resp <= {13'h1180, dn_reg}; dst <= D_DN; end
             else begin
-                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 1'b0;
+                in_len <= 8'd0; post_req <= 1'b1; post_kind <= 2'd1;
                 resp <= R_CA; dst <= D_WAIT;
             end
         default: begin resp <= R_FLINE; dst <= D_IDLE; end   // opclass 001
@@ -406,7 +418,7 @@ always @(posedge clk) begin
             else if (post_req && present)               st <= T_PKIND;
             else if (rst_req && !busy && present && !reset) begin
                 post_req  <= 1'b1;
-                post_kind <= 1'b1;
+                post_kind <= 2'd2;
                 in_len    <= 8'd0;
                 rst_req   <= 1'b0;
                 st        <= T_PKIND;
@@ -441,9 +453,10 @@ always @(posedge clk) begin
                         ack(32'hFFFF_FFFF);
                     end
                     CIR_COND: begin
-                        st_null <= 1'b0;
-                        cond    <= cr_word;
-                        dead    <= 1'b0;
+                        st_null  <= 1'b0;
+                        cond     <= cr_word;
+                        cond_arm <= 1'b0;
+                        dead     <= 1'b0;
                         dst     <= D_COND;
                         ack(32'hFFFF_FFFF);
                     end
@@ -460,7 +473,6 @@ always @(posedge clk) begin
                         if (cr_word[15:8] == 8'h00) begin   // null frame: reset
                             st_null  <= 1'b1;
                             fcc      <= 4'd0;
-                            bsun_en  <= 1'b0;
                             rst_req  <= 1'b1;
                             post_req <= 1'b0;
                             rest_fmt <= cr_word;
@@ -512,15 +524,26 @@ always @(posedge clk) begin
                                 else if (dead) begin
                                     dead <= 1'b0; dst <= D_IDLE; resp <= R_IDLE;
                                     ack({R_PROTO, R_PROTO});
+                                end else if (cond_arm) begin  // the ARM's answer
+                                    cond_arm <= 1'b0;
+                                    dst  <= D_IDLE;
+                                    resp <= R_IDLE;
+                                    ack(r_exc ? {R_BSUN, R_BSUN} : {2{15'h0400, r_tf}});
+                                end else if (cond_nan) begin  // BSUN: ask the ARM
+                                    cond_arm  <= 1'b1;
+                                    in_len    <= 8'd0;
+                                    post_req  <= 1'b1;
+                                    post_kind <= 2'd3;
+                                    ack({R_CA, R_CA});
                                 end else begin
                                     dst  <= D_IDLE;
                                     resp <= R_IDLE;
-                                    ack(bsun ? {R_BSUN, R_BSUN} : {2{15'h0400, tf}});
+                                    ack({2{15'h0400, tf}});
                                 end
                             D_IN:
                                 if (in_pos >= in_len) begin // operand complete: post
                                     post_req  <= 1'b1;
-                                    post_kind <= 1'b0;
+                                    post_kind <= 2'd1;
                                     dst       <= D_IDLE;
                                     resp      <= R_IDLE;
                                     ack(opclass == 3'b010 ? {R_REL, R_REL} : {R_IDLE, R_IDLE});
@@ -609,8 +632,8 @@ always @(posedge clk) begin
         end
 
         // ---- post a request: header, RSEQ last ----
-        T_PKIND: dma(1'b1, A_KIND, post_kind ? 16'd2 : 16'd1, 2'b11, T_PCMD);
-        T_PCMD:  dma(1'b1, A_CMD, cmd, 2'b11, T_PAUX);
+        T_PKIND: dma(1'b1, A_KIND, {14'd0, post_kind}, 2'b11, T_PCMD);
+        T_PCMD:  dma(1'b1, A_CMD, post_kind == 2'd3 ? {10'd0, cond[5:0]} : cmd, 2'b11, T_PAUX);
         T_PAUX:  dma(1'b1, A_AUX, aux, 2'b11, T_PNB);
         T_PNB:   dma(1'b1, A_RNB, {8'd0, in_len}, 2'b11, T_PSEQ);
         T_PSEQ:  dma(1'b1, A_RSEQ, rseq + 1'd1, 2'b11, T_PDONE);
@@ -631,15 +654,13 @@ always @(posedge clk) begin
             end
         T_QFLG: begin
             r_unimpl <= rd_q[0];
+            r_exc    <= rd_q[1];
+            r_tf     <= rd_q[2];
             dma(1'b0, A_FPSRH, 16'd0, 2'b11, T_QFPSR);
         end
-        T_QFPSR: begin
+        T_QFPSR: begin                      // (FPCR and the result length are not needed)
             fcc <= rd_q[11:8];
-            dma(1'b0, A_FPCR, 16'd0, 2'b11, T_QFPCR);
-        end
-        T_QFPCR: begin                      // (the result length follows from the dialog)
-            bsun_en <= rd_q[15];
-            st      <= T_QDONE;
+            st  <= T_QDONE;
         end
         T_QDONE: begin
             busy <= 1'b0;
@@ -670,10 +691,10 @@ always @(posedge clk) begin
         dst      <= D_IDLE;
         resp     <= R_IDLE;
         fcc      <= 4'd0;
-        bsun_en  <= 1'b0;
         frm_cnt  <= 4'd0;
         rest_fmt <= 16'h0000;
         dead     <= 1'b0;
+        cond_arm <= 1'b0;
         rst_req  <= 1'b1;               // reset the FPU on the ARM too
         if (st != T_PKIND && st != T_PCMD && st != T_PAUX && st != T_PNB && st != T_PSEQ)
             post_req <= 1'b0;

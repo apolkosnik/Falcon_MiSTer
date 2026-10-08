@@ -19,13 +19,16 @@
  * memory order (DDR3 byte k = guest byte k), so they are copied as is.
  *   +$000 MAGIC $4650  +$002 HEARTBEAT  +$004 VERSION (2)
  *   request (FPGA -> ARM), RSEQ written last:
- *   +$100 RSEQ  +$102 KIND (1 execute, 2 reset)  +$104 CMD  +$106 AUX
+ *   +$100 RSEQ  +$102 KIND (1 execute, 2 reset, 3 condition)  +$104 CMD  +$106 AUX
  *   +$108 NBYTES  +$10A IADDR[31:16]  +$10C IADDR[15:0]  +$110.. operand bytes
  *   reply (ARM -> FPGA), ASEQ written last:
  *   +$200 ASEQ  +$202 FLAGS  +$204 FPSR[31:16]  +$206 FPSR[15:0]
  *   +$208 FPCR[15:0]  +$20A NBYTES  +$210.. result bytes
  * FLAGS: bit 0 the instruction is not implemented (the bridge answers it
- * with the F-line exception), bit 1 an exception is pending (milestone 4).
+ * with the F-line exception), bit 1 an exception is pending (milestone 4;
+ * for a condition request: the BSUN exception), bit 2 the condition is true.
+ * A condition request (the bridge sends only IEEE-nonaware predicates with
+ * NAN set: they set BSUN/IOP in the FPSR) carries the predicate in CMD.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -57,7 +60,7 @@ enum { O_MAGIC = 0x000, O_HB = 0x002, O_VERSION = 0x004,
        O_ASEQ = 0x200, O_FLAGS = 0x202, O_FPSR = 0x204, O_FPCR = 0x208,
        O_ANBYTES = 0x20A, O_ADATA = 0x210 };
 
-enum { KIND_EXEC = 1, KIND_RESET = 2 };
+enum { KIND_EXEC = 1, KIND_RESET = 2, KIND_COND = 3 };
 
 static volatile uint8_t *mb;
 static volatile sig_atomic_t quit;
@@ -108,7 +111,14 @@ static void serve(uint16_t seq, int verbose)
 
 	if (kind == KIND_RESET)
 		fpe_reset();
-	else
+	else if (kind == KIND_COND) {
+		int r = fpe_cond(cmd & 0x3f);
+		if (r == -2) {              /* BSUN enabled: the bridge raises it now */
+			flags = 2;
+			fpe_clear_exception();
+		} else if (r)
+			flags = 4;
+	} else
 		flags = fpe_exec(cmd, in, n, aux, iaddr, out, &out_len);
 	if (out_len < 0 || out_len > MAX_BYTES) out_len = 0;
 

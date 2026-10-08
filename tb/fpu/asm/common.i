@@ -26,11 +26,12 @@ CASEIX		equ	$0F30		; long: generated case being run
 RESUME		equ	$0F34		; long: where an aborted case continues
 SAVESP		equ	$0F38		; long: stack pointer at the start of the case program
 ABORTMODE	equ	$0F3C		; long: non-zero: unexpected exceptions abort the current case
+SOFTEXC		equ	$0F54		; long: non-zero: an expected pre-instruction exception is stepped over (SKIP)
 MARK1		equ	$0F40		; longs: progress markers of the hand written M2 programs
 MARK2		equ	$0F44
 MARK3		equ	$0F48
 MARK4		equ	$0F4C
-EXLOG		equ	$1000		; 32-byte entries: vector, format, PC, IA, SR
+EXLOG		equ	$80000		; 32-byte entries: vector, format, PC, IA, SR, case index (8192 entries)
 RECLOG		equ	$4000		; (tag, value) longs, ends with tag 0
 BUF		equ	$8000
 BUF2		equ	$8100
@@ -124,10 +125,15 @@ h_exc:
 	logexc
 	tst.l	ABORTMODE
 	beq.s	hx0
-	cmp.l	#7,d0			; case mode: TRAPcc is counted, everything else aborts the case
-	bne	habort
+	cmp.l	#7,d0			; case mode: TRAPcc is counted, expected soft exceptions are stepped over
+	bne.s	hxs
+	cmp.l	#2,d1			; (a BSUN pre-instruction exception, vector 48, has format 0)
+	bne.s	hxs
 	addq.l	#1,TRAPCNT
 	bra.s	hx2
+hxs:	tst.l	SOFTEXC
+	bne.s	hx0
+	bra	habort
 hx0:	cmp.l	#11,d0
 	bne.s	hx1
 	move.b	#1,FLHIT

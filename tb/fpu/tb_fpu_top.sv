@@ -60,6 +60,7 @@ module tb_fpu_top #(
     output            o_d3_we,
     output     [23:1] o_d3_addr,
     output     [15:0] o_d3_rdata,
+    output     [15:0] o_d3_wdata,
     output            o_d3_ack
 );
 
@@ -177,6 +178,6 @@ assign o_dsack0_n = dsack0_n, o_dsack1_n = dsack1_n, o_berr_n = berr_n;
 assign o_dbg_inst = cpu_dbg_inst, o_dbg_pc = dbg_pc, o_halted = cpu_halted, o_reset_oe = cpu_reset_oe;
 assign o_cp_req = cp_req, o_cp_we = cp_we, o_cp_id = cp_id, o_cp_off = cp_off;
 assign o_cp_ack = cp_ack, o_cp_berr = cp_berr, o_present = fpu_present;
-assign o_d3_req = d3_req, o_d3_we = d3_we, o_d3_addr = d3_addr, o_d3_rdata = d3_rdata, o_d3_ack = d3_ack;
+assign o_d3_req = d3_req, o_d3_we = d3_we, o_d3_addr = d3_addr, o_d3_rdata = d3_rdata, o_d3_wdata = d3_wdata, o_d3_ack = d3_ack;
 
 endmodule

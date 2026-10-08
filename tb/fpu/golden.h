@@ -21,7 +21,8 @@ uint32_t gold_getreg(int r);
 int gold_exec(uint32_t iaddr, uint16_t op, uint16_t cmd, const uint16_t *ext, int next);
 /* FScc <ea> */
 void gold_scc(uint32_t iaddr, uint16_t op, uint16_t cond, const uint16_t *ext, int next);
-/* condition predicate cc (0..31) against the current FPSR without changing the state */
+/* condition predicate cc (0..31) as fpp.c evaluates it (side effects on FPSR included); -2: BSUN exception */
+int gold_last_vector(void);                          /* vector of the last exception/unimplemented event */
 int gold_cond(int cc);
 uint32_t gold_fpsr(void);
 uint32_t gold_fpcr(void);

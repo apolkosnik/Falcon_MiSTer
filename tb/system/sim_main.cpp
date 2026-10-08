@@ -83,6 +83,11 @@ static void fpu_serve(void)
     if (n > FPE_MAXIO) n = FPE_MAXIO;
     for (int i = 0; i < n; i++) in[i] = guest_rd8(MB + 0x110 + i);
     if (kind == 2) fpe_reset();
+    else if (kind == 3) {                               // condition (BSUN cases)
+        int r = fpe_cond(cmd & 0x3f);
+        if (r == -2) { flags = 2; fpe_clear_exception(); }
+        else if (r) flags = 4;
+    }
     else flags = fpe_exec(cmd, in, n, aux, 0, out, &out_len);
     if (out_len < 0 || out_len > FPE_MAXIO) out_len = 0;
     for (int i = 0; i < out_len; i++) guest_wr8(MB + 0x210 + i, out[i]);

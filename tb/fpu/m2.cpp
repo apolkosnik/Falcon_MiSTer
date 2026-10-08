@@ -12,7 +12,9 @@
 #include "m2.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 
 #include "golden.h"
 
@@ -22,20 +24,27 @@ enum { M_DN, M_AN, M_IND, M_POST, M_PRE, M_D16, M_IMM };
 enum { F_L, F_S, F_X, F_P, F_W, F_D, F_B };               // cmd size field
 
 const uint32_t WBASE = 0x100000, DBASE = 0x300000;
-const uint32_t SRC = 0x10, DST = 0x80, CND = 0x100, FPI = 0x180, NULLF = 0x1E0;
-const uint32_t CASE_STRIDE = 0x200, DUMP_STRIDE = 0x100;
+const uint32_t SRC = 0x10, DST = 0x80, CND = 0x800, BPA = 0x840, FPI = 0xF80, NULLF = 0xFE0;
+const uint32_t CASE_STRIDE = 0x1000, DUMP_STRIDE = 0x100;
+const int CHUNK = 400;                                     // cases per program image (ROM is 512 KB)
 
 struct Insn {
 	uint16_t op = 0, cmd = 0;
 	std::vector<uint16_t> ext;
 	bool reset = false;                                    // FRESTORE (a6) of the null frame
 	bool scc = false;                                      // FScc <ea>: cmd is the predicate
+	bool soft = false;                                     // an exception is expected: the handler steps over it
+	int ckind = 0;                                         // conditional helpers: 1 FScc (a5)+ style, 2 FBcc, 3 FDBcc, 4 FTRAPcc
+	int pred = 0;
+	uint32_t slot = 0;                                     // window offset of the result byte(s)
+	std::vector<std::pair<int, uint32_t> > pre;            // registers loaded just before the instruction (0-7 D, 8-14 A)
 };
 
 struct Case {
 	std::string group, name;
 	uint32_t d[8], a[6];
-	std::vector<uint8_t> mem;                              // 0x200 bytes
+	std::vector<uint8_t> mem;                              // CASE_STRIDE bytes
+	bool soft_cond = false;                                // conditionals may raise BSUN: step over them
 	uint32_t fpcr = 0;
 	std::vector<Insn> body;
 	std::vector<int> spreds;                               // FScc (a5)+ predicates
@@ -46,8 +55,8 @@ struct Case {
 std::vector<Case> cases;
 std::vector<uint8_t> golden_img;                           // golden RAM after the run
 
-uint32_t W(int i) { return WBASE + (uint32_t)i * CASE_STRIDE; }
-uint32_t DU(int i) { return DBASE + (uint32_t)i * DUMP_STRIDE; }
+uint32_t W(int i) { return WBASE + (uint32_t)(i % CHUNK) * CASE_STRIDE; }
+uint32_t DU(int i) { return DBASE + (uint32_t)(i % CHUNK) * DUMP_STRIDE; }
 
 // -------------------------------------------------------------- operand data
 typedef std::vector<uint8_t> Bytes;
@@ -195,14 +204,15 @@ Insn make(Case &c, uint16_t cmd, int mode, int reg, uint32_t off, int size, cons
 			if (size == 1) v |= 0xDEADBE00u;
 			if (size == 2) v |= 0xDEAD0000u;
 			c.d[reg] = v;
+			n.pre.push_back({reg, v});
 		}
 		break;
 	case M_AN:
-		if (src) { uint32_t v = 0; for (uint8_t b : *src) v = (v << 8) | b; c.a[reg] = v; }
+		if (src) { uint32_t v = 0; for (uint8_t b : *src) v = (v << 8) | b; c.a[reg] = v; n.pre.push_back({8 + reg, v}); }
 		break;
-	case M_IND: case M_POST: c.a[reg] = addr; break;
-	case M_PRE: c.a[reg] = addr + (uint32_t)size; break;
-	case M_D16: c.a[reg] = addr - 0x20; n.ext.push_back(0x20); break;
+	case M_IND: case M_POST: c.a[reg] = addr; n.pre.push_back({8 + reg, addr}); break;
+	case M_PRE: c.a[reg] = addr + (uint32_t)size; n.pre.push_back({8 + reg, addr + (uint32_t)size}); break;
+	case M_D16: c.a[reg] = addr - 0x20; n.pre.push_back({8 + reg, addr - 0x20}); n.ext.push_back(0x20); break;
 	case M_IMM:
 		if (src) {
 			if (src->size() == 1) n.ext.push_back((*src)[0]);
@@ -451,10 +461,12 @@ void g_cond()
 	    {"FCMP FP1,FP0 (greater)", 1, 0, 0, 1, 0}, {"FCMP FP0,FP1 (less)", 1, 0, 0, 0, 1}, {"FCMP FP0,FP0 (equal)", 1, 0, 0, 0, 0},
 	    {"FCMP FP6,FP0 (NaN)", 1, 0, 0, 6, 0}, {"FTST FP5 (inf)", 2, 0, 0, 5, 0}, {"FTST FP4 (-0)", 2, 0, 0, 4, 0},
 	    {"FTST FP6 (NaN)", 2, 0, 0, 6, 0}, {"FTST FP3 (+0)", 2, 0, 0, 3, 0}};
-	std::vector<int> all, few = {1, 2, 4, 8, 0x0E, 0x17, 0x0F, 0x10, 0x1D};
+	std::vector<int> all;
 	for (int p = 0; p < 32; p++) all.push_back(p);
+	for (int bs = 0; bs < 2; bs++)
 	for (const Prod &p : prods) {
-		Case &c = new_case("cond", std::string("after ") + p.n, 0, 0);
+		Case &c = new_case("cond", std::string("after ") + p.n + (bs ? " FPCR BSUN enabled" : ""), 0, bs ? 0x8000u : 0u);
+		c.soft_cond = true;
 		if (p.kind == 0) {
 			Bytes v = be(p.v, fsize(p.fmt));
 			c.body.push_back(make(c, cmd_in(p.fmt, 0, 0x00), M_IND, 0, SRC, fsize(p.fmt), &v));
@@ -463,7 +475,23 @@ void g_cond()
 		else
 			c.body.push_back(regreg(p.a, 0, 0x3A));
 		c.spreds = all;
-		c.bpreds = few;
+		c.bpreds = all;
+	}
+}
+
+// -------------------------------------------------------------- all 16 condition code combinations x 32 predicates
+// (FPSR written directly, so combinations no instruction produces are included)
+void g_cctable()
+{
+	std::vector<int> all;
+	for (int p = 0; p < 32; p++) all.push_back(p);
+	for (int cc = 0; cc < 16; cc++) {
+		Case &c = new_case("cctable", "FPSR cc=" + std::string(1, "0123456789ABCDEF"[cc]) + " {N Z I NAN}=" + std::to_string((cc >> 3) & 1) + std::to_string((cc >> 2) & 1) + std::to_string((cc >> 1) & 1) + std::to_string(cc & 1), 0, 0);
+		c.soft_cond = true;
+		Bytes v = be((uint32_t)cc << 24, 4);
+		c.body.push_back(make(c, 0x8800, M_IMM, 0, 0, 4, &v));
+		c.spreds = all;
+		c.bpreds = {0x01, 0x0E, 0x0A, 0x1E};
 	}
 }
 
@@ -495,6 +523,161 @@ void g_reset()
 	}
 }
 
+// -------------------------------------------------------------- group 10: random streams
+static const int DOCOPS[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x14, 0x15, 0x16,
+                             0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                             0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x3A};
+
+// opmodes Hatari's fault_if_nonexisting_opmode refuses (fpp.c): F-line ($42, $43, $46-$57, $59, ... $6D) and from $6E-$77, vector 4 for $78-$7F
+bool hatari_refused(int op)
+{
+	static const int l[] = {0x42, 0x43, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+	                        0x57, 0x59, 0x5b, 0x5d, 0x5f, 0x61, 0x65, 0x69, 0x6a, 0x6b, 0x6d};
+	if (op >= 0x6E) return true;
+	for (int x : l) if (x == op) return true;
+	return false;
+}
+
+bool documented(int op)
+{
+	for (int d : DOCOPS) if (d == op) return true;
+	return false;
+}
+
+void g_random(int nseq)
+{
+	std::mt19937 rg(0xF9B20003u);
+	auto R = [&](uint32_t n) { return (uint32_t)(rg() % n); };
+	auto rbytes = [&](int n) { Bytes b((size_t)n); for (auto &x : b) x = (uint8_t)rg(); return b; };
+	auto value = [&](int fmt) -> Bytes {
+		if (R(2)) return data_of(fmt, (int)R(32));
+		Bytes b = rbytes(fsize(fmt));
+		if (fmt == F_X) { b[2] = b[3] = 0; }
+		return b;
+	};
+	for (int sq = 0; sq < nseq; sq++) {
+		uint32_t fpcr = (R(4) << 4) | ((R(4) == 0 ? 1 : R(3) == 0 ? 2 : 0) << 6);
+		if (R(8) == 0) fpcr |= 0x8000;                    // BSUN enabled
+		bool keep = !getenv("M2_SEQ") || atoi(getenv("M2_SEQ")) == sq;          // debugging aid: one sequence only (same random stream)
+		Case &c = new_case("random", "sequence " + std::to_string(sq), (int)R(3), fpcr);
+		c.soft_cond = true;
+		int n = 12 + (int)R(9);
+		int ncond = 0;
+		for (int k = 0; k < n; k++) {
+			uint32_t soff = (uint32_t)k * 0x60, doff = soff + 0x30;
+			int kind = (int)R(100);
+			if (kind < 18) {                                // FMOVE <ea>,FPn
+				int fmt = (int)R(7);
+				bool small = fmt == F_B || fmt == F_W || fmt == F_L || fmt == F_S;
+				int ms[] = {M_IND, M_POST, M_PRE, M_D16, M_IMM, M_DN};
+				int m = ms[R(small ? 6 : 5)];
+				Bytes v = value(fmt);
+				c.body.push_back(make(c, cmd_in(fmt, (int)R(8), 0x00), m, 0, soff, fsize(fmt), &v));
+			} else if (kind < 32) {                         // FMOVE FPn,<ea>
+				int fmt = (int)R(7);
+				bool small = fmt == F_B || fmt == F_W || fmt == F_L || fmt == F_S;
+				int ms[] = {M_IND, M_POST, M_PRE, M_D16, M_DN};
+				int m = ms[R(small ? 5 : 4)];
+				int kf = 0;
+				if (fmt == F_P) kf = (int)R(2) ? (int)R(18) : -(int)R(8);
+				if (fmt == F_P && R(4) == 0) {              // dynamic k-factor in D3
+					Insn n2 = make(c, cmd_out(7, (int)R(8), 3 << 4), R(2) ? M_IND : M_D16, 0, doff, 12, nullptr);
+					n2.pre.push_back({3, 0xAB000000u | R(0x80)});
+					c.d[3] = n2.pre.back().second;
+					c.body.push_back(n2);
+				} else
+					c.body.push_back(make(c, cmd_out(fmt, (int)R(8), kf), m, 0, doff, fsize(fmt), nullptr));
+			} else if (kind < 52) {                         // arithmetic, register to register
+				int op;
+				uint32_t t = R(100);
+				bool soft = false;
+				if (t < 88) op = DOCOPS[R(sizeof(DOCOPS) / sizeof(DOCOPS[0]))];
+				else { do op = (int)R(0x6E); while (documented(op) || hatari_refused(op)); }
+				Insn n2 = regreg((int)R(8), (int)R(8), op);
+				n2.soft = soft;
+				c.body.push_back(n2);
+			} else if (kind < 64) {                         // arithmetic from memory
+				int fmt = (int)R(7);
+				bool small = fmt == F_B || fmt == F_W || fmt == F_L || fmt == F_S;
+				int ms[] = {M_IND, M_POST, M_PRE, M_D16, M_IMM, M_DN};
+				int m = ms[R(small ? 6 : 5)];
+				int op;
+				uint32_t t = R(100);
+				bool soft = false;
+				if (t < 85) op = DOCOPS[R(sizeof(DOCOPS) / sizeof(DOCOPS[0]))];
+				else if (t < 95) { do op = (int)R(0x6E); while (documented(op) || hatari_refused(op)); }
+				else { op = 0x6E + (int)R(18); soft = true; }
+				Bytes v = value(fmt);
+				Insn n2 = make(c, cmd_in(fmt, (int)R(8), op), m, 0, soff, fsize(fmt), &v);
+				n2.soft = soft;
+				if (soft) {                                  // no operand transfer: a post-increment/pre-decrement register is not touched
+				}
+				c.body.push_back(n2);
+			} else if (kind < 68) {                         // FMOVECR
+				Insn n2;
+				n2.op = 0xF200;
+				n2.cmd = (uint16_t)(0x5C00 | (R(8) << 7) | (R(3) ? (R(2) ? 0x30 + R(16) : 0x0B + R(5)) : R(0x80)));
+				c.body.push_back(n2);
+			} else if (kind < 76) {                         // control register moves
+				int l = 1 + (int)R(7);
+				int nreg = ((l & 1) ? 1 : 0) + ((l & 2) ? 1 : 0) + ((l & 4) ? 1 : 0);
+				bool one = nreg == 1;
+				bool in = R(2);
+				Bytes v;
+				if (l & 1) { Bytes b = be((R(4) << 4) | ((R(3)) << 6) | (R(10) == 0 ? 0x8000 : 0), 4); v.insert(v.end(), b.begin(), b.end()); }
+				if (l & 2) { Bytes b = be(rg() & 0x0FFFFFF8u, 4); v.insert(v.end(), b.begin(), b.end()); }
+				if (l & 4) { Bytes b = be(rg(), 4); v.insert(v.end(), b.begin(), b.end()); }
+				if (in) {
+					std::vector<int> ms = {M_IND, M_POST, M_D16, M_IMM};
+					if (one) ms.push_back(M_DN);
+					if (one && l == 4) ms.push_back(M_AN);
+					c.body.push_back(make(c, (uint16_t)(0x8000 | crlist(l)), ms[R((uint32_t)ms.size())], 0, soff, 4 * nreg, &v));
+				} else {
+					std::vector<int> ms = {M_IND, M_PRE, M_D16};
+					if (one) ms.push_back(M_DN);
+					if (one && l == 4) ms.push_back(M_AN);
+					c.body.push_back(make(c, (uint16_t)(0xA000 | crlist(l)), ms[R((uint32_t)ms.size())], 0, doff, 4 * nreg, nullptr));
+				}
+			} else if (kind < 86) {                         // FMOVEM.X
+				int mask = (int)R(256);
+				int nr = 0;
+				for (int b = 0; b < 8; b++) nr += (mask >> b) & 1;
+				if (nr > 4) { mask &= 0x0F << (int)(R(2) * 4); nr = 0; for (int b = 0; b < 8; b++) nr += (mask >> b) & 1; }
+				bool dyn = R(3) == 0;
+				if (R(2)) {                                  // into the FPU
+					static const int mi3[3] = {M_IND, M_POST, M_D16};
+					int m = mi3[R(3)];
+					Bytes img = rbytes(12 * (nr ? nr : 1));
+					for (size_t b = 0; b + 12 <= img.size(); b += 12) { img[b + 2] = img[b + 3] = 0; }
+					uint16_t cmd = dyn ? (uint16_t)(0xD800 | (2 << 4)) : (uint16_t)(0xD000 | mask);
+					Insn n2 = make(c, cmd, m, 0, soff, 12 * nr, &img);
+					if (dyn) { n2.pre.push_back({2, 0xCD000000u | (uint32_t)mask}); c.d[2] = n2.pre.back().second; }
+					c.body.push_back(n2);
+				} else {
+					static const int mo3[3] = {M_PRE, M_IND, M_D16};
+					int m = mo3[R(3)];
+					uint16_t base = (m == M_PRE) ? (dyn ? 0xE800 : 0xE000) : (dyn ? 0xF800 : 0xF000);
+					uint16_t cmd = dyn ? (uint16_t)(base | (2 << 4)) : (uint16_t)(base | mask);
+					Insn n2 = make(c, cmd, m, 0, doff, 12 * nr, nullptr);
+					if (dyn) { n2.pre.push_back({2, 0xCD000000u | (uint32_t)mask}); c.d[2] = n2.pre.back().second; }
+					c.body.push_back(n2);
+				}
+			} else {                                        // conditionals
+				if (ncond >= 30) { k--; continue; }
+				Insn n2;
+				n2.ckind = 1 + (int)R(4);
+				if (n2.ckind == 1 && R(2)) n2.ckind = 2;
+				n2.pred = (int)R(32);
+				n2.slot = BPA + 4 * (uint32_t)ncond;
+				if (n2.ckind == 1) n2.slot = 0;
+				ncond++;
+				c.body.push_back(n2);
+			}
+		}
+		if (!keep) cases.pop_back();
+	}
+}
+
 // -------------------------------------------------------------- walking a case
 struct Sink {
 	virtual ~Sink() {}
@@ -502,7 +685,7 @@ struct Sink {
 	virtual void setreg(int r, uint32_t v) = 0;
 	virtual void fpu(const Insn &n, int k) = 0;
 	virtual void reset() = 0;
-	virtual void scc(int p, uint32_t a5) = 0;
+	virtual void scc(int p, uint32_t a5, bool soft) = 0;
 	virtual void mbcc(int p, uint32_t addr) = 0;
 	virtual void mdbcc(int p, uint32_t addr) = 0;
 	virtual void mtrap(int p, uint32_t addr) = 0;
@@ -528,14 +711,19 @@ void walk(int i, Sink &s)
 	s.fpu(fc, k++);
 	for (int r = 0; r < 8; r++) s.setreg(r, c.d[r]);
 	for (int r = 0; r < 6; r++) s.setreg(8 + r, c.a[r]);
+	uint32_t a5 = W(i) + CND;
 	for (const Insn &n : c.body) {
+		for (auto &pr : n.pre) s.setreg(pr.first, pr.second);
 		if (n.reset) { s.setreg(14, W(i) + NULLF); s.reset(); }
+		else if (n.ckind == 1) { s.scc(n.pred, a5, true); a5++; }
+		else if (n.ckind == 2) s.mbcc(n.pred, W(i) + n.slot);
+		else if (n.ckind == 3) s.mdbcc(n.pred, W(i) + n.slot + 1);
+		else if (n.ckind == 4) s.mtrap(n.pred, W(i) + n.slot + 3);
 		else s.fpu(n, k++);
 	}
-	uint32_t a5 = W(i) + CND;
-	for (int p : c.spreds) { s.scc(p, a5); a5++; }
+	for (int p : c.spreds) { s.scc(p, a5, c.soft_cond); a5++; }
 	for (size_t b = 0; b < c.bpreds.size(); b++) {
-		uint32_t base = W(i) + 0x140 + 4 * (uint32_t)b;
+		uint32_t base = W(i) + BPA + 4 * (uint32_t)b;
 		s.mbcc(c.bpreds[b], base);
 		s.mdbcc(c.bpreds[b], base + 1);
 		s.mtrap(c.bpreds[b], base + 3);
@@ -554,11 +742,12 @@ void walk(int i, Sink &s)
 
 struct AsmSink : Sink {
 	FILE *f;
-	int ci = 0;
+	int ci = 0, nc = 0;
 	explicit AsmSink(FILE *fp) : f(fp) {}
 	void begin(int i, const Case &c) override
 	{
 		ci = i;
+		nc = 0;
 		fprintf(f, "; ---- case %d: %s / %s\n", i, c.group.c_str(), c.name.c_str());
 		fprintf(f, "case%d:\n\tmove.l\t#%d,CASEIX\n\tlea\tend%d(pc),a0\n\tmove.l\ta0,RESUME\n", i, i, i);
 	}
@@ -572,58 +761,92 @@ struct AsmSink : Sink {
 	}
 	void fpu(const Insn &n, int k) override
 	{
+		if (n.soft) fprintf(f, "\tmove.l\t#%d,SKIP\n\tmove.l\t#1,SOFTEXC\n", 2 * (2 + (int)n.ext.size()));
 		fprintf(f, "L%d_%d:\tdc.w\t$%04X,$%04X", ci, k, n.op, n.cmd);
 		for (uint16_t e : n.ext) fprintf(f, ",$%04X", e);
 		fprintf(f, "\n");
+		if (n.soft) fprintf(f, "\tclr.l\tSOFTEXC\n");
 	}
 	void reset() override { fprintf(f, "\tdc.w\t$F356\t\t; frestore (a6)\n"); }
-	void scc(int p, uint32_t) override { fprintf(f, "\tdc.w\t$F255,$%04X\t; fscc (a5)\n\taddq.l\t#1,a5\n", p); }
-	void mbcc(int p, uint32_t a) override { fprintf(f, "\tM2BCC\t%d,$%X\n", p, a); }
-	void mdbcc(int p, uint32_t a) override { fprintf(f, "\tM2DBCC\t%d,$%X\n", p, a); }
-	void mtrap(int p, uint32_t a) override { fprintf(f, "\tM2TRAP\t%d,$%X\n", p, a); }
+	void scc(int p, uint32_t, bool soft) override
+	{
+		if (soft) fprintf(f, "\tmove.l\t#4,SKIP\n\tmove.l\t#1,SOFTEXC\n");
+		fprintf(f, "L%d_c%d:\tdc.w\t$F255,$%04X\t; fscc (a5)\n", ci, nc++, p);
+		if (soft) fprintf(f, "\tclr.l\tSOFTEXC\n");
+		fprintf(f, "\taddq.l\t#1,a5\n");
+	}
+	void mbcc(int p, uint32_t a) override { fprintf(f, "\tM2BCC\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); }
+	void mdbcc(int p, uint32_t a) override { fprintf(f, "\tM2DBCC\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); }
+	void mtrap(int p, uint32_t a) override { fprintf(f, "\tM2TRAP\t%d,$%X,L%d_c%d\n", p, a, ci, nc++); }
 	void dumpregs(uint32_t a) override { fprintf(f, "\tmovem.l\td0-d7/a0-a6,$%X\n", a); }
 	void marker(uint32_t a, uint32_t v) override { fprintf(f, "\tmove.l\t#$%08X,$%X\n", v, a); }
 	void end(int i) override { fprintf(f, "end%d:\n", i); }
 };
 
+struct ExpExc { int vec; std::string label; };
 std::vector<std::string> gold_notes;                       // golden exceptions per case
+std::vector<std::vector<ExpExc> > gold_exc;                // exceptions the case must take (refused opmodes, BSUN)
+std::map<std::string, uint32_t> cur_syms;
+unsigned gold_cond_reqs = 0;                               // nonaware predicates evaluated with NAN set (go to the ARM)
+
 struct GoldSink : Sink {
-	const std::map<std::string, uint32_t> &syms;
-	int ci = 0;
-	explicit GoldSink(const std::map<std::string, uint32_t> &s) : syms(s) {}
-	void begin(int i, const Case &) override { ci = i; gold_reset(); }
+	int ci = 0, nc = 0;
+	void begin(int i, const Case &) override { ci = i; nc = 0; gold_reset(); }
 	void setreg(int r, uint32_t v) override { gold_setreg(r, v); }
 	void fpu(const Insn &n, int k) override
 	{
 		char lb[32];
 		snprintf(lb, sizeof lb, "L%d_%d", ci, k);
-		auto it = syms.find(lb);
-		uint32_t addr = it == syms.end() ? 0 : it->second;
+		auto it = cur_syms.find(lb);
+		uint32_t addr = it == cur_syms.end() ? 0 : it->second;
 		if (n.scc) { gold_scc(addr, n.op, n.cmd, n.ext.empty() ? nullptr : n.ext.data(), (int)n.ext.size()); return; }
 		int fl = gold_exec(addr, n.op, n.cmd, n.ext.empty() ? nullptr : n.ext.data(), (int)n.ext.size());
-		if (fl) gold_notes[(size_t)ci] += " golden flags " + std::to_string(fl) + " at " + lb;
+		if (fl & GOLD_UNIMPL) {
+			if (n.soft) gold_exc[(size_t)ci].push_back({gold_last_vector(), lb});
+			else gold_notes[(size_t)ci] += " golden flags " + std::to_string(fl) + " at " + lb;
+		} else if (fl)
+			gold_notes[(size_t)ci] += " golden flags " + std::to_string(fl) + " at " + lb;
 	}
 	void reset() override { gold_reset(); }
-	void scc(int p, uint32_t a5) override
+	// condition: -2 = BSUN exception (the instruction is stepped over), 0/1 = result
+	int cond(int p)
 	{
-		gold_ram()[a5] = gold_cond(p) ? 0xFF : 0x00;
+		char lb[32];
+		snprintf(lb, sizeof lb, "L%d_c%d", ci, nc++);
+		if ((p & 0x10) && (gold_fpsr() & 0x01000000u)) gold_cond_reqs++;
+		uint32_t before = gold_fpsr();
+		int r = gold_cond(p);
+		if (getenv("M2_SEQ")) fprintf(stderr, "golden cond %s pred %02x fpsr before %08x after %08x -> %d\n", lb, p, before, gold_fpsr(), r);
+		if (r == -2) gold_exc[(size_t)ci].push_back({48, lb});
+		return r;
+	}
+	void scc(int p, uint32_t a5, bool) override
+	{
+		int r = cond(p);
+		if (r >= 0) gold_ram()[a5] = r ? 0xFF : 0x00;
 		gold_setreg(13, a5 + 1);
 	}
 	void mbcc(int p, uint32_t a) override
 	{
-		int tf = gold_cond(p) ? 1 : 0;
+		int r = cond(p);
+		int tf = r > 0 ? 1 : 0;
 		gold_setreg(7, (uint32_t)tf);
 		gold_ram()[a] = (uint8_t)tf;
 	}
 	void mdbcc(int p, uint32_t a) override
 	{
-		int tf = gold_cond(p) ? 1 : 0;
+		int r = cond(p);
+		int tf = r != 0 ? 1 : 0;                          // exception: stepped over, same registers as "true"
 		gold_setreg(6, tf ? 5u : 4u);
 		gold_setreg(7, tf ? 0u : 1u);
 		gold_ram()[a] = tf ? 0 : 1;
 		gold_ram()[a + 1] = tf ? 5 : 4;
 	}
-	void mtrap(int p, uint32_t a) override { gold_ram()[a] = gold_cond(p) ? 1 : 0; }
+	void mtrap(int p, uint32_t a) override
+	{
+		int r = cond(p);
+		gold_ram()[a] = r > 0 ? 1 : 0;
+	}
 	void dumpregs(uint32_t a) override
 	{
 		for (int r = 0; r < 15; r++) {
@@ -644,45 +867,60 @@ struct GoldSink : Sink {
 void m2_build()
 {
 	cases.clear();
-	g_fmove_in();
-	g_fmove_out();
-	g_fmovecr();
-	g_ctrl();
-	g_fmovem();
-	g_arith();
-	g_cond();
-	g_fscc_ea();
-	g_reset();
+	if (!getenv("M2_SEQ")) {
+		g_fmove_in();
+		g_fmove_out();
+		g_fmovecr();
+		g_ctrl();
+		g_fmovem();
+		g_arith();
+		g_cond();
+		g_cctable();
+		g_fscc_ea();
+		g_reset();
+	}
+	g_random(2200);
 	gold_notes.assign(cases.size(), "");
+	gold_exc.assign(cases.size(), {});
 }
 int m2_ncases() { return (int)cases.size(); }
+int m2_nchunks() { return ((int)cases.size() + CHUNK - 1) / CHUNK; }
+int m2_chunk_first(int c) { return c * CHUNK; }
+int m2_chunk_end(int c) { return std::min((c + 1) * CHUNK, (int)cases.size()); }
 const char *m2_group(int i) { return cases[(size_t)i].group.c_str(); }
 const char *m2_name(int i) { return cases[(size_t)i].name.c_str(); }
 bool m2_expects_imm(int i) { return cases[(size_t)i].imm_issue; }
 uint32_t m2_dump_addr(int i) { return DU(i); }
 uint32_t m2_marker(int i) { return 0xC0DE0000u + (uint32_t)i; }
 
-void m2_emit_asm(FILE *f)
+void m2_emit_asm(FILE *f, int chunk)
 {
 	AsmSink s(f);
-	for (int i = 0; i < m2_ncases(); i++) walk(i, s);
+	for (int i = m2_chunk_first(chunk); i < m2_chunk_end(chunk); i++) walk(i, s);
 }
 
-void m2_load_ram(uint8_t *ram)
+void m2_load_ram(uint8_t *ram, int chunk)
 {
-	for (int i = 0; i < m2_ncases(); i++)
+	for (int i = m2_chunk_first(chunk); i < m2_chunk_end(chunk); i++)
 		memcpy(ram + W(i), cases[(size_t)i].mem.data(), CASE_STRIDE);
 }
 
-void m2_run_golden(const std::map<std::string, uint32_t> &syms)
+void m2_run_golden(const std::map<std::string, uint32_t> &syms, int chunk)
 {
 	gold_init();
-	m2_load_ram(gold_ram());
-	GoldSink s(syms);
-	gold_notes.assign(cases.size(), "");
-	for (int i = 0; i < m2_ncases(); i++) walk(i, s);
+	memset(gold_ram(), 0, GOLD_RAM_SIZE);
+	m2_load_ram(gold_ram(), chunk);
+	cur_syms = syms;
+	gold_cond_reqs = 0;
+	GoldSink s;
+	for (int i = m2_chunk_first(chunk); i < m2_chunk_end(chunk); i++) {
+		gold_notes[(size_t)i].clear();
+		gold_exc[(size_t)i].clear();
+		walk(i, s);
+	}
 	golden_img.assign(gold_ram(), gold_ram() + GOLD_RAM_SIZE);
 }
+unsigned m2_golden_cond_requests() { return gold_cond_reqs; }
 
 static std::string hexs(const uint8_t *p, int n)
 {
@@ -692,7 +930,7 @@ static std::string hexs(const uint8_t *p, int n)
 	return s;
 }
 
-M2Result m2_compare(const uint8_t *ram, int i)
+M2Result m2_compare(const uint8_t *ram, int i, const std::vector<M2Exc> &got)
 {
 	M2Result r;
 	uint32_t d = DU(i), w = W(i);
@@ -704,24 +942,38 @@ M2Result m2_compare(const uint8_t *ram, int i)
 	uint32_t fpcr = ((uint32_t)g[d + 96] << 24) | ((uint32_t)g[d + 97] << 16) | ((uint32_t)g[d + 98] << 8) | g[d + 99];
 	snprintf(b, sizeof b, "golden: fpcr=%08x fpsr=%08x", fpcr, fpsr);
 	r.summary = b + gold_notes[(size_t)i];
-	auto add = [&](const std::string &what, const uint8_t *e, const uint8_t *gt, int n) {
-		if (r.diffs.size() < 6) r.diffs.push_back({what, hexs(e, n), hexs(gt, n)});
+	auto add = [&](const std::string &what, const std::string &e, const std::string &gt) {
+		if (r.diffs.size() < 6) r.diffs.push_back({what, e, gt});
 	};
 	bool bad = false;
-	// dump area (FPIAR excluded: reported separately)
 	for (int off = 0; off < 96; off += 12)
-		if (memcmp(g + d + off, ram + d + off, 12)) { bad = true; add("FP" + std::to_string(off / 12), g + d + off, ram + d + off, 12); }
-	if (memcmp(g + d + 96, ram + d + 96, 8)) { bad = true; add("FPCR/FPSR", g + d + 96, ram + d + 96, 8); }
+		if (memcmp(g + d + off, ram + d + off, 12)) { bad = true; add("FP" + std::to_string(off / 12), hexs(g + d + off, 12), hexs(ram + d + off, 12)); }
+	if (memcmp(g + d + 96, ram + d + 96, 8)) { bad = true; add("FPCR/FPSR", hexs(g + d + 96, 8), hexs(ram + d + 96, 8)); }
 	static const char *rn[15] = {"D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "A0", "A1", "A2", "A3", "A4", "A5", "A6"};
 	for (int k = 0; k < 15; k++)
-		if (memcmp(g + d + 108 + 4 * k, ram + d + 108 + 4 * k, 4)) { bad = true; add(rn[k], g + d + 108 + 4 * k, ram + d + 108 + 4 * k, 4); }
+		if (memcmp(g + d + 108 + 4 * k, ram + d + 108 + 4 * k, 4)) { bad = true; add(rn[k], hexs(g + d + 108 + 4 * k, 4), hexs(ram + d + 108 + 4 * k, 4)); }
 	for (int off = 0; off < (int)CASE_STRIDE; off += 4)
 		if (memcmp(g + w + off, ram + w + off, 4)) {
 			bad = true;
 			char nb[32];
 			snprintf(nb, sizeof nb, "mem[win+0x%03X]", off);
-			add(nb, g + w + off, ram + w + off, 4);
+			add(nb, hexs(g + w + off, 4), hexs(ram + w + off, 4));
 		}
+	// exceptions: the refused opmodes (vector 11 / 4) and BSUN (vector 48) at exactly the golden's instructions
+	const std::vector<ExpExc> &ex = gold_exc[(size_t)i];
+	bool exok = ex.size() == got.size();
+	for (size_t k = 0; exok && k < ex.size(); k++) {
+		auto it = cur_syms.find(ex[k].label);
+		if ((int)got[k].vec != ex[k].vec || got[k].fmt != 0 || it == cur_syms.end() || got[k].pc != it->second) exok = false;
+	}
+	if (!exok) {
+		bad = true;
+		std::string e, gt;
+		for (auto &x : ex) { auto it = cur_syms.find(x.label); e += " vec" + std::to_string(x.vec) + "@" + (it == cur_syms.end() ? x.label : std::to_string(it->second)); }
+		for (auto &x : got) gt += " vec" + std::to_string(x.vec) + "/fmt" + std::to_string(x.fmt) + "@" + std::to_string(x.pc);
+		add("exceptions", e.empty() ? "none" : e, gt.empty() ? "none" : gt);
+	}
+	r.nexc = (int)ex.size();
 	r.fpiar_exp = ((uint32_t)g[d + 104] << 24) | ((uint32_t)g[d + 105] << 16) | ((uint32_t)g[d + 106] << 8) | g[d + 107];
 	r.fpiar_got = ((uint32_t)ram[d + 104] << 24) | ((uint32_t)ram[d + 105] << 16) | ((uint32_t)ram[d + 106] << 8) | ram[d + 107];
 	r.fpiar_diff = r.fpiar_exp != r.fpiar_got;

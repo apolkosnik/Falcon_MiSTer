@@ -18,7 +18,7 @@
 #   ONLY=name                   run one scenario: detect_real detect_nosvc detect_badmagic detect_hb0
 #                               detect_badversion watch_freeze watch_magic watch_real frames cond gen
 #                               cpid_alive cpid_absent absent reset raw rawna straddle
-#                               m2cases m2bg m2busy m2wd_stop m2wd_nosvc m2wd_presence
+#                               m2cases m3sweeps m2bg m2busy m2wd_stop m2wd_nosvc m2wd_presence
 set -e
 cd "$(dirname "$0")"
 ROOT=../..
@@ -58,22 +58,32 @@ if [ "${NOBUILD:-0}" != 1 ] || [ ! -x obj/vl/tb_fpu ] || [ -n "$BRIDGE_SV$CPUBUS
 		$CPU/ap030_top.v $CPU/ap030_core.v $CPU/ap030_memsys.v $CPU/ap030_mmu.v $CPU/ap030_cache.v \
 		$CPU/ap030_bus.v $CPU/ap030_alu.v $CPU/ap030_muldiv.v $CPU/ap030_regfile.v \
 		${CPUBUS_SV:-$RTL/falcon/falcon_cpubus.sv} ${MEMARB_SV:-$RTL/falcon/falcon_memarb.sv} ${BRIDGE_SV:-$RTL/falcon/falcon_fpu_bridge.sv} \
-		tb_fpu_top.sv tb_fpu.cpp m2.cpp \
+		tb_fpu_top.sv tb_fpu.cpp m2.cpp m3.cpp \
 		-CFLAGS "-O2 -Wall -Wextra -DTB_CLK_HZ=$CLK_HZ" -LDFLAGS "$PWD/obj/golden.o $LIBFPE -lm" -o tb_fpu > obj/build.log 2>&1 \
 		|| { tail -40 obj/build.log; echo "RESULT: FAIL (build)"; exit 1; }
-	if grep -E "tb_fpu_top\.sv|(tb_fpu|m2)\.cpp:[0-9]+:[0-9]+: warning" obj/build.log; then
+	if grep -E "tb_fpu_top\.sv|(tb_fpu|m2|m3)\.cpp:[0-9]+:[0-9]+: warning" obj/build.log; then
 		echo "warnings in tb/fpu files (see above)"
 	fi
 fi
 
 echo "== generating the milestone 2 cases =="
-./obj/vl/tb_fpu --gen=obj/gen_cases.s || { echo "RESULT: FAIL (case generation)"; exit 1; }
+rm -f obj/gen_cases_*.s obj/gen_m3_*.s obj/t_cases[0-9]*.s obj/t_m3[0-9]*.s
+./obj/vl/tb_fpu --gen=obj/gen_cases || { echo "RESULT: FAIL (case generation)"; exit 1; }
+read NM2 NM3 < obj/gen_chunks.txt
+for k in $(seq 0 $((NM2-1))); do sed "s/gen_cases.s/gen_cases_$k.s/" asm/t_cases.s > obj/t_cases$k.s; done
+for k in $(seq 0 $((NM3-1))); do sed "s/gen_cases.s/gen_m3_$k.s/" asm/t_cases.s > obj/t_m3$k.s; done
 
 echo "== assembling test programs ($($VASM -v 2>&1 </dev/null | head -1)) =="
-for t in t_detect t_watch t_frames t_cond t_gen t_cpid t_absent t_reset t_straddle t_raw t_rawna t_bg t_busy t_wd t_cases; do
+ASMS="t_detect t_watch t_frames t_cond t_gen t_cpid t_absent t_reset t_straddle t_raw t_rawna t_bg t_busy t_wd"
+for t in $ASMS; do
 	( cd asm && $VASM -quiet -Fbin -m68030 -m68882 -no-opt -I../obj -L ../obj/$t.lst -o ../obj/$t.bin $t.s ) \
 		|| { echo "RESULT: FAIL (assembling $t)"; exit 1; }
 done
+# the generated chunks: assembled in parallel (large)
+pids=""
+for t in $(seq 0 $((NM2-1))); do n=t_cases$t; ( cd asm && $VASM -quiet -Fbin -m68030 -m68882 -no-opt -I../obj -L ../obj/$n.lst -o ../obj/$n.bin ../obj/$n.s ) & pids="$pids $!"; done
+for t in $(seq 0 $((NM3-1))); do n=t_m3$t; ( cd asm && $VASM -quiet -Fbin -m68030 -m68882 -no-opt -I../obj -L ../obj/$n.lst -o ../obj/$n.bin ../obj/$n.s ) & pids="$pids $!"; done
+for p in $pids; do wait $p || { echo "RESULT: FAIL (assembling generated chunks)"; exit 1; }; done
 
 echo "== running =="
 rc=0
