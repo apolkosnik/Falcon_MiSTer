@@ -137,10 +137,17 @@ mapping differences and MiSTer interception behavior.
 ```
 git clone --recurse-submodules <this repo>
 ./scripts/build.sh          # Quartus 17.0.x; prints TIMING MET / FAILED
+QUARTUS=/path/to/intelFPGA_lite/17.0/quartus ./scripts/build.sh   # another install
 ```
 
 `scripts/build.sh` runs the Quartus stages separately because Quartus 17.0's
-fitter can crash while exiting on newer Linux after a complete fit.
+fitter can crash while exiting on newer Linux after a complete fit.  The
+project requires Quartus 17.0 (`/opt/intelFPGA_lite/17.0` by default,
+`QUARTUS` for another install).  The script deletes `db/` and
+`incremental_db/` when they were written by another Quartus version or
+edition (which Quartus refuses to open), and leaves `Falcon.qsf` as it was:
+Quartus rewrites the project file when it closes it, including the
+`FALCON_BRINGUP` macros `files.qip` adds.
 
 ## Simulation
 
