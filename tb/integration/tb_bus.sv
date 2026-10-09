@@ -26,8 +26,9 @@ reg rw = 1, as_n = 1, ds_n = 1;
 // Hatari time); default: turbo, cycles end when answered
 reg turbo;
 initial turbo = !$test$plusargs("falcon");
+reg tstat_en = 0;               // OSD "Timing counters" (falcon_tstat at $FFF000)
 tb_top t(.clk(clk), .reset(reset), .cold_reset(reset), .por(reset),
- .ram_mb(4'd14), .ram_tos(1'b0), .monitor(monitor), .cpu_turbo(turbo),
+ .ram_mb(4'd14), .ram_tos(1'b0), .monitor(monitor), .cpu_turbo(turbo), .tstat_en(tstat_en),
  .ps2_key(11'd0), .ps2_mouse(25'd0), .joy0(32'd0), .rtc(65'd0),
  .img_mounted(7'd0), .img_readonly(1'b0), .img_size(64'd0),
  .sd_ack(7'd0), .sd_buff_addr(14'd0), .sd_buff_dout(8'd0), .sd_buff_wr(1'b0));
@@ -99,8 +100,16 @@ task blit(input [23:0] src, input [23:0] dst, input [15:0] words, input [3:0] lo
   repeat (4) @(negedge clk);
  end
 endtask
-reg [15:0] w;
+reg [15:0] w, hi, lo;
 integer i;
+reg [31:0] c0, c1, r0, r1, f0, f1, d0, d1, g0, g1;
+// the counter a high word read returns, on that read's bus_stb clock
+reg [31:0] at_hi;
+reg [31:0] sysclk = 0;          // system clocks
+always @(posedge clk) sysclk <= sysclk + 1;
+always @(posedge clk)
+ if (t.system.tstat.bus_stb && !t.system.tstat.bus_we && t.system.tstat.bus_addr[1] == 1'b0)
+  at_hi <= t.system.tstat.cnt;
 initial begin
  force t.system.cpu.reset_n_i = 0;
  force t.system.cpu_a = a;
@@ -241,6 +250,55 @@ initial begin
  check(t.system.blit_busy == 0,"blit to bus-error I/O completes");
  // the I/O space is not DDR3 storage
  check(peekw('hff8240) == 0 && peekw('hff8004) == 0,"blitter I/O accesses left the DDR3 copy of the I/O area alone");
+
+ $display("Timing counters (core diagnostic, falcon_tstat)");
+ // off (the OSD default): $FFF000-$FFF01F bus errors, as on a Falcon and in
+ // Hatari (IoMem_BusErrorEvenReadAccess: no ioMemTabFalcon.c entry there)
+ mapcheck('hfff000,2,1,0);
+ mapcheck('hfff01e,2,1,1);
+ tstat_en = 1;
+ cycle('hfff000,0,2,0);
+ check(!berr && rd[31:16] == 'h5453,$sformatf("counters on: ID %04x expected 5453",rd[31:16]));
+ cycle('hfff002,0,2,0);
+ check(rd[31:16] == {8'd1, 6'd0, 1'b1, !turbo},$sformatf("version/mode %04x expected %04x",rd[31:16],{8'd1, 6'd0, 1'b1, !turbo}));
+ // a high word read latches the low word: a counter read in two cycles
+ // with a gap is its value on the high word's bus_stb clock
+ cycle('hfff004,0,2,0); hi = rd[31:16];
+ repeat (200) @(negedge clk);
+ cycle('hfff006,0,2,0); lo = rd[31:16];
+ check({hi, lo} == at_hi,$sformatf("FTIME long read %0d = FTIME when the high word was read %0d",{hi, lo},at_hi));
+ cycle('hfff006,0,2,0);
+ check(rd[31:16] != lo,"the latch is used once: the next low word read is live");
+ cycle('hfff008,0,2,0); hi = rd[31:16];
+ repeat (200) @(negedge clk);
+ cycle('hfff00a,0,2,0); lo = rd[31:16];
+ check({hi, lo} == at_hi,$sformatf("RTIME long read %0d = RTIME when the high word was read %0d",{hi, lo},at_hi));
+ // RTIME counts system clocks; FTIME is Falcon time: every clock in turbo,
+ // at 16 MHz one per two system clocks except for what the debt and the cap
+ // took (falcon_tstat: RTIME = period * FTIME + DEBT + forgiven)
+ c0 = sysclk; r0 = t.system.tstat.rtime; f0 = t.system.tstat.ftime;
+ d0 = t.system.cpuclk.debt; g0 = t.system.cpuclk.forgiven;
+ repeat (4000) @(negedge clk);
+ c1 = sysclk; r1 = t.system.tstat.rtime; f1 = t.system.tstat.ftime;
+ d1 = t.system.cpuclk.debt; g1 = t.system.cpuclk.forgiven;
+ check(r1 - r0 == c1 - c0,$sformatf("RTIME %0d in %0d system clocks",r1 - r0,c1 - c0));
+ check(turbo ? (f1 - f0 == r1 - r0) : (2 * (f1 - f0) == (r1 - r0) - (d1 - d0) - (g1 - g0)),
+       $sformatf("FTIME %0d in %0d system clocks (debt %0d -> %0d, forgiven +%0d; %s)",
+                 f1 - f0, r1 - r0, d0, d1, g1 - g0, turbo ? "turbo" : "16 MHz"));
+ for (i = 0; i < 8; i = i + 1) cycle('h20000 + 64*i,0,2,0);   // RAM reads (DDR3 latency)
+ cycle('hfff00c,0,2,0);
+ check(turbo ? rd[31:16] == 0 : rd[31:16] <= 4095,$sformatf("DEBT %0d: 0 in turbo, at most the cap at 16 MHz",rd[31:16]));
+ // writes are taken and ignored; the unused words read 0
+ f0 = t.system.tstat.ftime;
+ ww('hfff004,'h1234);
+ check(!berr && $signed(t.system.tstat.ftime - f0) > -64 && $signed(t.system.tstat.ftime - f0) < 1000,
+       "a write to FTIME is taken and ignored (it keeps counting)");
+ cycle('hfff00e,0,2,0);
+ check(!berr && rd[31:16] == 0,$sformatf("unused word $FFF00E reads %04x expected 0000",rd[31:16]));
+ cycle('hfff01e,0,2,0);
+ check(!berr && rd[31:16] == 0,$sformatf("unused word $FFF01E reads %04x expected 0000",rd[31:16]));
+ tstat_en = 0;
+ mapcheck('hfff000,2,1,0);
 
  $display("NVRAM preservation through system wiring");
  wb('hff8961,20); wb('hff8963,3);

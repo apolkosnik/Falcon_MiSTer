@@ -119,7 +119,10 @@ module falcon_blitter #(
     // ------------------------------------------------------------------
     // registers
     // ------------------------------------------------------------------
-    reg [15:0] ht [0:15];
+    // the halftone RAM in LUT RAM (MLAB, asynchronous read): one copy for
+    // the blit, one for the CPU's reads
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] ht  [0:15];
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] htc [0:15];
     reg [15:1] src_xinc, src_yinc, dst_xinc, dst_yinc;
     reg [23:1] src_addr, dst_addr;
     reg [15:0] endmask1, endmask2, endmask3;
@@ -136,7 +139,7 @@ module falcon_blitter #(
 
     integer i;
     initial begin
-        for (i = 0; i < 16; i = i + 1) ht[i] = 16'h0000;
+        for (i = 0; i < 16; i = i + 1) begin ht[i] = 16'h0000; htc[i] = 16'h0000; end
     end
 
     // ------------------------------------------------------------------
@@ -216,7 +219,7 @@ module falcon_blitter #(
     /* verilator lint_on UNUSEDSIGNAL */
     wire [15:0] src_word = buf_sh[15:0];
     // Blitter_GetHalftoneWord
-    wire [15:0] ht_word  = ctl_smudge ? ht[src_word[3:0]] : ht[line_nr];
+    wire [15:0] ht_word  = ht[ctl_smudge ? src_word[3:0] : line_nr];
 
     reg [15:0] hop_out;
     always @(*) begin
@@ -284,13 +287,16 @@ module falcon_blitter #(
             5'h1D: rd_mux = {6'b0, hop, 4'b0, lop};
             5'h1E: rd_mux = {ctl_busy, ctl_hog, ctl_smudge, 1'b0, line_nr, skew_reg};
             5'h1F: rd_mux = 16'hFFFF;
-            default: rd_mux = ht[bus_addr[4:1]];
+            default: rd_mux = htc[bus_addr[4:1]];
         endcase
     end
 
     wire wr_stb  = bus_cs & bus_stb & bus_we;
     wire wr_word = wr_stb & bus_uds & bus_lds;
     wire wr_ctl  = wr_stb & bus_uds & (bus_addr == 5'h1E);
+    wire ht_we   = !reset && wr_word && !bus_addr[5];
+    always @(posedge clk) if (ht_we) ht[bus_addr[4:1]]  <= bus_din;
+    always @(posedge clk) if (ht_we) htc[bus_addr[4:1]] <= bus_din;
 
     // non-hog bus count after the current access
     wire [7:0] blit_cnt_inc = blit_cnt + 8'd1;
@@ -510,8 +516,7 @@ module falcon_blitter #(
                 5'h1C: y_count <= (bus_din == 16'd0) ? 17'h10000 : {1'b0, bus_din};
                 default: ;
                 endcase
-                if (bus_addr[5] == 1'b0)
-                    ht[bus_addr[4:1]] <= bus_din;
+                // (the halftone RAM: ht_we)
             end
             if (wr_stb && bus_addr == 5'h1D) begin
                 if (bus_uds) hop <= bus_din[9:8];

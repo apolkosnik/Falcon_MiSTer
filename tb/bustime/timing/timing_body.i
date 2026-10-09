@@ -5,9 +5,17 @@
 ; is a subroutine run twice: once to fill the instruction cache, then between
 ; two markers (move.w #n,$3F0.w); the cost of a test is the difference of the
 ; clock counts at its two markers.  Position independent; data in `tbuf`.
+;
+; With TSTAT defined (tools/cputime, milestone 4) every marker also calls
+; tstat_mark, which reads the core's timing counters ($FFF000, falcon_tstat)
+; into tstat_tab, and a last marker (73) closes the harness-only test's
+; span.
 
 MARK	macro
 	move.w	#\1,$3F0.w
+	ifd	TSTAT
+	bsr	tstat_mark
+	endif
 	endm
 
 TEST	macro				; TEST <subroutine>, <first marker>
@@ -77,6 +85,10 @@ timing:
 	move.l	#$0009,d0		; the harness alone (instruction cache on)
 	movec	d0,cacr
 	TEST	t_empty,71
+	ifd	TSTAT
+	bsr	t_empty
+	MARK	73
+	endif
 
 	move.l	(sp)+,$80.w
 	move.l	(sp)+,d0
@@ -228,4 +240,37 @@ t_ext:	rept	50
 	rts
 
 	even
+; tbuf at 2 mod 4 from the start (the body runs from a 256-byte boundary):
+; 1(a0) then crosses a longword.  Hatari charges a misaligned word inside a
+; longword as one access, the 68030 on the Falcon's 16-bit port always
+; makes two byte cycles (docs/CPU_TIMING.md: the odd word); across a
+; longword both take two.
+	dcb.b	(2-(*-timing))&3,0
 tbuf:	ds.b	256
+
+	ifd	TSTAT
+; the counters at marker n go to tstat_tab + 16 * n: FTIME (first, so the
+; rest of the hook is the same every time), DEBT.w and RTIME (long reads:
+; falcon_tstat latches the low word); the clocks forgiven at the debt cap
+; follow from the three.  Without the
+; counters (Hatari) tstat_io points to the ST palette instead: the same
+; instructions (the same instruction cache footprint) and I/O reads of the
+; same length (FAST16, no wait states), whose values are not used.
+tstat_mark:
+	movem.l	d0/a0-a1,-(sp)
+	move.w	$3F0.w,d0
+	lsl.w	#4,d0
+	lea	tstat_tab(pc),a0
+	add.w	d0,a0
+	move.l	tstat_io(pc),a1
+	move.l	4(a1),(a0)+		; FTIME
+	move.w	12(a1),(a0)+		; DEBT
+	move.l	8(a1),(a0)+		; RTIME
+	movem.l	(sp)+,d0/a0-a1
+	rts
+tstat_io:
+	dc.l	$FFFF8240		; $FFFFF000 with the counters
+	even
+tstat_tab:
+	ds.b	16*74
+	endif

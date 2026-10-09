@@ -70,6 +70,7 @@ I/O decode (word address bits [23:1] are given to each device):
 | FFA200-FFA207  | `falcon_dsp` host interface                    | IPL6 (HREQ) |
 | FFFA00-FFFA2F  | `falcon_mfp` (MC68901)                         | IPL6 |
 | FFFC00-FFFC07  | `falcon_acia` (IKBD ACIA $FFFC00/2, MIDI ACIA $FFFC04/6) | GPIP4 |
+| FFF000-FFF01F  | `falcon_tstat` CPU timing counters, only with the OSD option "Timing counters" (a core diagnostic: on a Falcon and in Hatari, and by default here, a bus error) |   |
 
 ## Interrupts
 
@@ -203,7 +204,10 @@ input             sd_buff_wr
 | `falcon_system` | `rtl/falcon/falcon_system.sv` | CPU, bus bridge, decode, interrupt logic, device instances |
 | `falcon_cpubus` | `rtl/falcon/falcon_cpubus.sv` | 68030 pin bus to RAM/device bus bridge, CPU space cycles; Falcon mode: Hatari's cycle lengths, 16-bit RAM/ROM port, posted write, read-ahead buffer |
 | `falcon_cpuclk` | `rtl/falcon/falcon_cpuclk.sv` | CPU clock enable (turbo, 16/8 MHz) and the time accounting (debt) |
-| `falcon_memarb` | `rtl/falcon/falcon_memarb.sv` | ST-RAM arbiter: video, DMA masters, CPU, ROM loader |
+| `falcon_pipescan` | `rtl/falcon/falcon_pipescan.sv` | Hatari's prefetch pipeline model (stops before RTS/JMP/...) over the AP68030's queue |
+| `falcon_tstat` | `rtl/falcon/falcon_tstat.sv` | CPU timing counters at $FFF000 (OSD option; tools/cputime) |
+| `falcon_l2` | `rtl/falcon/falcon_l2.sv` | the CPU's line cache in block RAM (64 KB, 32-byte lines filled by 4-beat bursts, write-through; Falcon mode only, turbo passes through); other masters' writes drop lines |
+| `falcon_memarb` | `rtl/falcon/falcon_memarb.sv` | ST-RAM arbiter: video, DMA masters, CPU (through `falcon_l2`; burst reads for its lines), ROM loader |
 | `falcon_ddram` | `rtl/falcon/falcon_ddram.sv` | DDR3 adapter with bursts |
 | `falcon_combel` | `rtl/falcon/falcon_combel.sv` | $FF8001/6/7, joypads, DIP switches |
 | `falcon_videl` | `rtl/falcon/falcon_videl.sv` | Videl |

@@ -27,8 +27,13 @@
 //  word it adds), an instruction's length excludes its brief/full extension
 //  words, which the step where pipeline_pos == disp020 consumes (adding the
 //  base/outer displacement of a full format), and an F-line opcode
-//  (variable length) ends the scan until the next refill; so does a word the
-//  processor consumed before it was scanned.
+//  (variable length) ends the scan until the next refill.  The processor can
+//  take two or three words in a clock, before the scan reaches them (an
+//  opcode and its extension words, right after they arrive), so the scanner
+//  keeps the next two words to scan as it sees them in the queue and scans
+//  them from there (the scan was never more than one word behind the queue
+//  in the benches: tb/bustime, tb/system "scan lag"); a word that left the
+//  queue unseen ends the scan until the next refill.
 //============================================================================
 
 module falcon_pipescan #(parameter OPTBL_MEM = "rtl/falcon/falcon_optbl.mem")
@@ -53,6 +58,8 @@ initial $readmemb(OPTBL_MEM, optbl);
 reg [8:0] rd;                  // the entry of the word taken last clock
 
 reg [31:0] sa;                 // the next word to scan
+reg [15:0] sh0, sh1;           // the words at sa, sa+2 ...
+reg  [1:0] shv;                // ... when seen in the queue
 reg        act;                // scanning
 reg        pend;               // a word was taken last clock: its step now
 reg [15:0] w;                  // that word
@@ -63,11 +70,23 @@ reg  [1:0] stp;                // pipeline_stop: 0, 1, 2 (= -1)
 assign scan_v  = act;
 assign scan_to = pend ? wa : sa;
 
-// the word at sa, when it is in the queue
+// the words at sa + 2j (j = 0..2): from the shadow, or from the queue
 wire [31:0] off   = sa - scan;
-wire        inq   = (off[31:4] == 28'd0) && (off[3:1] < qn);
-wire [15:0] qword = q[95 - 16 * off[3:1] -: 16];
-wire        gone  = off[31];   // the processor consumed it before it was scanned
+wire        near  = (off[31:5] == 27'd0) || (off[31:5] == {27{1'b1}});   // -32 <= off < 32
+wire  [4:0] oi    = off[5:1];  // then sa's word index in the queue (signed)
+wire  [2:0] inq;
+wire [15:0] qw0, qw1, qw2;
+function [16:0] qword;         // {in the queue, the word} for word index i (signed)
+	input [4:0] i;
+	qword = {near && !i[4] && (i[3:0] < {1'b0, qn}), q[95 - 16 * i[2:0] -: 16]};
+endfunction
+assign {inq[0], qw0} = qword(oi);
+assign {inq[1], qw1} = qword(oi + 5'd1);
+assign {inq[2], qw2} = qword(oi + 5'd2);
+wire  [1:0] av  = shv | inq[1:0];                 // available
+wire [15:0] aw0 = shv[0] ? sh0 : qw0;
+wire [15:0] aw1 = shv[1] ? sh1 : qw1;
+wire        gone  = !av[0] && off[31];   // the processor consumed it unseen
 /* verilator lint_off UNUSEDSIGNAL */
 wire        unused_ps = off[0] | (|w[15:9]) | (|w[7:6]) | (|w[3:2]);   // (sa is even; only these bits of w matter)
 /* verilator lint_on UNUSEDSIGNAL */
@@ -109,9 +128,9 @@ always @* begin
 end
 
 always @(posedge clk) if (ce) begin
-	rd <= optbl[qword];
+	rd <= optbl[aw0];
 	if (flush || !enable) begin
-		sa <= scan; act <= enable; pend <= 1'b0;
+		sa <= scan; act <= enable; pend <= 1'b0; shv <= 2'd0;
 		pos <= 5'd0; r8a <= 3'd0; r8b <= 3'd0; stp <= 2'd0;
 		stop_v <= 1'b0;
 	end else if (act) begin
@@ -121,9 +140,13 @@ always @(posedge clk) if (ce) begin
 			if (n_lost || n_stopnow) act <= 1'b0;   // nothing more to decide
 		end
 		pend <= 1'b0;
+		{sh0, sh1} <= {aw0, aw1};
+		shv <= av;
 		if (gone) act <= 1'b0;
-		else if (inq && !(pend && (n_lost || n_stopnow))) begin
-			w <= qword; wa <= sa; pend <= 1'b1; sa <= sa + 32'd2;
+		else if (av[0] && !(pend && (n_lost || n_stopnow))) begin
+			w <= aw0; wa <= sa; pend <= 1'b1; sa <= sa + 32'd2;
+			{sh0, sh1} <= {aw1, qw2};
+			shv <= {inq[2], av[1]};
 		end
 	end
 end

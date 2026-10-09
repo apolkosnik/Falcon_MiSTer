@@ -27,7 +27,7 @@ if [ "${NOBUILD:-0}" != 1 ] || [ ! -x obj/vl/tb_bustime ]; then
 		tb_bustime.sv $ROOT/tb/system/ddr3_model.sv \
 		$CPU/ap030_top.v $CPU/ap030_core.v $CPU/ap030_memsys.v $CPU/ap030_mmu.v $CPU/ap030_cache.v \
 		$CPU/ap030_bus.v $CPU/ap030_alu.v $CPU/ap030_muldiv.v $CPU/ap030_regfile.v \
-		$RTL/falcon/falcon_cpuclk.sv $RTL/falcon/falcon_pipescan.sv $RTL/falcon/falcon_cpubus.sv $RTL/falcon/falcon_memarb.sv \
+		$RTL/falcon/falcon_cpuclk.sv $RTL/falcon/falcon_pipescan.sv $RTL/falcon/falcon_cpubus.sv $RTL/falcon/falcon_l2.sv $RTL/falcon/falcon_memarb.sv \
 		> obj/build.log 2>&1 || { tail -30 obj/build.log; echo "RESULT: FAIL (build)"; exit 1; }
 fi
 

@@ -132,7 +132,8 @@ falcon_memarb (unchanged priorities)  ->  DDR3
 3. Internal timing governor (Hatari's rules); exceptions and interrupt
    acknowledge (the 4 idle clocks after it); blitter cycle costs; programs
    timed in Hatari and on the core.
-4. Hardware: timing program, debt statistics, Quartus fit (the core is at 96%).
+4. Hardware: timing program, debt statistics, Quartus fit (the core is at 96%):
+   timing counters (OSD option) and CPUTIME; see below.
 
 ## Hatari's Falcon CPU timing in detail (the reference for milestones 2 and 3)
 
@@ -462,6 +463,11 @@ is now Hatari's:
   refill scans from the target on (add_prefetch_030 scans each word it
   adds), brief/full extension words are consumed at their positions, and
   an F-line opcode (variable length) ends the scan until the next refill.
+  The processor can take an opcode and its extension words in the clock
+  they arrive, before the scan reaches them, so the scanner keeps the next
+  two words to scan as it sees them in the queue (found in milestone 4:
+  without that it gave up on such an instruction, missed the stops behind
+  it and the processor fetched past RTS).
   When it decodes a stopping instruction it reports the address where
   Hatari's stop takes effect (`fetch_stop`); the AP68030 fetches no
   longword once the next word to take is at `fetch_stop - 2` or beyond.
@@ -505,30 +511,33 @@ is core - Hatari):
 | move.w (An) / move.l (An) | 896 / 952 | 896 / 952 | 0 / 0 |
 | move.w, move.l to (An) | 880 / 1000 | 880 / 1000 | 0 / 0 |
 | move.l (An)+,(An)+ x25 / move.w 1(An) (odd) | 1360 / 1008 | 1360 / 1008 | 0 / 0 |
-| mulu.w / muls.w / divu.w / divs.w x20 | 1000 / 1560 / 2240 / 1412 | 1000 / 1560 / 2228 / 1400 | 0 / 0 / +12 / +12 |
+| mulu.w / muls.w / divu.w / divs.w x20 | 1000 / 1560 / 2232 / 1404 | 1000 / 1560 / 2228 / 1400 | 0 / 0 / +4 / +4 |
 | mulu.l / divu.l x20 | 584 / 496 | 592 / 492 | -8 / +4 |
 | lsl.l #8 / asr.w Dn | 408 / 800 | 416 / 796 | -8 / +4 |
-| bsr/rts / jsr/rts x25 | 976 / 1244 | 976 / 1232 | 0 / +12 |
-| movem.l x10 | 1072 | 1080 | -8 |
+| bsr/rts / jsr/rts x25 | 976 / 1236 | 976 / 1232 | 0 / +4 |
+| movem.l x10 | 1080 | 1080 | 0 |
 | MFP read x20 / ROM move.l | 724 / 884 | 724 / 884 | 0 / 0 |
 | add.l Dn,(An) x25 / clr.l (An) | 1096 / 992 | 1096 / 992 | 0 / 0 |
-| trap/rte x10 / ext/swap | 884 / 507 | 880 / 508 | +4 / -1 |
+| trap/rte x10 / ext/swap | 884 / 491 | 880 / 508 | +4 / -17 |
 | nop, I-cache off / move.w (An), I-cache off | 720 / 761 | 720 / 760 | 0 / +1 |
 | move.l (An), D-cache / copy, D-cache | 712 / 335 | 728 / 364 | -16 / -29 |
 
 Whole sections: with the I-cache on and the D-cache off (markers 1-62) the
-core takes 26,454 clocks and Hatari 26,462 (-0.03%); 14 of those 31 spans
-are exact, the others within 12 clocks either way, and they largely cancel.  The rest
-(I-cache off, then D-cache on; markers 63-72) is 2,574 against 2,618
-(-1.7%), almost all in the two D-cache tests, whose timelines differ in the
-fills right after the marker; that is not explained yet.  Everything:
-29,313 against 29,342 (-0.10%).  Before the governor the core took 1.0-2.3
+core takes 26,438 clocks and Hatari 26,462 (-0.09%); 15 of those 31 spans
+are exact and the others within 8 clocks, except ext/swap (-17), whose
+span ends with the first run after the instruction cache is turned off.
+The rest (I-cache off, then D-cache on; markers 63-72) is 2,574 against
+2,618 (-1.7%), almost all in the two D-cache tests, whose timelines differ
+in the fills right after the marker; that is not explained yet.
+Everything: 29,281 against 29,342 (-0.21%).  (With the scanner as first
+committed: -0.03%, 14 exact, within 12; the fix moved divu/divs/jsr from
++12 to +4 and movem.l from -8 to 0.)  Before the governor the core took 1.0-2.3
 times Hatari's clocks (move.w (An) 563 against 246, bsr/rts 834 against
 454).  The odd word (two byte cycles, hardware) stays a deviation.
 
 Verification (with the prefetch model): tb/bustime passes (every cycle
-Hatari's length; the program takes the same 24,370 processor clocks in all
-five configurations, with the debt at its cap at 16 MHz); tb/fpu 7167/7167
+Hatari's length; the program takes the same 20,248 processor clocks in all
+five configurations (24,370 before the scanner fix), with the debt at its cap at 16 MHz); tb/fpu 7167/7167
 in both modes; tb/integration in turbo and Falcon mode (`+falcon`: a cycle
 the bench starts during a blit waits for the blit's Hatari time); tb/blitter
 passes; the AP68030 regression (every program also with `+lazy`) passes in
@@ -546,3 +555,166 @@ timing met (worst slack +0.167 ns, in the HDMI domain; seed 3 missed it
 there by 0.9 ns).  With the prefetch model: 41,362 ALMs (99%; the scanner
 and the fetch rule about 190), 348 RAM blocks (the opcode table 72);
 seed 2 meets timing (worst slack +0.155 ns, HDMI domain).
+
+## Milestone 4: on the board (simulated; the board run is the user's)
+
+**Timing counters.**  `falcon_tstat` is a register block at
+`$FFF000-$FFF01F`, decoded only with the new OSD option "Timing counters"
+(`status[10]`, default off).  Off, the range bus errors as on a Falcon and
+in Hatari (IoMem_Init leaves every I/O address without an
+ioMemTabFalcon.c entry a bus error), so the default machine is unchanged.
+Registers (words, read only; the module header has the details): ID
+`$5453`, version and mode, then 32-bit FTIME (Falcon time in processor
+clocks: every processor and idle clock, less the clocks given back and any
+wait state the bridge could not avoid - Hatari's cycle count) and RTIME
+(system clocks), and DEBT.  Reading a high word latches the low word, so a
+long read is consistent.  The clocks forgiven at the debt cap need no
+counter of their own: over any stretch, `RTIME = period * FTIME + DEBT +
+forgiven` exactly (tb/integration checks it against falcon_cpuclk's
+counter in both modes, with the latch and the bus error when off).  The
+first version also had forgiven, held and peak-debt registers and a
+four-word scanner shadow with five 32-bit address adders; the core was 18
+LABs over the device, then 6, until those went.
+
+**CPUTIME** (`tools/cputime`: `build.sh` makes CPUTIME.TOS and a floppy
+image, CPUTIME.ST).  It runs the 35 sequences of `timing_body.i` built with
+`TSTAT`, which reads the counters at every marker, and prints per test the
+span from its first marker to the next test's first marker: Falcon time
+("core"), the same span in the full-system simulation ("sim", from `ref.i`:
+Falcon time at every marker, which `ref.sh` regenerates with `sim.sh`:
+tb/system on the stand-in ROM `tools/fputest/simrom.s`), real time and the
+part of it forgiven at the debt cap (both in processor clocks), and real
+time as a share of Falcon time; then the sections, how many spans equal
+the simulation, the marker intervals that do not (a test's own run, the
+next test's cache-filling run) and the slot phase it started at.  On the board: turn the option on,
+run it from the floppy, and every span should equal the simulation (Falcon
+time does not depend on memory latency); real and lost are the board's
+own numbers.
+
+Three things had to be right for "equal to the simulation" to hold:
+
+- *The slot phase.*  Hatari's ST-RAM slot waits depend on Falcon time
+  mod 4, so a program that starts at another phase pays other waits all the
+  way (one run on the stand-in ROM started at phase 1: every span differed,
+  2.5% longer in all).  What runs before - TOS, the FPU probe, the program's
+  own size - leaves the phase anywhere, so CPUTIME spins on FTIME from the
+  instruction cache until it reads 0 mod 4 before it starts (FTIME samples
+  at an I/O read come out 0 or 1 mod 4: every CHIP16 access aligns to the
+  slot; from both, the loop ends within two rounds).  Hatari has the same
+  sensitivity; the tb/bustime golden relies on the ROM and the TOS harness
+  starting in the same phase, which they evidently do (the spans match).
+- *The scanner* (falcon_pipescan) lost track whenever the processor took
+  an opcode and its extension words in the clock they arrived, missed the
+  stops behind them and let the processor fetch past RTS (in CPUTIME's
+  marker hook, whose first instruction is a MOVEM: the extra fetch evicted
+  a cache line of the following test).  It now keeps the next two words to
+  scan (see milestone 3); the scan is never more than one word behind the
+  queue in any bench (tb/bustime and tb/system report the largest lag).
+- *The stack* (found on the board, below).  With the data cache on, the
+  marker hook's MOVEMs and RTS read the stack and allocate data-cache lines
+  that can replace the test data's; where the stack sits in a 256-byte
+  block decides which.  CPUTIME runs the sequences on its own stack at a
+  fixed place in a 256-byte block; with the caller's stack moved by 2, 4,
+  80, 128, 160 or 192 bytes the simulation's spans stay the same (before,
+  128 or 192 changed the two data-cache spans, and 2 - a misaligned stack -
+  19 spans by 4 to 8 clocks).
+
+Checked in simulation: with DDR3 read latency +0 to +40 clocks
+(`+ddrlat=`, a new tb/system model option), other pseudo-random timings
+(`+ddrseed=`), BUSY held for up to 100 clocks (`+ddrbusy=`), one read in
+sixteen 100-440 clocks late (`+ddrspike=`), VGA or mono video, MFP timers
+running with their interrupt pending under the mask and entry phases forced
+by extra instructions before the sync loop, every span is equal to the reference
+while real time goes from 165% of Falcon time (the model's 5-12 clock
+latency) to 530% (+40 clocks): the debt sits at its cap through the whole
+program and nearly every held clock is forgiven (real = Falcon + lost).
+With the model's latency the word multiply/divide spans are at 91-96%
+(the processor catches up there); every other span, which includes a
+cache-filling run from ST-RAM, is at 133-250%: such code runs at roughly
+half speed in real time.
+The board's DDR3 latency decides where it lands; that is what CPUTIME
+measures.  tb/system now also reports wait states the bridge could not
+avoid, fetches let through by the AP68030's stop guard, scans the scanner
+gave up and its largest lag: 0, 0, 0 and one word in CPUTIME and FPUTEST.
+
+**On the board** (first run, 2026-10-09, before the own stack): 33 of 36
+spans equal to the simulation; MFP read +36, move.l (An) with the data
+cache +32, copy with the data cache +16.  The two data-cache spans are the
+stack (above).  The MFP read span is not explained yet: in simulation
+neither memory timing, nor the MFP's timers and pending interrupt, nor the
+stack moves it.  Second run (the core with the line cache below, the same
+program): 34 of 36, the MFP read span equal, the two data-cache spans
++32/+16 as before - that program still used TOS's stack.  CPUTIME 3 (the
+version is in its title; its own stack, the marker intervals listed) is
+the one to run; its reference is the same whatever its size (rebuilt with
+another title, ref.sh gives the same numbers).  Third run, CPUTIME 3 on the
+core with the line cache (2026-10-09): Falcon time equal to the simulation
+in 36 of 36 spans - on the board's DDR3 Falcon time is the simulation's.
+
+**The CPU's line cache** (`falcon_l2`, apolkosnik's suggestion: block
+RAM).  Real time is where the core falls short: every CPU read from the
+DDR3 waits its latency, the bridge holds the processor, the debt reaches
+its cap and the excess is forgiven.  falcon_l2 sits between falcon_cpubus
+and falcon_memarb's CPU port: 64 KB, direct mapped, 32-byte lines filled
+with one 4-beat DDR3 burst (falcon_memarb gained a CPU burst read), the
+word asked for answered as its beat arrives; hits answer in two clocks.
+Writes go through (updating a cached line, never allocating).  Every write
+by another master - DMA, the loader - drops the line at its index when its
+DDR3 command goes out (falcon_memarb `owr_*`, which unlike the AP68030's
+snoop includes the loader), a fill such a write touches is not kept, and a
+sweep invalidates the cache after reset and whenever it is switched on.  It
+is used in the Falcon mode only: in turbo the port passes straight through,
+combinationally, and turbo stays bit-identical.  Since it changes only when
+answers arrive, Falcon time does not move: tb/bustime takes the same 20,248
+processor clocks in its five configurations and CPUTIME's spans equal the
+simulation's reference made without the cache.  Real time: tb/bustime's
+held clocks drop from 30,718 to 18,636 and the forgiven ones from 20,042 to
+7,960 (base configuration; the 8 MHz debt peak from 174 to 71), CPUTIME in
+the full-system simulation from 165% of Falcon time to 122.5% (and 223%
+with 30 clocks more read latency and BUSY stretches).  tb/l2 checks
+coherence: random CPU reads and writes over three times the cache, DMA and
+loader writes, video bursts and the cache switched off and on, every read
+against what the memory held while it was out (nine runs; with the
+invalidation removed it fails).  tb/fpu's own DDR3 model now accepts reads
+of four, and its bench tells the cache about the control words it writes
+straight into guest memory (no master on the board does that to memory the
+CPU reads).
+
+**Room for it.**  The core was at 99% of the ALMs.  The blitter's halftone
+RAM moved from flip-flops into LUT RAM (MLABs: asynchronous read, so the
+timing is the same; two copies, the blit's and the CPU's; 632 ALMs to 440;
+tb/blitter passes against Hatari).  The AP68030's register file can go the
+same way - D0-D7/A0-A6 in MLABs, one copy per read port, a flag per register
+for the zero a reset leaves: 776 ALMs to 464, the whole core 333 fewer in a
+fit with only that change, the AP68030 regression passing in both builds -
+but that is a change to the AP68030, kept as `extra/ap68030_regfile_mlab.patch`
+and not applied: the core fits without it.  Quartus 17.0 with the cache
+(and without the patch): 40,045 ALMs (96%; falcon_l2 137 - with room to
+place, the fitter packs every module tighter than at 99%), 414 RAM blocks
+(the cache 66); seed 2 meets timing (worst slack +0.136 ns, HDMI domain).
+With the patch as well: 39,615 ALMs, +0.433 ns.
+
+**Why CPUTIME does not compare with Hatari.**  The same program runs in
+Hatari (the hook then reads the ST palette instead of the counters: the
+same instructions and I/O reads of the same length), but the hook itself
+does not time the same: in a sequence of I/O reads and RAM writes the
+AP68030 issues an instruction fetch after the next operand access, where
+Hatari fetches at consumption, before the operands (the AP68030's memory
+system serves a pending data access first, and a fetch decision waits two
+or three clocks for the scanner to reach words that just arrived).  Each
+such instruction ends a few clocks later in the slot grid; the hook costs
+about 18 clocks more per call, and a few spans more than that.  Without
+the hook (tb/bustime/timing) the sequences match Hatari within 0.1%; making
+the fetch order Hatari's (fetch before a pending operand access, a scanner
+without latency) is left for later.  Also from this: `tbuf` sits at 2 mod 4
+from the body's start, so the odd word read (`1(a0)`) crosses a longword in
+every build - Hatari charges a misaligned word inside a longword as one
+access, the 68030 on the 16-bit port makes two byte cycles either way.
+
+Verification: tb/integration 71 + 71 + 39 checks (turbo, Falcon, memory
+types); tb/bustime passes (20,248 processor clocks in all five
+configurations); tb/fpu 7167/7167 in both modes; FPUTEST passes at 16 MHz
+on the full system; turbo is still bit-identical (same PC trace); the
+AP68030 is unchanged since milestone 3.  Quartus 17.0: 41,441 ALMs (99%;
+falcon_tstat 72, the scanner 199 with its shadow, falcon_cpuclk 31), 348
+RAM blocks; seed 2 meets timing (worst slack +0.063 ns, HDMI domain).

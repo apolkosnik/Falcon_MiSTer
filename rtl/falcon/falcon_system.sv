@@ -19,6 +19,7 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 	input             ram_tos,      // loaded TOS is a RAM TOS behind its loader
 	input       [1:0] monitor,
 	input             cpu_turbo,    // 1: CPU on every clock (32 MHz); 0: Falcon, 16/8 MHz ($FF8007 bit 0)
+	input             tstat_en,     // OSD: the timing counters at $FFF000 (falcon_tstat); 0: bus error there
 
 	// ROM/cartridge loader
 	input             ld_wr,
@@ -142,13 +143,14 @@ falcon_pipescan pipescan
 );
 wire  [4:0] cpu_tpos;
 wire  [3:0] cpu_credit;
+wire [15:0] cpu_debt;
 falcon_cpuclk cpuclk
 (
 	.clk(clk), .reset(reset),
 	.turbo(!cpu_fmode), .cpu_16mhz(cpu_16mhz),
 	.hold(cpu_hold), .credit(cpu_credit), .idle(cpu_idle), .back(cpu_back),
 	.cpu_ce(cpu_ce), .idle_tick(cpu_idle_tick), .tpos(cpu_tpos),
-	.debt(), .debt_peak(), .forgiven(), .held(), .idled()
+	.debt(cpu_debt), .debt_peak(), .forgiven(), .held(), .idled()
 );
 
 ap030_top #(.USE_CE(1)) cpu
@@ -182,6 +184,14 @@ wire [23:2] cram_addr;
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
 wire [63:0] cram_rdata64;
+// the same port behind the CPU's line cache (falcon_l2), to falcon_memarb
+wire        mram_req, mram_we, mram_ack, mram_burst, mram_beat;
+wire [23:2] mram_addr;
+wire  [3:0] mram_be;
+wire [31:0] mram_wdata, mram_rdata;
+wire [63:0] mram_rdata64;
+wire        owr_we;
+wire [23:3] owr_addr;
 
 // device bus: the CPU bridge's, or the blitter's while it reaches I/O
 wire        c_dev_cs, c_dev_stb, c_dev_we, c_dev_uds, c_dev_lds, dev_super;
@@ -389,6 +399,17 @@ falcon_fpu_bridge #(.CLK_HZ(CLK_HZ)) fpu
 );
 `endif
 
+// the CPU's line cache in block RAM (Falcon mode; turbo passes straight through)
+falcon_l2 l2
+(
+	.clk(clk), .reset(reset), .en(cpu_fmode),
+	.c_req(cram_req), .c_we(cram_we), .c_addr(cram_addr), .c_be(cram_be), .c_wdata(cram_wdata),
+	.c_rdata(cram_rdata), .c_rdata64(cram_rdata64), .c_ack(cram_ack),
+	.m_req(mram_req), .m_we(mram_we), .m_addr(mram_addr), .m_be(mram_be), .m_wdata(mram_wdata),
+	.m_burst(mram_burst), .m_rdata(mram_rdata), .m_rdata64(mram_rdata64), .m_beat(mram_beat), .m_ack(mram_ack),
+	.owr_we(owr_we), .owr_addr(owr_addr)
+);
+
 falcon_memarb memarb
 (
 	.clk(clk), .reset(por), .ram_mb(ram_mb),
@@ -402,8 +423,9 @@ falcon_memarb memarb
 	.d2_rdata(mblt_rdata), .d2_ack(mblt_ack),
 	.d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
 	.d3_rdata(d3_rdata), .d3_ack(d3_ack),
-	.cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
-	.cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_rdata64(cram_rdata64), .cpu_ack(cram_ack),
+	.cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),
+	.cpu_wdata(mram_wdata), .cpu_rdata(mram_rdata), .cpu_rdata64(mram_rdata64), .cpu_ack(mram_ack),
+	.cpu_burst(mram_burst), .cpu_beat(mram_beat), .owr_we(owr_we), .owr_addr(owr_addr),
 	.snoop_we(snoop_we), .snoop_addr(snoop_addr),
 	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
@@ -435,6 +457,7 @@ wire sel_scc     = (da[23:3]  == 21'h1FF190);                  // FF8C80-FF8C87
 wire sel_dsp     = (da[23:3]  == 21'h1FF440);                  // FFA200-FFA207
 wire sel_mfp     = (da[23:6]  == 18'h3FFE8) && (da[5:0] < 6'h30); // FFFA00-FFFA2F
 wire sel_acia    = (da[23:3]  == 21'h1FFF80);                  // FFFC00-FFFC07
+wire sel_tstat   = tstat_en && (da[23:5] == 19'h7FF80);        // FFF000-FFF01F, OSD option (bus error otherwise)
 
 // addresses that read as $FF/write nothing instead of bus erroring
 // (IoMem_FixVoidAccessForCompatibleFalcon in the STE-compatible bus mode,
@@ -463,9 +486,9 @@ wire sel_void    = void_always || (!falcon_bus && (void_compat || void_cbyte || 
 
 // per-device bus signals
 wire [15:0] ide_dout, combel_dout, videl_dout, fdc_dout, psg_dout, xbar_dout, nvram_dout;
-wire [15:0] blit_dout, dsp_dout, mfp_dout, acia_dout;
+wire [15:0] blit_dout, dsp_dout, mfp_dout, acia_dout, tstat_dout;
 wire        ide_ack, combel_ack, videl_ack, fdc_ack, psg_ack, xbar_ack, nvram_ack;
-wire        blit_ack, dsp_ack, mfp_ack, acia_ack;
+wire        blit_ack, dsp_ack, mfp_ack, acia_ack, tstat_ack;
 wire        xbar_berr, fdc_berr;
 reg   [7:0] scc_ptr;
 
@@ -486,6 +509,7 @@ always @* begin
 		else if (sel_dsp)    begin dev_dout = dsp_dout;    dev_ack = dsp_ack;    end
 		else if (sel_mfp)    begin dev_dout = mfp_dout;    dev_ack = mfp_ack;    end
 		else if (sel_acia)   begin dev_dout = acia_dout;   dev_ack = acia_ack;   end
+		else if (sel_tstat)  begin dev_dout = tstat_dout;  dev_ack = tstat_ack;  end
 		else if (sel_void)   begin dev_dout = 16'hFFFF;    dev_ack = dev_stb;    end
 		else dev_berr = 1;
 	end
@@ -496,6 +520,16 @@ end
 //////////////////////////////////////////////////////////////////
 //  Devices
 //////////////////////////////////////////////////////////////////
+
+// ---- CPU timing counters (core diagnostic, OSD option) ----
+falcon_tstat tstat
+(
+	.clk(clk), .reset(reset),
+	.bus_cs(dev_cs & sel_tstat), .bus_stb(dev_stb & sel_tstat), .bus_we(dev_we),
+	.bus_addr(dev_addr[4:1]), .bus_dout(tstat_dout), .bus_ack(tstat_ack),
+	.fmode(cpu_fmode), .cpu_16mhz(cpu_16mhz), .cpu_ce(cpu_ce), .idle_tick(cpu_idle_tick),
+	.back(cpu_back), .credit(cpu_credit), .debt(cpu_debt)
+);
 
 falcon_combel combel
 (

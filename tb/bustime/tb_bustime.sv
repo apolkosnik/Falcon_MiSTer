@@ -118,6 +118,13 @@ wire [23:2] cram_addr;
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
 wire [63:0] cram_rdata64;
+// the CPU's line cache between the bridge and the arbiter (falcon_l2)
+wire        mram_req, mram_we, mram_ack, mram_burst, mram_beat, owr_we;
+wire [23:2] mram_addr;
+wire  [3:0] mram_be;
+wire [31:0] mram_wdata, mram_rdata;
+wire [63:0] mram_rdata64;
+wire [23:3] owr_addr;
 wire        dev_cs, dev_stb, dev_we, dev_uds, dev_lds, dev_super;
 wire [23:1] dev_addr;
 wire [15:0] dev_din;
@@ -168,6 +175,15 @@ wire  [7:0] DDRAM_BURSTCNT, DDRAM_BE;
 wire [28:0] DDRAM_ADDR;
 wire [63:0] DDRAM_DOUT, DDRAM_DIN;
 
+falcon_l2 l2
+(
+	.clk(clk), .reset(reset), .en(cpu_fmode),
+	.c_req(cram_req), .c_we(cram_we), .c_addr(cram_addr), .c_be(cram_be), .c_wdata(cram_wdata),
+	.c_rdata(cram_rdata), .c_rdata64(cram_rdata64), .c_ack(cram_ack),
+	.m_req(mram_req), .m_we(mram_we), .m_addr(mram_addr), .m_be(mram_be), .m_wdata(mram_wdata),
+	.m_burst(mram_burst), .m_rdata(mram_rdata), .m_rdata64(mram_rdata64), .m_beat(mram_beat), .m_ack(mram_ack),
+	.owr_we(owr_we), .owr_addr(owr_addr)
+);
 falcon_memarb memarb
 (
 	.clk(clk), .reset(reset), .ram_mb(4'd4),
@@ -177,8 +193,9 @@ falcon_memarb memarb
 	.d1_req(1'b0), .d1_we(1'b0), .d1_addr(23'd0), .d1_be(2'b00), .d1_wdata(16'd0), .d1_rdata(), .d1_ack(),
 	.d2_req(d2_req), .d2_we(1'b1), .d2_addr(d2_addr), .d2_be(2'b11), .d2_wdata(d2_wdata), .d2_rdata(), .d2_ack(d2_ack),
 	.d3_req(1'b0), .d3_we(1'b0), .d3_addr(23'd0), .d3_be(2'b00), .d3_wdata(16'd0), .d3_rdata(), .d3_ack(),
-	.cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
-	.cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_rdata64(cram_rdata64), .cpu_ack(cram_ack),
+	.cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),
+	.cpu_wdata(mram_wdata), .cpu_rdata(mram_rdata), .cpu_rdata64(mram_rdata64), .cpu_ack(mram_ack),
+	.cpu_burst(mram_burst), .cpu_beat(mram_beat), .owr_we(owr_we), .owr_addr(owr_addr),
 	.snoop_we(snoop_we), .snoop_addr(snoop_addr),
 	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
@@ -475,5 +492,13 @@ initial begin
 	else $display("PASS");
 	$finish;
 end
+
+// how far the pipeline scan falls behind the queue head (words), for the
+// depth of falcon_pipescan's shadow
+integer lag_max = 0;
+always @(posedge clk)
+	if (cpu_ce && pipescan.act && !pipescan.flush && $signed(pipescan.off) < 0 &&
+	    -($signed(pipescan.off) / 2) > lag_max) lag_max <= -($signed(pipescan.off) / 2);
+final $display("scan lag %0d words", lag_max);
 
 endmodule

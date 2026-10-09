@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")"
 R=${RTL:-../../rtl}
 DEFS=""
-SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/falcon_pipescan.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_combel.sv
+SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/falcon_pipescan.sv $R/falcon/falcon_tstat.sv $R/falcon/falcon_l2.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_combel.sv
  $R/falcon/falcon_videl.sv $R/falcon/falcon_psg.sv $R/falcon/falcon_mfp.sv $R/falcon/falcon_mfp_timer.sv $R/falcon/falcon_mfp_usart.sv
  $R/falcon/falcon_acia.sv $R/falcon/falcon_ikbd.sv $R/falcon/falcon_ikbd_keymap.sv $R/falcon/falcon_nvram.sv $R/falcon/falcon_mbox_test.sv $R/falcon/falcon_fpu_bridge.sv
  $R/falcon/falcon_blitter.sv $R/falcon/falcon_crossbar.sv"

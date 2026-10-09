@@ -19,6 +19,10 @@ module tb_fpu_top #(
 ) (
     input             clk,
     input             por,          // power-on reset (arbiter, bridge presence)
+    // the bench wrote guest memory directly (its control words): the CPU's
+    // line cache must drop that line, as for another master's write
+    input             tbinv_we,
+    input      [23:3] tbinv_addr,
     input       [2:0] ipl_n,        // interrupt priority level (active low), autovectored
     input             reset,        // machine reset (CPU, bus bridge); the bench holds it with por
 
@@ -142,6 +146,13 @@ wire [23:2] cram_addr;
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
 wire [63:0] cram_rdata64;
+// the CPU's line cache between the bridge and the arbiter (falcon_l2)
+wire        mram_req, mram_we, mram_ack, mram_burst, mram_beat, owr_we;
+wire [23:2] mram_addr;
+wire  [3:0] mram_be;
+wire [31:0] mram_wdata, mram_rdata;
+wire [63:0] mram_rdata64;
+wire [23:3] owr_addr;
 
 wire        cp_req, cp_we, cp_ack, cp_berr;
 wire  [2:0] cp_id;
@@ -206,6 +217,25 @@ falcon_fpu_bridge #(.CLK_HZ(CLK_HZ)) fpu
 );
 
 // ---------------------------------------------------------------- memory arbiter
+falcon_l2 l2
+(
+    .clk(clk), .reset(reset), .en(cpu_fmode),
+    .c_req(cram_req), .c_we(cram_we), .c_addr(cram_addr), .c_be(cram_be), .c_wdata(cram_wdata),
+    .c_rdata(cram_rdata), .c_rdata64(cram_rdata64), .c_ack(cram_ack),
+    .m_req(mram_req), .m_we(mram_we), .m_addr(mram_addr), .m_be(mram_be), .m_wdata(mram_wdata),
+    .m_burst(mram_burst), .m_rdata(mram_rdata), .m_rdata64(mram_rdata64), .m_beat(mram_beat), .m_ack(mram_ack),
+    .owr_we(owr_we | tb_go), .owr_addr(owr_we ? owr_addr : tb_a)
+);
+// the bench's invalidation waits a clock when the arbiter has one
+reg         tb_pend = 1'b0;
+reg  [23:3] tb_pa;
+wire        tb_go = (tbinv_we || tb_pend) && !owr_we;
+wire [23:3] tb_a  = tbinv_we ? tbinv_addr : tb_pa;
+always @(posedge clk)
+    if (tbinv_we || tb_pend) begin
+        tb_pend <= owr_we;
+        tb_pa   <= tb_a;
+    end
 falcon_memarb memarb
 (
     .clk(clk), .reset(por), .ram_mb(4'd4),
@@ -219,8 +249,9 @@ falcon_memarb memarb
     .d2_rdata(), .d2_ack(),
     .d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
     .d3_rdata(d3_rdata), .d3_ack(d3_ack),
-    .cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
-    .cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_rdata64(cram_rdata64), .cpu_ack(cram_ack),
+    .cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),
+    .cpu_wdata(mram_wdata), .cpu_rdata(mram_rdata), .cpu_rdata64(mram_rdata64), .cpu_ack(mram_ack),
+    .cpu_burst(mram_burst), .cpu_beat(mram_beat), .owr_we(owr_we), .owr_addr(owr_addr),
     .snoop_we(snoop_we), .snoop_addr(snoop_addr),
     .DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
     .DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
