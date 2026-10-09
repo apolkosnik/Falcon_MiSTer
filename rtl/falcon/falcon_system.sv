@@ -125,16 +125,18 @@ assign ld_busy = ld_busy_arb;
 // every bus cycle Hatari's length and holds the processor while an answer
 // is late; falcon_cpuclk lets it catch up afterwards.
 wire        cpu_16mhz;
-wire        cpu_ce, cpu_hold, cpu_fmode, cpu_wbuf_busy, cpu_inst;
+wire        cpu_ce, cpu_hold, cpu_fmode, cpu_wbuf_busy, cpu_inst, cpu_idle, cpu_idle_tick;
+wire  [1:0] cpu_tm_pop, cpu_tm_md;
+wire  [7:0] cpu_back;
 wire  [4:0] cpu_tpos;
 wire  [3:0] cpu_credit;
 falcon_cpuclk cpuclk
 (
 	.clk(clk), .reset(reset),
 	.turbo(!cpu_fmode), .cpu_16mhz(cpu_16mhz),
-	.hold(cpu_hold), .credit(cpu_credit),
-	.cpu_ce(cpu_ce), .tpos(cpu_tpos),
-	.debt(), .debt_peak(), .forgiven(), .held()
+	.hold(cpu_hold), .credit(cpu_credit), .idle(cpu_idle), .back(cpu_back),
+	.cpu_ce(cpu_ce), .idle_tick(cpu_idle_tick), .tpos(cpu_tpos),
+	.debt(), .debt_peak(), .forgiven(), .held(), .idled()
 );
 
 ap030_top #(.USE_CE(1)) cpu
@@ -150,7 +152,7 @@ ap030_top #(.USE_CE(1)) cpu
 	.ipl_n(ipl_n), .ipend_n(cpu_ipend_n),
 	.reset_n_i(~(reset | sv_busy)), .reset_n_oe(cpu_reset_oe),
 	.cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
-	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .dbg_halted(cpu_halted),
+	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .dbg_halted(cpu_halted),
 	.dbg_vbr(), .dbg_cacr(), .dbg_cache_clear(),
 	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0)
 );
@@ -188,6 +190,12 @@ wire  [4:0] cp_off;
 wire  [1:0] cp_siz;
 wire [31:0] cp_wdata, cp_rdata;
 
+// the blitter's DMA port (its accesses also count in the CPU's Falcon time)
+wire        blt_req, blt_we, blt_ack;
+wire [23:1] blt_addr;
+wire  [1:0] blt_be;
+wire [15:0] blt_wdata, blt_rdata;
+
 falcon_cpubus cpubus
 (
 	.clk(clk), .reset(reset | sv_busy),
@@ -208,7 +216,10 @@ falcon_cpubus cpubus
 	.fmode_in(!cpu_turbo), .fmode(cpu_fmode), .cpu_ce(cpu_ce), .tpos(cpu_tpos),
 	.inst(cpu_inst & cpu_ce), .hold(cpu_hold), .credit(cpu_credit), .wbuf_busy(cpu_wbuf_busy),
 	.ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
-	.buf_flush(ld_busy_arb | sv_busy), .iack_mfp(iack_mfp)
+	.buf_flush(ld_busy_arb | sv_busy), .iack_mfp(iack_mfp),
+	.dispatch(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md),
+	.idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(!cpu_bgack_n), .blit_acc(blt_ack),
+	.gov_idle(), .gov_back()
 );
 
 
@@ -229,11 +240,6 @@ wire        fdc_dreq, fdc_dwe, fdc_dack;
 wire [23:1] fdc_daddr;
 wire  [1:0] fdc_dbe;
 wire [15:0] fdc_dwdata, fdc_drdata;
-
-wire        blt_req, blt_we, blt_ack;
-wire [23:1] blt_addr;
-wire  [1:0] blt_be;
-wire [15:0] blt_wdata, blt_rdata;
 
 // The blitter's accesses to the IDE and I/O areas go to the devices
 // (Hatari's blitter uses get_word/put_word, which reach the I/O handlers):
@@ -656,6 +662,7 @@ falcon_blitter blitter
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_blit), .bus_addr(dev_addr[5:1]), .bus_dout(blit_dout), .bus_ack(blit_ack),
 	.br(blit_br), .bg(blit_bg), .cpu_bus_cycle(cpu_cycle_done),
+	.fmode(cpu_fmode), .ftick(cpu_ce | cpu_idle_tick),
 	.busy(blit_busy),
 	.dma_req(blt_req), .dma_we(blt_we), .dma_addr(blt_addr), .dma_be(blt_be),
 	.dma_wdata(blt_wdata), .dma_rdata(blt_rdata), .dma_ack(blt_ack)

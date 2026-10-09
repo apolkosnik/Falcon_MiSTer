@@ -41,6 +41,11 @@
 //   clocks = 256 CPU cycles at 16 MHz, which is the 64*4 CPU cycle
 //   approximation Hatari uses when not in cycle exact mode).  Set
 //   NONHOG_CPU_TIMEOUT = 0 to disable the timeout.
+//   With the CPU's Falcon bus timing (fmode, docs/CPU_TIMING.md) the CPU's
+//   share is NONHOG_CPU_CLOCKS (256) of its clocks in Falcon time (ftick),
+//   as Hatari runs the 68030 between two non-hog bursts (blitter.c:931-937,
+//   BLITTER_NONHOG_BUS_CPU * 4); the time of the blit itself is accounted
+//   by falcon_cpubus (Hatari's 4 clocks per access and arbitration).
 //   Writing control with bit 7 = 1 while the CPU owns the bus restarts the
 //   blitter at once (keeping its word state); writing bit 7 = 0 pauses it
 //   (busy stays 1, no bus request) until bit 7 is written to 1 again.
@@ -74,7 +79,8 @@ module falcon_blitter #(
     parameter CLK_HZ               = 32000000,
     parameter NONHOG_BLIT_ACCESSES = 64,
     parameter NONHOG_CPU_ACCESSES  = 64,
-    parameter NONHOG_CPU_TIMEOUT   = 512
+    parameter NONHOG_CPU_TIMEOUT   = 512,
+    parameter NONHOG_CPU_CLOCKS    = 256
 ) (
 /* verilator lint_on UNUSEDPARAM */
     input             clk,
@@ -104,6 +110,8 @@ module falcon_blitter #(
     output            br,
     input             bg,
     input             cpu_bus_cycle,
+    input             fmode,        // Falcon bus timing: the CPU's share in its clocks
+    input             ftick,        // a CPU clock of Falcon time
 
     output            busy
 );
@@ -324,7 +332,16 @@ module falcon_blitter #(
             tmo_cnt  <= 16'd0;
         end else begin
             // ---------------- non-hog CPU share ----------------
-            if (phase == P_CPU) begin
+            if (phase == P_CPU && fmode) begin
+                if (ftick) begin
+                    tmo_cnt <= tmo_cnt + 16'd1;
+                    if (tmo_cnt + 16'd1 >= NONHOG_CPU_CLOCKS) begin
+                        phase    <= P_RUN;
+                        blit_cnt <= 8'd0;
+                    end
+                end
+            end
+            else if (phase == P_CPU) begin
                 if (cpu_bus_cycle)
                     cpu_cnt <= cpu_cnt + 8'd1;
                 tmo_cnt <= tmo_cnt + 16'd1;

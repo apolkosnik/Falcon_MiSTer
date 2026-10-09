@@ -77,8 +77,8 @@
 //  expected: the edge after S0 is held on the clock the cycle is first seen).
 //  RAM writes are posted (one entry, written to memory in order before any
 //  later RAM read or device access); RAM/ROM reads go through a read-ahead
-//  buffer that keeps the last 64-bit DDR3 word (kept coherent with the
-//  posted writes, invalidated by other masters' writes and by the loader),
+//  buffer that keeps the last 64-bit DDR3 word (invalidated by a CPU write
+//  to it, by other masters' writes and by the loader),
 //  so sequential fetches need one DDR3 read per four words.  The data of a
 //  write is taken at the start of the cycle: the AP68030 drives its write
 //  lanes from S0 (ap030_bus wlanes).
@@ -164,7 +164,20 @@ module falcon_cpubus
 	input             snoop_we,    // another master wrote RAM
 	input      [23:0] snoop_addr,
 	input             buf_flush,   // the loader writes memory
-	input             iack_mfp     // with iack_done: the vector came from the MFP
+	input             iack_mfp,    // with iack_done: the vector came from the MFP
+
+	// Hatari's internal timing (milestone 3, the governor below): from the
+	// AP68030, each for one processor clock (ap030_top dbg_inst, tm_pop, tm_md)
+	input             dispatch,    // an instruction was dispatched
+	input       [1:0] tm_pop,      // instruction words consumed
+	input       [1:0] tm_md,       // MUL.W / DIVU.W / DIVS.W started
+	output            idle,        // ask falcon_cpuclk for idle clocks
+	input             idle_tick,   // ... one passed
+	output      [7:0] back,        // give back processor clocks (falcon_cpuclk)
+	input             bus_lost,    // another master owns the bus (blitter)
+	input             blit_acc,    // ... and made an access (one clock)
+	output reg [31:0] gov_idle,    // idle clocks inserted (Hatari slower than the AP68030)
+	output reg [31:0] gov_back     // processor clocks given back (Hatari faster)
 );
 
 localparam S_IDLE = 3'd0, S_RAM = 3'd1, S_DEV = 3'd2, S_IACK = 3'd3, S_HOLD = 3'd4, S_CP = 3'd5;
@@ -208,7 +221,7 @@ endfunction
 //----------------------------------------------------------------------------
 // Falcon mode
 //----------------------------------------------------------------------------
-localparam F_IDLE = 2'd0, F_RUN = 2'd1, F_HOLD = 2'd2;
+localparam F_IDLE = 2'd0, F_RUN = 2'd1, F_HOLD = 2'd2, F_GOV = 2'd3;
 localparam J_NONE = 3'd0, J_RD = 3'd1, J_WR = 3'd2, J_DEV = 3'd3, J_DEVW = 3'd4, J_IACK = 3'd5, J_CP = 3'd6;
 localparam K_D16 = 2'd0, K_D32 = 2'd1, K_BERR = 2'd2, K_AVEC = 2'd3;
 reg  [1:0] fst;
@@ -219,10 +232,6 @@ reg        fplan;          // fw is known (an acknowledge's length depends on it
 reg  [4:0] fk;             // processor rising edges of this cycle seen so far
 reg  [4:0] fw;             // Hatari's wait states for this cycle
 reg  [4:0] ft0;            // processor clock position of S0, mod 20
-reg [23:2] faddr;          // RAM/ROM longword (reads: after the vector mapping)
-reg        fa1;            // A1: the word within it
-reg  [3:0] fbe;            // a write waiting for the write buffer
-reg [31:0] fwd;
 // posted RAM write
 reg        wb_valid, wb_inflight;
 reg [23:2] wb_addr;
@@ -237,6 +246,13 @@ reg [63:0] rb_data;
 reg        ym_seen, acia_seen;
 reg  [1:0] ym_cnt;
 reg        fdc_mode4;   // $FF8606 bit 4: $FF8604 is the DMA sector count
+// for the governor: the cycle's kind and its operand
+reg        f_data, f_iack, f_cont;
+reg        w_data, w_rw, w_pops;     // the last cycle (continuations of a long operand)
+reg  [7:0] w_la;
+reg  [1:0] w_siz;
+reg        w_par;                    // its operand's first S0, parity
+reg  [5:0] w_len;                    // its operand's cycles so far, clocks
 
 assign wbuf_busy = wb_valid;
 // hold the processor's next rising edge while it would be the cycle's
@@ -246,7 +262,84 @@ assign wbuf_busy = wb_valid;
 // following edge are on consecutive clocks).  A hold costs Falcon time
 // (debt), never a processor clock.
 assign hold = fmode && (((fst == F_RUN) && !fready && (fk >= (fplan ? fw : 5'd0))) ||
-                        ((fst == F_IDLE) && as_act));
+                        ((fst == F_IDLE) && as_act) || (fst == F_GOV) || bus_lost);
+
+//----------------------------------------------------------------------------
+// Governor (milestone 3): the time between bus cycles is Hatari's internal
+// time, whatever the AP68030 needs.  Hatari charges 2 clocks for every
+// instruction word consumed, taken first from the "window" of the last bus
+// access (its visible duration: Hatari's time advances in steps of 2, an
+// access's odd clock is owed to the next charge; a long access is one
+// window) and only the rest as time (do_cycles_ce020_internal,
+// cpu_prefetch.h:54-80, newcpu.c:10627); MULU.W/MULS.W 20, DIVU.W 34,
+// DIVS.W 48 in full (gencpu.c:8286-8399); 4 idle clocks after an interrupt
+// acknowledge (newcpu.c:3025).  gR sums these since the last check, gC the
+// AP68030's processor clocks outside bus cycles.  At every dispatch and at
+// every new bus cycle the difference goes into gA: Hatari ahead (gA > 0):
+// idle clocks (the processor waits frozen while the clocks pass); the
+// AP68030 slower (gA < 0): the clocks are given back (falcon_cpuclk takes
+// them out of Falcon time and the processor makes them up at 32 MHz), at
+// most 32 per check, so a STOP or a wait for the bus is not given back.
+// Adjustments happen only between bus cycles; a new cycle is planned after
+// them, so it starts where Hatari's would.  While the blitter owns the bus
+// the processor is held (Hatari stops the 68030 for a blit) and the blit
+// takes Hatari's time in idle clocks: 4 per access, 4 when it takes the bus
+// and 4 when it gives it back (Blitter_BusArbitration, BLITTER_CYCLES_PER_
+// BUS_READ/WRITE, blitter.c:254-452).  Events of a processor clock are taken on the
+// system clock after it (pe), when it is known whether that clock was
+// outside a bus cycle (no AS yet, not the S0 of the cycle just seen).
+//----------------------------------------------------------------------------
+reg         pe;                // the previous system clock had a processor clock
+reg   [7:0] gR, gC;
+reg  [10:0] gA;                // pending adjustment, signed
+reg   [4:0] gW;
+reg         lost_d;            // bus_lost of the previous clock
+always @(posedge clk) begin pe <= cpu_ce; lost_d <= bus_lost; end
+wire  [3:0] g_blit = (blit_acc ? 4'd4 : 4'd0) + ((bus_lost != lost_d) ? 4'd4 : 4'd0);
+wire  [2:0] g_w2   = pe ? {tm_pop, 1'b0} : 3'd0;              // 2 per word
+wire  [2:0] g_abs  = ({2'b00, gW} >= {4'd0, g_w2}) ? g_w2 : gW[2:0];
+wire  [5:0] g_md   = !pe ? 6'd0 : (tm_md == 2'd1) ? 6'd20 : (tm_md == 2'd2) ? 6'd34 : (tm_md == 2'd3) ? 6'd48 : 6'd0;
+wire        g_end  = (fst == F_HOLD) && !as_act;               // a cycle ends
+wire  [8:0] g_R1   = {1'b0, gR} + {6'd0, g_w2 - g_abs} + {3'd0, g_md} + ((g_end && f_iack) ? 9'd4 : 9'd0);
+wire  [8:0] g_C1   = {1'b0, gC} + ((pe && fst == F_IDLE && !as_act && !bus_lost) ? 9'd1 : 9'd0);
+wire        g_sync = fmode && (((fst == F_IDLE) && as_act) || (pe && dispatch));
+wire  [8:0] g_ex   = (g_C1 > g_R1) ? g_C1 - g_R1 : 9'd0;           // the AP68030 slower
+wire  [8:0] g_ahd  = (g_R1 > g_C1) ? g_R1 - g_C1 : 9'd0;           // Hatari slower
+wire [10:0] g_dlt  = !g_sync ? 11'd0 : {2'b00, g_ahd} - ((g_ex > 9'd32) ? 11'd32 : {2'b00, g_ex});
+// adjustments only between bus cycles: idle clocks one by one, clocks given back at once
+wire        g_ok   = fmode && ((fst == F_GOV) || ((fst == F_IDLE) && !as_act));
+assign idle = g_ok && !gA[10] && (gA != 11'd0);
+wire [10:0] g_neg  = -gA;
+assign back = (g_ok && gA[10]) ? ((g_neg > 11'd31) ? 8'd31 : g_neg[7:0]) : 8'd0;
+// the window of the cycle that ends: its operand's visible span
+wire  [5:0] g_span = (f_cont ? w_len : 6'd0) + 6'd3 + {1'b0, fw};
+wire  [5:0] g_win  = ({5'd0, f_cont ? w_par : ft0[0]} + g_span) & 6'h3E;
+
+always @(posedge clk) begin
+	if (reset || !fmode) begin
+		gR <= 0; gC <= 0; gA <= 0; gW <= 0; w_data <= 0; w_pops <= 0;
+		if (reset) begin gov_idle <= 0; gov_back <= 0; end
+	end else begin
+		gW <= gW - {2'b00, g_abs};
+		if (pe && tm_pop != 2'd0) w_pops <= 1'b1;
+		gR <= g_sync ? 8'd0 : (g_R1 > 9'd255) ? 8'd255 : g_R1[7:0];
+		gC <= g_sync ? 8'd0 : (g_C1 > 9'd255) ? 8'd255 : g_C1[7:0];
+		gA <= gA + {3'd0, back} - (idle_tick ? 11'd1 : 11'd0) + g_dlt + {7'd0, g_blit};
+		if (idle_tick) gov_idle <= gov_idle + 32'd1;
+		gov_back <= gov_back + {24'd0, back};
+		if (g_end && f_data) begin
+			gW     <= (g_win > 6'd31) ? 5'd31 : g_win[4:0];
+			w_data <= 1'b1;
+			w_pops <= 1'b0;
+			w_la   <= la[7:0];
+			w_siz  <= siz;
+			w_rw   <= rw;
+			w_par  <= f_cont ? w_par : ft0[0];
+			w_len  <= g_span;
+		end
+		else if (g_end) w_data <= 1'b0;
+	end
+end
 
 // position of S0: the rising edge before the one this AS was first seen at
 wire [4:0] t0 = (tpos == 5'd0) ? 5'd19 : tpos - 5'd1;
@@ -295,17 +388,109 @@ function [15:0] word64;        // the 16-bit word i of a 64-bit word (guest orde
 	input [63:0] q; input [1:0] i;
 	word64 = q[63 - 16 * i -: 16];
 endfunction
-function [63:0] merge64;       // a 32-bit write (be[3] = lowest address) into a 64-bit word
-	input [63:0] q; input hi; input [3:0] be; input [31:0] wd;
-	integer j;
-	begin
-		merge64 = q;
-		for (j = 0; j < 4; j = j + 1)
-			if (be[3 - j]) merge64[63 - 8 * (4 * hi + j) -: 8] = wd[31 - 8 * j -: 8];
-	end
-endfunction
 wire [23:2] maddr_rd = mem_addr(la, 1'b1);
 wire        rb_hit   = rb_valid && (rb_tag == maddr_rd[23:3]);
+
+task f_start;                  // plan the cycle seen on the bus (S0 at position t0)
+	begin
+		f_data <= !cpu_space;
+		f_iack <= cpu_space && (la[19:16] == 4'hF);
+		// the second half of a long operand: one window with the first
+		f_cont <= !cpu_space && w_data && !w_pops && (rw == w_rw) && (la[7:0] == w_la + 8'd2) &&
+		          (w_siz == 2'b00) && (siz == 2'b10);
+		// seen at the first rising edge after AS: S0 was the
+		// processor's previous rising edge (position t0)
+		fk     <= {4'd0, cpu_ce};
+		ft0    <= t0;
+		fplan  <= 1;
+		fready <= 0;
+		fjob   <= J_NONE;
+		fkind  <= K_D16;
+		tmo    <= 0;
+		if (cpu_space) begin
+			if (la[19:16] == 4'hF) begin
+				iack_req   <= 1;
+				iack_level <= la[3:1];
+				fjob  <= J_IACK;
+				fplan <= 0;            // the length depends on the source
+				fw    <= 5'd0;
+				fst   <= F_RUN;
+			end
+			else if (la[19:16] == 4'h2) begin
+				cp_req   <= 1;
+				cp_we    <= !rw;
+				cp_id    <= la[15:13];
+				cp_off   <= la[4:0];
+				cp_siz   <= siz;
+				cp_wdata <= d_o;
+				fjob <= J_CP;
+				fw   <= 5'd0;
+				fst  <= F_RUN;
+			end
+			else begin                 // breakpoint, MMU access level
+				fkind <= K_BERR; fw <= 5'd0;
+				f_assert(K_BERR);
+			end
+		end
+		else if ((is_prot && !is_super) || (is_vec && !rw)) begin
+			// supervisor space from user mode; the reset vectors are ROM
+			fkind <= K_BERR; fready <= 1; fw <= bank_w;
+			if (bank_w == 5'd0) f_assert(K_BERR); else fst <= F_RUN;
+		end
+		else if (is_vec && rw && ram_tos) begin
+			d_i    <= {2{la[2] ? (la[1] ? 16'h0000 : 16'h00E0) : (la[1] ? 16'h8000 : 16'h0000)}};
+			fready <= 1; fw <= bank_w;
+			if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
+		end
+		else if ((is_vec && rw) || (is_ram && rw) || ((is_rom || is_cart) && rw)) begin
+			fw    <= bank_w;
+			if (rb_hit) begin
+				d_i    <= {2{word64(rb_data, {maddr_rd[2], la[1]})}};
+				fready <= 1;
+				if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
+			end
+			else begin
+				fjob <= J_RD;
+				fst  <= F_RUN;
+			end
+		end
+		else if (is_ram && !rw) begin
+			fw <= bank_w;
+			if (!wb_valid) begin
+				wb_valid <= 1; wb_addr <= la[23:2]; wb_be <= p16_be; wb_data <= p16_wd;
+				if (rb_tag == la[23:3]) rb_valid <= 0;     // a write to the buffered word
+				fready <= 1;
+				if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
+			end
+			else begin
+				fjob <= J_WR;              // (the processor holds the write until DSACK)
+				fst  <= F_RUN;
+			end
+		end
+		else if (is_ide || is_io) begin
+			dev_we   <= !rw;
+			dev_addr <= la[23:1];
+			dev_uds  <= !la[0];
+			dev_lds  <= la[0] || (nbytes != 3'd1);
+			dev_din  <= d_o[31:16];
+			ciin_n   <= 0;                 // I/O is never cached
+			fw       <= is_ide ? bank_w : dev_w;
+			if (is_ym)    begin ym_seen <= 1; ym_cnt <= ym_seen ? ym_cnt + 2'd1 : 2'd0; end
+			if (is_aciar) acia_seen <= 1;
+			if (!wb_valid) begin           // RAM writes reach memory before any I/O
+				dev_cs  <= 1;
+				dev_stb <= 1;
+				fjob    <= J_DEV;
+			end
+			else fjob <= J_DEVW;
+			fst <= F_RUN;
+		end
+		else begin
+			fkind <= K_BERR; fready <= 1; fw <= bank_w;
+			if (bank_w == 5'd0) f_assert(K_BERR); else fst <= F_RUN;
+		end
+	end
+endtask
 
 task f_assert;                 // end the cycle (visible at the next falling edge)
 	input [1:0] k;
@@ -476,101 +661,14 @@ always @(posedge clk) begin
 		case (fst)
 		F_IDLE:
 			if (as_act) begin
-				// seen at the first rising edge after AS: S0 was the
-				// processor's previous rising edge (position t0)
-				fk     <= {4'd0, cpu_ce};
-				ft0    <= t0;
-				fplan  <= 1;
-				fready <= 0;
-				fjob   <= J_NONE;
-				fkind  <= K_D16;
-				tmo    <= 0;
-				if (cpu_space) begin
-					if (la[19:16] == 4'hF) begin
-						iack_req   <= 1;
-						iack_level <= la[3:1];
-						fjob  <= J_IACK;
-						fplan <= 0;            // the length depends on the source
-						fw    <= 5'd0;
-						fst   <= F_RUN;
-					end
-					else if (la[19:16] == 4'h2) begin
-						cp_req   <= 1;
-						cp_we    <= !rw;
-						cp_id    <= la[15:13];
-						cp_off   <= la[4:0];
-						cp_siz   <= siz;
-						cp_wdata <= d_o;
-						fjob <= J_CP;
-						fw   <= 5'd0;
-						fst  <= F_RUN;
-					end
-					else begin                 // breakpoint, MMU access level
-						fkind <= K_BERR; fw <= 5'd0;
-						f_assert(K_BERR);
-					end
-				end
-				else if ((is_prot && !is_super) || (is_vec && !rw)) begin
-					// supervisor space from user mode; the reset vectors are ROM
-					fkind <= K_BERR; fready <= 1; fw <= bank_w;
-					if (bank_w == 5'd0) f_assert(K_BERR); else fst <= F_RUN;
-				end
-				else if (is_vec && rw && ram_tos) begin
-					d_i    <= {2{la[2] ? (la[1] ? 16'h0000 : 16'h00E0) : (la[1] ? 16'h8000 : 16'h0000)}};
-					fready <= 1; fw <= bank_w;
-					if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
-				end
-				else if ((is_vec && rw) || (is_ram && rw) || ((is_rom || is_cart) && rw)) begin
-					faddr <= maddr_rd;
-					fa1   <= la[1];
-					fw    <= bank_w;
-					if (rb_hit) begin
-						d_i    <= {2{word64(rb_data, {maddr_rd[2], la[1]})}};
-						fready <= 1;
-						if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
-					end
-					else begin
-						fjob <= J_RD;
-						fst  <= F_RUN;
-					end
-				end
-				else if (is_ram && !rw) begin
-					fw <= bank_w;
-					if (!wb_valid) begin
-						wb_valid <= 1; wb_addr <= la[23:2]; wb_be <= p16_be; wb_data <= p16_wd;
-						if (rb_valid && rb_tag == la[23:3]) rb_data <= merge64(rb_data, la[2], p16_be, p16_wd);
-						fready <= 1;
-						if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
-					end
-					else begin
-						faddr <= la[23:2]; fbe <= p16_be; fwd <= p16_wd;
-						fjob <= J_WR;
-						fst  <= F_RUN;
-					end
-				end
-				else if (is_ide || is_io) begin
-					dev_we   <= !rw;
-					dev_addr <= la[23:1];
-					dev_uds  <= !la[0];
-					dev_lds  <= la[0] || (nbytes != 3'd1);
-					dev_din  <= d_o[31:16];
-					ciin_n   <= 0;                 // I/O is never cached
-					fw       <= is_ide ? bank_w : dev_w;
-					if (is_ym)    begin ym_seen <= 1; ym_cnt <= ym_seen ? ym_cnt + 2'd1 : 2'd0; end
-					if (is_aciar) acia_seen <= 1;
-					if (!wb_valid) begin           // RAM writes reach memory before any I/O
-						dev_cs  <= 1;
-						dev_stb <= 1;
-						fjob    <= J_DEV;
-					end
-					else fjob <= J_DEVW;
-					fst <= F_RUN;
-				end
-				else begin
-					fkind <= K_BERR; fready <= 1; fw <= bank_w;
-					if (bank_w == 5'd0) f_assert(K_BERR); else fst <= F_RUN;
-				end
+				// a new cycle: Hatari's internal time first (idle clocks), then
+				// its length from S0's position after them
+				if (g_dlt != 11'd0 || gA != 11'd0) fst <= F_GOV;
+				else f_start;
 			end
+
+		F_GOV:
+			if (gA == 11'd0) f_start;
 
 		F_RUN: begin
 			case (fjob)
@@ -578,7 +676,7 @@ always @(posedge clk) begin
 					if (!rd_inflight && !ram_req && !wb_valid) begin
 						ram_req   <= 1;
 						ram_we    <= 0;
-						ram_addr  <= faddr;
+						ram_addr  <= maddr_rd;
 						ram_be    <= 4'b1111;
 						rd_inflight <= 1;
 					end
@@ -586,16 +684,16 @@ always @(posedge clk) begin
 						ram_req     <= 0;
 						rd_inflight <= 0;
 						rb_valid    <= 1;
-						rb_tag      <= faddr[23:3];
+						rb_tag      <= maddr_rd[23:3];
 						rb_data     <= ram_rdata64;
-						d_i         <= {2{word64(ram_rdata64, {faddr[2], fa1})}};
+						d_i         <= {2{word64(ram_rdata64, {maddr_rd[2], la[1]})}};
 						fready      <= 1;
 						fjob        <= J_NONE;
 					end
 				J_WR:
 					if (!wb_valid) begin
-						wb_valid <= 1; wb_addr <= faddr; wb_be <= fbe; wb_data <= fwd;
-						if (rb_valid && rb_tag == faddr[23:3]) rb_data <= merge64(rb_data, faddr[2], fbe, fwd);
+						wb_valid <= 1; wb_addr <= la[23:2]; wb_be <= p16_be; wb_data <= p16_wd;
+						if (rb_tag == la[23:3]) rb_valid <= 0;
 						fready <= 1;
 						fjob   <= J_NONE;
 					end
@@ -662,7 +760,6 @@ always @(posedge clk) begin
 				fst <= F_IDLE;
 			end
 
-		default: fst <= F_IDLE;
 		endcase
 
 		if (buf_flush || (snoop_we && snoop_addr[23:3] == rb_tag)) rb_valid <= 0;

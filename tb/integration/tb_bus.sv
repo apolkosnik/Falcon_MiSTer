@@ -21,8 +21,13 @@ reg [31:0] a = 0, d = 0;
 reg [2:0] fc = 5;
 reg [1:0] siz = 2;
 reg rw = 1, as_n = 1, ds_n = 1;
+// +falcon: the bus bridge's Falcon mode (Hatari's cycle lengths and Falcon
+// time: a cycle started while the blitter owns the bus waits for the blit's
+// Hatari time); default: turbo, cycles end when answered
+reg turbo;
+initial turbo = !$test$plusargs("falcon");
 tb_top t(.clk(clk), .reset(reset), .cold_reset(reset), .por(reset),
- .ram_mb(4'd14), .ram_tos(1'b0), .monitor(monitor), .cpu_turbo(1'b0),
+ .ram_mb(4'd14), .ram_tos(1'b0), .monitor(monitor), .cpu_turbo(turbo),
  .ps2_key(11'd0), .ps2_mouse(25'd0), .joy0(32'd0), .rtc(65'd0),
  .img_mounted(7'd0), .img_readonly(1'b0), .img_size(64'd0),
  .sd_ack(7'd0), .sd_buff_addr(14'd0), .sd_buff_dout(8'd0), .sd_buff_wr(1'b0));
@@ -35,8 +40,8 @@ task cycle(input [23:0] addr, input wr, input [1:0] size, input [31:0] data);
   @(negedge clk); a = {8'd0,addr}; rw = !wr; siz = size; d = data; as_n = 0; ds_n = 0;
   n = 0;
   do begin @(posedge clk); #1; n = n + 1; end
-  while (t.system.berr_n && t.system.dsack0_n && t.system.dsack1_n && n < 2000);
-  if (n == 2000) $fatal(1, "Bus timeout at %06x",addr);
+  while (t.system.berr_n && t.system.dsack0_n && t.system.dsack1_n && n < (turbo ? 2000 : 200000));
+  if (n == (turbo ? 2000 : 200000)) $fatal(1, "Bus timeout at %06x",addr);
   berr = !t.system.berr_n; rd = t.system.cpu_di;
   @(negedge clk); as_n = 1; ds_n = 1;
   repeat (3) @(negedge clk);

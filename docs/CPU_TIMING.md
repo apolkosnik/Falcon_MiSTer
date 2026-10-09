@@ -1,9 +1,10 @@
 # A 16 MHz, cycle-accurate 68030 - design
 
 Status (branch `feature/cpu-16mhz`): decisions taken (below); milestones 1
-(the CPU clock: 16/8 MHz or 32 MHz turbo) and 2 (the Falcon bus: Hatari's
-cycle lengths on DDR3) done, see the sections at the end; milestones 3-4
-open.  Until milestone 1 the core ran the AP68030 on every
+(the CPU clock: 16/8 MHz or 32 MHz turbo), 2 (the Falcon bus: Hatari's
+cycle lengths on DDR3) and 3 (Hatari's internal timing, the blitter's costs,
+the comparison with Hatari) done, see the sections at the end; milestone 4
+(hardware) open.  Until milestone 1 the core ran the AP68030 on every
 clock of the 32 MHz system clock and ended every bus cycle as soon as memory
 or the device answered; a Falcon030 runs it at 16 MHz (8 MHz selectable) on
 a 16-bit bus.  This document says what "cycle-accurate" can mean for this
@@ -379,4 +380,111 @@ Verification:
 - Quartus 17.0, seed 3: timing met (+2.70 ns setup on the system clock),
   41,175 ALMs (98%, +892 over milestone 1): milestones 3 and 4 have about
   700 ALMs left.
+
+## Milestone 3: Hatari's internal timing (done)
+
+**What the measurements showed.**  The AP68030 is not faster than Hatari
+everywhere, as assumed in the plan: from its caches it runs register
+instructions in 1 clock (Hatari: 2 per instruction word), but an instruction
+with a memory operand costs it about 6 clocks besides the bus cycle (3 from
+dispatch to S0, 3 from the end of the cycle to the next dispatch: MOVE.W
+(An),Dn takes 8 clocks even on its own bench's 2-clock synchronous bus),
+where Hatari hides the next opcode's 2 clocks in the access's window.  So
+padding alone (the plan) cannot reach Hatari's timing; memory-heavy code ran
+at about half Hatari's speed.
+
+**The governor** (falcon_cpubus, Falcon mode) therefore maps the AP68030's
+internal time onto Hatari's in both directions, using the time accounting of
+milestone 2:
+
+- From the AP68030 it takes, per processor clock, the instruction words
+  consumed (`tm_pop`), a word-size MUL/DIV starting (`tm_md`) and the
+  dispatch pulse (new AP68030 outputs, `ap030_top` timing hooks).
+- It charges Hatari's internal time: 2 clocks per word, first from the last
+  bus access's window (its visible span; a long access is one window),
+  MULU.W/MULS.W 20, DIVU.W 34, DIVS.W 48, 4 idle clocks after an interrupt
+  acknowledge.
+- At every dispatch and every new bus cycle it compares that with the
+  AP68030's own clocks outside bus cycles.  If Hatari is ahead, idle clocks
+  pass (Falcon time and the clock position advance, the processor stays
+  frozen); if the AP68030 needed more, the clocks are given back (the
+  position goes back, the debt grows, the processor makes them up at
+  32 MHz), at most 32 per check so a STOP or a wait for the bus is not given
+  back.  Adjustments happen only between bus cycles, and a new cycle is
+  planned after them: in Falcon time every bus cycle starts where Hatari's
+  would and takes Hatari's length.
+- The blitter: while it owns the bus the processor is held (Hatari stops the
+  68030 for a blit) and the blit takes Hatari's time as idle clocks: 4 per
+  access, 4 when it takes the bus and 4 when it gives it back
+  (Blitter_BusArbitration, blitter.c:254-452); in non-hog mode the CPU's
+  share between bursts is 256 of its clocks in Falcon time (blitter.c:931,
+  falcon_blitter `fmode`/`ftick`), not 64 CPU bus cycles.
+
+**Real time.**  Falcon time is now Hatari's; real time follows as far as
+the hardware keeps up.  The AP68030 at 32 MHz makes up for its slow memory
+instructions, the DDR3 latency and the ARM's FPU only partly: memory-heavy
+code drives the debt to its cap and the excess is forgiven, so such code
+runs slower than Hatari in real time (in the timing program about half the
+system clocks were forgiven).  Register code and cached loops are exact in
+real time too.
+
+**The golden**: `tb/bustime/timing/` - `timing_body.i` holds 35 instruction
+sequences (register, branch, memory in every form, MUL/DIV word and long,
+shifts, subroutine calls, MOVEM, I/O, ROM, TRAP/RTE, I-cache off, D-cache
+on), each run once to fill the cache and then between two markers.  The same
+code runs on the core (`t_timing_rom.s` in tb_bustime, which prints the
+processor clock of each marker's S0) and in Hatari (`t_timing_tos.s`,
+`hatari_golden.sh`: Hatari's Falcon default headless, its CycleCounter at
+each marker from a debugger breakpoint); both copy the code to a 256-byte
+boundary so the instruction cache maps it the same way.  `run.sh` prints the
+table.  Result (clocks per test; "diff" is core - Hatari, "-base" the same
+less the harness's own -3):
+
+| test (x50 unless noted) | core | Hatari | -base |
+|------|-----:|-----:|-----:|
+| nop | 183 | 182 | +4 |
+| moveq / add.l Dn / move.l Dn | 127 / 175 / 171 | 138 / 146 / 154 | -8 / +32 / +20 |
+| lea d(An) | 287 | 262 | +28 |
+| dbra loop / bra.s x25 / bcc not taken | 279 / 135 / 131 | 262 / 106 / 142 | +20 / +32 / -8 |
+| move.w (An) / move.l (An) | 267 / 515 | 254 / 510 | +16 / +8 |
+| move.w, move.l to (An) | 235 / 435 | 246 / 446 | -8 / -8 |
+| move.l (An)+,(An)+ x25 | 515 | 502 | +16 |
+| move.w 1(An) (odd) | 499 | 494 | +8 |
+| mulu.w / muls.w / divu.w / divs.w x20 | 467 / 483 / 903 / 1195 | 478 / 478 / 898 / 1190 | -8 / +8 / +8 / +8 |
+| mulu.l / divu.l x20 | 155 / 271 | 142 / 250 | +16 / +24 |
+| lsl.l #8 / asr.w Dn | 171 / 127 | 174 / 138 | 0 / -8 |
+| bsr/rts / jsr/rts x25 | 459 / 515 | 446 / 478 | +16 / +40 |
+| movem.l x10 | 723 | 718 | +8 |
+| MFP read x20 / ROM move.l | 199 / 335 | 186 / 346 | +16 / -8 |
+| add.l Dn,(An) x25 / clr.l (An) | 435 / 523 | 446 / 510 | -8 / +16 |
+| trap/rte x10 | 451 | 446 | +8 |
+| ext/swap x50 | 227 | 246 | -16 |
+| nop, I-cache off / move.w (An), I-cache off | 291 / 491 | 262 / 470 | +32 / +24 |
+| move.l (An), D-cache / copy, D-cache | 171 / 307 | 174 / 294 | 0 / +16 |
+
+Before the governor the same table had the core at 1.0-2.3 times Hatari
+(e.g. move.w (An) 563 against 246, bsr/rts 834 against 454).  The residual
+is within about 0.3 clock per instruction, mostly in multiples of 8 clocks:
+one long instruction fetch from ST-RAM.  It comes from the AP68030's
+prefetch, which runs further ahead than Hatari's 3-word queue (more fetches
+past branches and into lines that conflict in the cache), and from the
+slot phase of the accesses that follow.  Making that exact would mean giving
+the AP68030 Hatari's fetch policy (a change to its fetch unit); the odd word
+(two byte cycles, hardware) stays a deviation.
+
+Verification: tb/bustime passes with the governor (every cycle Hatari's
+length; the program takes the same Falcon time, 25,394 clocks, in all five
+configurations, with the debt at its cap at 16 MHz); tb/fpu 7167/7167 in
+both modes; tb/integration in turbo and Falcon mode (`+falcon`: a cycle the
+bench starts during a blit now waits for the blit's Hatari time); tb/blitter
+passes; the AP68030 regression passes with the timing hooks; FPUTEST passes
+at 16 MHz; turbo is still bit-identical (same PC trace).  Quartus 17.0:
+the first fit was 4 LABs over the device (41,537 ALMs); the bridge was
+trimmed where only real time is affected (a CPU write to the buffered word
+invalidates the read-ahead buffer instead of merging into it; reads and a
+write waiting for the posted one use the address and data still on the
+bus; the long-operand check compares the low address bits; clocks are
+given back in steps of at most 31), leaving 41,176 ALMs (98%, about the
+same as milestone 2).  Seed 2: timing met (worst slack +0.167 ns, in the
+HDMI domain; seed 3 missed it there by 0.9 ns).
 

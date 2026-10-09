@@ -25,7 +25,8 @@
 //  Plusargs: +rom=<hex> (the program), +mhz8 (8 MHz), +vidload (video
 //  fetches), +seed=<n> (device and IACK delays), +maxclk=<n>, +trace.
 //
-//  Test device at $FFFF00: see t_bustime.s.
+//  Test device at $FFFF00: see t_bustime.s.  A word written to $3F0 is a
+//  timing marker (timing/): "MARK <value> <processor clock of its S0>".
 //============================================================================
 
 module tb_bustime;
@@ -60,7 +61,10 @@ wire        dsack0_n, dsack1_n, berr_n, avec_n, ciin_n;
 reg   [2:0] irq_level = 3'd0;
 wire        snoop_we;
 wire [23:0] snoop_addr;
-wire        cpu_ce, cpu_hold, cpu_fmode;
+wire        cpu_ce, cpu_hold, cpu_fmode, cpu_idle, cpu_idle_tick;
+wire  [1:0] cpu_tm_pop, cpu_tm_md;
+wire [31:0] gov_idle, gov_back, idled;
+wire  [7:0] cpu_back;
 wire  [4:0] cpu_tpos;
 wire  [3:0] cpu_credit;
 wire [15:0] debt, debt_peak;
@@ -69,8 +73,8 @@ wire [31:0] forgiven, held;
 falcon_cpuclk cpuclk
 (
 	.clk(clk), .reset(reset), .turbo(!cpu_fmode), .cpu_16mhz(!mhz8),
-	.hold(cpu_hold), .credit(cpu_credit), .cpu_ce(cpu_ce), .tpos(cpu_tpos),
-	.debt(debt), .debt_peak(debt_peak), .forgiven(forgiven), .held(held)
+	.hold(cpu_hold), .credit(cpu_credit), .idle(cpu_idle), .back(cpu_back), .cpu_ce(cpu_ce), .idle_tick(cpu_idle_tick),
+	.tpos(cpu_tpos), .debt(debt), .debt_peak(debt_peak), .forgiven(forgiven), .held(held), .idled(idled)
 );
 
 ap030_top #(.USE_CE(1)) cpu
@@ -89,7 +93,7 @@ ap030_top #(.USE_CE(1)) cpu
 	.ipl_n(~irq_level), .ipend_n(cpu_ipend_n),
 	.reset_n_i(~reset), .reset_n_oe(cpu_reset_oe),
 	.cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
-	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .dbg_halted(cpu_halted),
+	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .dbg_halted(cpu_halted),
 	.dbg_vbr(), .dbg_cacr(), .dbg_cache_clear(),
 	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0)
 );
@@ -131,7 +135,10 @@ falcon_cpubus cpubus
 	.fmode_in(1'b1), .fmode(cpu_fmode), .cpu_ce(cpu_ce), .tpos(cpu_tpos),
 	.inst(cpu_inst & cpu_ce), .hold(cpu_hold), .credit(cpu_credit), .wbuf_busy(),
 	.ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
-	.buf_flush(1'b0), .iack_mfp(iack_mfp)
+	.buf_flush(1'b0), .iack_mfp(iack_mfp),
+	.dispatch(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md),
+	.idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(1'b0), .blit_acc(1'b0),
+	.gov_idle(gov_idle), .gov_back(gov_back)
 );
 
 //----------------------------------------------------------------- memory
@@ -279,7 +286,7 @@ integer e = 0;                 // processor rising edges before this clock
 integer started = -1;          // S0 of the first bus cycle
 integer finished = -1;         // S0 of the cycle that writes the result
 integer credits = 0;
-reg     in_cyc = 1'b0, c_iack;
+reg     in_cyc = 1'b0, c_iack, c_pend = 1'b0;
 integer c_t0, c_exp, c_credit;
 reg [23:0] c_a;
 reg  [2:0] c_fc;
@@ -353,19 +360,27 @@ always @(posedge clk) begin
 			$display("%8d %0s a=%06x fc=%0d siz=%0d S0 at %0d: %0d clocks (Hatari %0d, +%0d)",
 			         sysclk, c_rw ? "RD" : "WR", c_a, c_fc, c_siz, c_t0, len, c_exp, c_credit);
 	end
-	// start of a cycle: the first clock with AS (S0 was the previous edge)
+	// start of a cycle: the first clock with AS.  Its S0 position counts the
+	// idle clocks the governor inserts before the cycle goes on: it is taken
+	// at the processor's next rising edge (S0 was the edge before it)
 	if (as_act && !in_cyc && !reset) begin
-		reg fast16;
 		in_cyc   = 1'b1;
-		c_t0     = e - 1;
+		c_pend   = 1'b1;
 		c_a      = cpu_a[23:0];
 		c_fc     = cpu_fc;
 		c_siz    = cpu_siz;
 		c_rw     = cpu_rw;
 		c_credit = 0;
 		c_iack   = 1'b0;
+	end
+	if (c_pend && cpu_ce) begin
+		reg fast16;
+		c_pend = 1'b0;
+		c_t0   = e - 1;
 		if (started < 0) started = c_t0;
-		if (!cpu_rw && c_a == 24'hFFFF00) finished = c_t0;
+		if (!c_rw && c_a == 24'hFFFF00) finished = c_t0;
+		// timing markers (timing/timing_body.i): the processor clock at S0
+		if (!c_rw && c_a == 24'h0003F0) $display("MARK %0d %0d", cpu_do[31:16], c_t0);
 		if (c_fc == 3'd7) begin
 			if (c_a[19:16] == 4'hF) c_iack = 1'b1;
 			else c_exp = 3;
@@ -378,7 +393,9 @@ always @(posedge clk) begin
 	end
 	if (cpu_inst && cpu_ce) begin k_ym_seen = 1'b0; k_acia_seen = 1'b0; end
 	if (cpu_hold && in_cyc) n_held_cyc = n_held_cyc + 1;
-	e = reset ? 0 : e + (cpu_ce ? 1 : 0);   // positions from reset, as falcon_cpuclk's
+	// Falcon time from reset, as falcon_cpuclk's position: processor and idle
+	// clocks, less the clocks the governor gives back
+	e = reset ? 0 : e + ((cpu_ce || cpu_idle_tick) ? 1 : 0) - cpu_back;
 end
 
 //----------------------------------------------------------------- run
@@ -394,6 +411,7 @@ initial begin
 	$display("");
 	$display("debt peak %0d, forgiven %0d, held %0d system clocks; %0d system clocks",
 	         debt_peak, forgiven, held, sysclk);
+	$display("governor: %0d idle clocks inserted, %0d clocks given back", gov_idle, gov_back);
 	$display("PROCESSOR CLOCKS %0d (from the first bus cycle to the result, less unavoidable wait states)",
 	         finished - started - credits);
 	if (cpu_halted) $display("FAIL: processor halted at pc %08x", dbg_pc);

@@ -88,14 +88,16 @@ always @(posedge clk) begin
     cpu_div <= (cpu_div == CPU_DIV - 1) ? 2'd0 : cpu_div + 2'd1;
     div_ce  <= (CPU_DIV == 1) || (cpu_div == CPU_DIV - 1);
 end
-wire       fc_ce, cpu_hold, cpu_fmode, cpu_inst;
+wire       fc_ce, cpu_hold, cpu_fmode, cpu_inst, cpu_idle, cpu_idle_tick;
+wire [1:0] cpu_tm_pop, cpu_tm_md;
+wire [7:0] cpu_back;
 wire [4:0] cpu_tpos;
 wire [3:0] cpu_credit;
 falcon_cpuclk cpuclk
 (
     .clk(clk), .reset(reset), .turbo(!cpu_fmode), .cpu_16mhz(1'b1),
-    .hold(cpu_hold), .credit(cpu_credit), .cpu_ce(fc_ce), .tpos(cpu_tpos),
-    .debt(), .debt_peak(), .forgiven(), .held()
+    .hold(cpu_hold), .credit(cpu_credit), .idle(cpu_idle), .back(cpu_back), .cpu_ce(fc_ce), .idle_tick(cpu_idle_tick), .tpos(cpu_tpos),
+    .debt(), .debt_peak(), .forgiven(), .held(), .idled()
 );
 wire cpu_ce = (FMODE != 0) ? fc_ce : div_ce;
 
@@ -115,7 +117,7 @@ ap030_top #(.USE_CE(1)) cpu
     .ipl_n(ipl_n), .ipend_n(cpu_ipend_n),
     .reset_n_i(~reset), .reset_n_oe(cpu_reset_oe),
     .cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
-    .dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_dbg_inst), .dbg_halted(cpu_halted),
+    .dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_dbg_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .dbg_halted(cpu_halted),
     .dbg_vbr(), .dbg_cacr(), .dbg_cache_clear(),
     .snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0)
 );
@@ -166,7 +168,10 @@ falcon_cpubus cpubus
     .fmode_in(FMODE != 0), .fmode(cpu_fmode), .cpu_ce(cpu_ce), .tpos(cpu_tpos),
     .inst(cpu_dbg_inst & cpu_ce), .hold(cpu_hold), .credit(cpu_credit), .wbuf_busy(),
     .ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
-    .buf_flush(1'b0), .iack_mfp(1'b0)
+    .buf_flush(1'b0), .iack_mfp(1'b0),
+    .dispatch(cpu_dbg_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md),
+    .idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(1'b0), .blit_acc(1'b0),
+    .gov_idle(), .gov_back()
 );
 
 // ---------------------------------------------------------------- FPU bridge
