@@ -650,6 +650,8 @@ the one to run; its reference is the same whatever its size (rebuilt with
 another title, ref.sh gives the same numbers).  Third run, CPUTIME 3 on the
 core with the line cache (2026-10-09): Falcon time equal to the simulation
 in 36 of 36 spans - on the board's DDR3 Falcon time is the simulation's.
+Fourth run, CPUTIME 3 on the committed bitstream (the line cache, without
+the register file patch): 36 of 36.
 
 **The CPU's line cache** (`falcon_l2`, apolkosnik's suggestion: block
 RAM).  Real time is where the core falls short: every CPU read from the
