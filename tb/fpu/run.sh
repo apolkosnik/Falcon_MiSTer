@@ -59,7 +59,7 @@ if [ "${NOBUILD:-0}" != 1 ] || [ ! -x obj/vl/tb_fpu ] || [ -n "$BRIDGE_SV$CPUBUS
 		-I$CPU -I$CPU/core --top-module tb_fpu_top -GCLK_HZ=$CLK_HZ -GCPU_DIV=${CPU_DIV:-1} -GFMODE=${FMODE:-0} --Mdir obj/vl \
 		$CPU/ap030_top.v $CPU/ap030_core.v $CPU/ap030_memsys.v $CPU/ap030_mmu.v $CPU/ap030_cache.v \
 		$CPU/ap030_bus.v $CPU/ap030_alu.v $CPU/ap030_muldiv.v $CPU/ap030_regfile.v \
-		${CPUBUS_SV:-$RTL/falcon/falcon_cpubus.sv} $RTL/falcon/falcon_cpuclk.sv ${MEMARB_SV:-$RTL/falcon/falcon_memarb.sv} ${BRIDGE_SV:-$RTL/falcon/falcon_fpu_bridge.sv} \
+		${CPUBUS_SV:-$RTL/falcon/falcon_cpubus.sv} $RTL/falcon/falcon_cpuclk.sv $RTL/falcon/falcon_pipescan.sv ${MEMARB_SV:-$RTL/falcon/falcon_memarb.sv} ${BRIDGE_SV:-$RTL/falcon/falcon_fpu_bridge.sv} \
 		tb_fpu_top.sv tb_fpu.cpp m2.cpp m3.cpp \
 		-CFLAGS "-O2 -Wall -Wextra -DTB_CLK_HZ=$CLK_HZ" -LDFLAGS "$PWD/obj/golden.o $LIBFPE -lm" -o tb_fpu > obj/build.log 2>&1 \
 		|| { tail -40 obj/build.log; echo "RESULT: FAIL (build)"; exit 1; }

@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")"
 R=${RTL:-../../rtl}
 DEFS=""
-SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_combel.sv
+SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/falcon_pipescan.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_combel.sv
  $R/falcon/falcon_videl.sv $R/falcon/falcon_psg.sv $R/falcon/falcon_mfp.sv $R/falcon/falcon_mfp_timer.sv $R/falcon/falcon_mfp_usart.sv
  $R/falcon/falcon_acia.sv $R/falcon/falcon_ikbd.sv $R/falcon/falcon_ikbd_keymap.sv $R/falcon/falcon_nvram.sv $R/falcon/falcon_mbox_test.sv $R/falcon/falcon_fpu_bridge.sv
  $R/falcon/falcon_blitter.sv $R/falcon/falcon_crossbar.sv"
@@ -19,8 +19,8 @@ case " $BRINGUP " in *" NO_DSP "*) DEFS="$DEFS +define+FALCON_NO_DSP" ;; *) SRCS
 # the 68882 engine for --fpu (Hatari's fpp.c, tools/falcon_fpu/engine)
 FPE=../../tools/falcon_fpu/engine
 HOST_ONLY=1 $FPE/build.sh > /dev/null
-# the PSG volume table is found relative to the project root, as in Quartus
-[ -n "$RTL" ] || { mkdir -p rtl/falcon && ln -sf ../../$R/falcon/falcon_psg_vol.mem rtl/falcon/falcon_psg_vol.mem; }
+# the .mem tables (PSG volumes, opcode table) are found relative to the project root, as in Quartus
+[ -n "$RTL" ] || { mkdir -p rtl/falcon && ln -sf ../../$R/falcon/falcon_psg_vol.mem rtl/falcon/falcon_psg_vol.mem; ln -sf ../../$R/falcon/falcon_optbl.mem rtl/falcon/falcon_optbl.mem; }
 verilator --cc --exe --build -j 16 -O3 --x-assign fast --x-initial fast \
 	-Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD -Wno-MULTIDRIVEN -Wno-UNOPTFLAT \
 	--top-module tb_top -Mdir ${OBJ:-obj_dir} $DEFS \

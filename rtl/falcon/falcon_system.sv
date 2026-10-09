@@ -128,6 +128,18 @@ wire        cpu_16mhz;
 wire        cpu_ce, cpu_hold, cpu_fmode, cpu_wbuf_busy, cpu_inst, cpu_idle, cpu_idle_tick;
 wire  [1:0] cpu_tm_pop, cpu_tm_md;
 wire  [7:0] cpu_back;
+wire [95:0] cpu_tm_q;
+wire  [2:0] cpu_tm_qn;
+wire [31:0] cpu_tm_scan, cpu_fetch_stop;
+wire        cpu_tm_flush, cpu_fetch_stop_v, cpu_scan_v;
+wire [31:0] cpu_scan_to;
+// Hatari's prefetch pipeline (stops before unconditional branches)
+falcon_pipescan pipescan
+(
+	.clk(clk), .ce(cpu_ce), .enable(cpu_fmode), .q(cpu_tm_q), .qn(cpu_tm_qn), .scan(cpu_tm_scan),
+	.flush(cpu_tm_flush), .stop_v(cpu_fetch_stop_v), .stop_at(cpu_fetch_stop),
+	.scan_v(cpu_scan_v), .scan_to(cpu_scan_to)
+);
 wire  [4:0] cpu_tpos;
 wire  [3:0] cpu_credit;
 falcon_cpuclk cpuclk
@@ -153,8 +165,12 @@ ap030_top #(.USE_CE(1)) cpu
 	.reset_n_i(~(reset | sv_busy)), .reset_n_oe(cpu_reset_oe),
 	.cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
 	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .dbg_halted(cpu_halted),
+	.tm_q(cpu_tm_q), .tm_qn(cpu_tm_qn), .tm_scan(cpu_tm_scan), .tm_flush(cpu_tm_flush),
+	.fetch_stop_v(cpu_fetch_stop_v), .fetch_stop(cpu_fetch_stop),
+	.fetch_scan_v(cpu_scan_v), .fetch_scan_to(cpu_scan_to),
 	.dbg_vbr(), .dbg_cacr(), .dbg_cache_clear(),
-	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0)
+	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0),
+	.fetch_lazy(cpu_fmode)   // Falcon mode: Hatari's instruction prefetch
 );
 
 //////////////////////////////////////////////////////////////////

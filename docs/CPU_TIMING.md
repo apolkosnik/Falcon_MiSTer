@@ -191,6 +191,15 @@ so its cost goes to that instruction.
   on every data write overwrites it with the written address's cachability
   (newcpu.c:859-871): after a write to I/O, instruction fills are not cached
   until the next write to RAM or ROM.
+- Fetch stop (MORE_ACCURATE_68020_PIPELINE, `pipeline_020`,
+  newcpu.c:9503-9586): with every consumed word the queue's second word
+  (`prefetch020[1]`) is decoded, instruction lengths from `cpudatatbl`
+  (length without brief/full extension words, whose positions `disp020`
+  gives; a full extension adds its displacements).  An unconditional flow
+  change (`branch > 0`: RTS, RTE, RTD, RTR, JSR, JMP, BSR; not TRAP, F-line
+  or illegal opcodes) stops the fetches one word early: while
+  `pipeline_stop < 0` get_word_ce030_prefetch_2 fetches no longword, until
+  the branch refills the queue.  Bcc (BRA included) does not stop them.
 - **Each consumed instruction word costs 2 clocks** (`do_cycles_ce020_internal(2)`,
   newcpu.c:10627), taken first from the window of the last bus access
   (cpu_prefetch.h:54-80: the window is that access's visible duration; a new
@@ -428,63 +437,112 @@ runs slower than Hatari in real time (in the timing program about half the
 system clocks were forgiven).  Register code and cached loops are exact in
 real time too.
 
+**Hatari's prefetch.**  With the governor every bus cycle starts where
+Hatari's would, provided the processor issues the same bus cycles; the
+AP68030's prefetch did not.  It kept four words ahead where Hatari keeps a
+3-word queue (a longword fetched when two words or fewer are left), and it
+fetched past an RTS or JMP into words the branch throws away, where Hatari
+stops one word early (`pipeline_020`, see "Instruction fetch" above).  Each
+extra or displaced fetch from ST-RAM shifts the following accesses' slots;
+the governor alone left a residual within about 0.3 clock per instruction,
+in multiples of 8 clocks (one longword from ST-RAM).  So the fetch policy
+is now Hatari's:
+
+- `fetch_lazy` (new AP68030 input, set in Falcon mode): a longword is
+  fetched only when two words or fewer are left, queued or on the way,
+  after the words taken in a clock; a branch refills the queue with the
+  target's longword and the next one (fill_prefetch_030_ntx).
+- `falcon_pipescan` runs `pipeline_020` over the AP68030's prefetch queue
+  (new outputs `tm_q`/`tm_qn`/`tm_scan`/`tm_flush`), one word per
+  processor clock as the words arrive, with Hatari's opcode table in block
+  RAM: `rtl/falcon/falcon_optbl.mem`, 64K entries of 9 bits (length in
+  words, stop, the two extension-word positions), generated from Hatari's
+  own tables by `tools/optbl/gen.sh` (its generated `op_smalltbl_23` and
+  table68k, as build_cpufunctbl builds `cpudatatbl`).  As in Hatari a
+  refill scans from the target on (add_prefetch_030 scans each word it
+  adds), brief/full extension words are consumed at their positions, and
+  an F-line opcode (variable length) ends the scan until the next refill.
+  When it decodes a stopping instruction it reports the address where
+  Hatari's stop takes effect (`fetch_stop`); the AP68030 fetches no
+  longword once the next word to take is at `fetch_stop - 2` or beyond.
+- Hatari decides a fetch after scanning the word two ahead of the
+  consumption that made it due, and its words arrive at once; the
+  AP68030's arrive later.  So a fetch decision waits until the scan has
+  passed that word (`fetch_scan_to`), and the stop is judged against the
+  consumption point latched when the fetch became due, not a later one.
+  A fetch the stop holds back for 63 clocks with nothing queued goes ahead
+  anyway (a guard, so a wrong stop cannot hang the processor).
+- The scanner runs on the processor's clock enable, so the processor's
+  behaviour stays a function of its own clocks: tb/bustime still takes the
+  same processor clocks in all five configurations.
+
 **The golden**: `tb/bustime/timing/` - `timing_body.i` holds 35 instruction
 sequences (register, branch, memory in every form, MUL/DIV word and long,
 shifts, subroutine calls, MOVEM, I/O, ROM, TRAP/RTE, I-cache off, D-cache
 on), each run once to fill the cache and then between two markers.  The same
-code runs on the core (`t_timing_rom.s` in tb_bustime, which prints the
-processor clock of each marker's S0) and in Hatari (`t_timing_tos.s`,
-`hatari_golden.sh`: Hatari's Falcon default headless, its CycleCounter at
-each marker from a debugger breakpoint); both copy the code to a 256-byte
-boundary so the instruction cache maps it the same way.  `run.sh` prints the
-table.  Result (clocks per test; "diff" is core - Hatari, "-base" the same
-less the harness's own -3):
+code runs on the core (`t_timing_rom.s` in tb_bustime) and in Hatari
+(`t_timing_tos.s`, `hatari_golden.sh`: Hatari's Falcon default headless, its
+CycleCounter at each marker from a debugger breakpoint); both copy the code
+to a 256-byte boundary so the instruction cache maps it the same way.
+Hatari reads its counter at the instruction boundary after the marker
+write, so the core reports the same point (`MARKE`: the Falcon clock, with
+the governor's balance, at the next dispatch).  `run.sh` prints the table.
 
-| test (x50 unless noted) | core | Hatari | -base |
+A test's own column (between its two markers) is mostly 12 clocks short
+of Hatari: a fetch near the end marker issues on the core a few clocks
+later than in Hatari (the decision waits for the words to arrive and be
+scanned) and lands just after the marker instead of just before it, so
+its cost moves to the next section, which is 12 long.  The span from a
+test's first marker to the next test's first marker (the test and the next
+test's cache-filling run) contains both and is the measure (clocks; "diff"
+is core - Hatari):
+
+| test (x50 unless noted) | core | Hatari | diff |
 |------|-----:|-----:|-----:|
-| nop | 183 | 182 | +4 |
-| moveq / add.l Dn / move.l Dn | 127 / 175 / 171 | 138 / 146 / 154 | -8 / +32 / +20 |
-| lea d(An) | 287 | 262 | +28 |
-| dbra loop / bra.s x25 / bcc not taken | 279 / 135 / 131 | 262 / 106 / 142 | +20 / +32 / -8 |
-| move.w (An) / move.l (An) | 267 / 515 | 254 / 510 | +16 / +8 |
-| move.w, move.l to (An) | 235 / 435 | 246 / 446 | -8 / -8 |
-| move.l (An)+,(An)+ x25 | 515 | 502 | +16 |
-| move.w 1(An) (odd) | 499 | 494 | +8 |
-| mulu.w / muls.w / divu.w / divs.w x20 | 467 / 483 / 903 / 1195 | 478 / 478 / 898 / 1190 | -8 / +8 / +8 / +8 |
-| mulu.l / divu.l x20 | 155 / 271 | 142 / 250 | +16 / +24 |
-| lsl.l #8 / asr.w Dn | 171 / 127 | 174 / 138 | 0 / -8 |
-| bsr/rts / jsr/rts x25 | 459 / 515 | 446 / 478 | +16 / +40 |
-| movem.l x10 | 723 | 718 | +8 |
-| MFP read x20 / ROM move.l | 199 / 335 | 186 / 346 | +16 / -8 |
-| add.l Dn,(An) x25 / clr.l (An) | 435 / 523 | 446 / 510 | -8 / +16 |
-| trap/rte x10 | 451 | 446 | +8 |
-| ext/swap x50 | 227 | 246 | -16 |
-| nop, I-cache off / move.w (An), I-cache off | 291 / 491 | 262 / 470 | +32 / +24 |
-| move.l (An), D-cache / copy, D-cache | 171 / 307 | 174 / 294 | 0 / +16 |
+| nop / moveq / add.l Dn / move.l Dn | 416 / 384 / 400 / 596 | 416 / 388 / 396 / 604 | 0 / -4 / +4 / -8 |
+| lea d(An) | 528 | 524 | +4 |
+| dbra loop / bra.s x25 / bcc not taken | 504 / 348 / 588 | 512 / 340 / 592 | -8 / +8 / -4 |
+| move.w (An) / move.l (An) | 896 / 952 | 896 / 952 | 0 / 0 |
+| move.w, move.l to (An) | 880 / 1000 | 880 / 1000 | 0 / 0 |
+| move.l (An)+,(An)+ x25 / move.w 1(An) (odd) | 1360 / 1008 | 1360 / 1008 | 0 / 0 |
+| mulu.w / muls.w / divu.w / divs.w x20 | 1000 / 1560 / 2240 / 1412 | 1000 / 1560 / 2228 / 1400 | 0 / 0 / +12 / +12 |
+| mulu.l / divu.l x20 | 584 / 496 | 592 / 492 | -8 / +4 |
+| lsl.l #8 / asr.w Dn | 408 / 800 | 416 / 796 | -8 / +4 |
+| bsr/rts / jsr/rts x25 | 976 / 1244 | 976 / 1232 | 0 / +12 |
+| movem.l x10 | 1072 | 1080 | -8 |
+| MFP read x20 / ROM move.l | 724 / 884 | 724 / 884 | 0 / 0 |
+| add.l Dn,(An) x25 / clr.l (An) | 1096 / 992 | 1096 / 992 | 0 / 0 |
+| trap/rte x10 / ext/swap | 884 / 507 | 880 / 508 | +4 / -1 |
+| nop, I-cache off / move.w (An), I-cache off | 720 / 761 | 720 / 760 | 0 / +1 |
+| move.l (An), D-cache / copy, D-cache | 712 / 335 | 728 / 364 | -16 / -29 |
 
-Before the governor the same table had the core at 1.0-2.3 times Hatari
-(e.g. move.w (An) 563 against 246, bsr/rts 834 against 454).  The residual
-is within about 0.3 clock per instruction, mostly in multiples of 8 clocks:
-one long instruction fetch from ST-RAM.  It comes from the AP68030's
-prefetch, which runs further ahead than Hatari's 3-word queue (more fetches
-past branches and into lines that conflict in the cache), and from the
-slot phase of the accesses that follow.  Making that exact would mean giving
-the AP68030 Hatari's fetch policy (a change to its fetch unit); the odd word
-(two byte cycles, hardware) stays a deviation.
+Whole sections: with the I-cache on and the D-cache off (markers 1-62) the
+core takes 26,454 clocks and Hatari 26,462 (-0.03%); 14 of those 31 spans
+are exact, the others within 12 clocks either way, and they largely cancel.  The rest
+(I-cache off, then D-cache on; markers 63-72) is 2,574 against 2,618
+(-1.7%), almost all in the two D-cache tests, whose timelines differ in the
+fills right after the marker; that is not explained yet.  Everything:
+29,313 against 29,342 (-0.10%).  Before the governor the core took 1.0-2.3
+times Hatari's clocks (move.w (An) 563 against 246, bsr/rts 834 against
+454).  The odd word (two byte cycles, hardware) stays a deviation.
 
-Verification: tb/bustime passes with the governor (every cycle Hatari's
-length; the program takes the same Falcon time, 25,394 clocks, in all five
-configurations, with the debt at its cap at 16 MHz); tb/fpu 7167/7167 in
-both modes; tb/integration in turbo and Falcon mode (`+falcon`: a cycle the
-bench starts during a blit now waits for the blit's Hatari time); tb/blitter
-passes; the AP68030 regression passes with the timing hooks; FPUTEST passes
-at 16 MHz; turbo is still bit-identical (same PC trace).  Quartus 17.0:
-the first fit was 4 LABs over the device (41,537 ALMs); the bridge was
-trimmed where only real time is affected (a CPU write to the buffered word
-invalidates the read-ahead buffer instead of merging into it; reads and a
-write waiting for the posted one use the address and data still on the
-bus; the long-operand check compares the low address bits; clocks are
-given back in steps of at most 31), leaving 41,176 ALMs (98%, about the
-same as milestone 2).  Seed 2: timing met (worst slack +0.167 ns, in the
-HDMI domain; seed 3 missed it there by 0.9 ns).
+Verification (with the prefetch model): tb/bustime passes (every cycle
+Hatari's length; the program takes the same 24,370 processor clocks in all
+five configurations, with the debt at its cap at 16 MHz); tb/fpu 7167/7167
+in both modes; tb/integration in turbo and Falcon mode (`+falcon`: a cycle
+the bench starts during a blit waits for the blit's Hatari time); tb/blitter
+passes; the AP68030 regression (every program also with `+lazy`) passes in
+the pin and FAST_PORT builds; FPUTEST passes at 16 MHz; turbo is still
+bit-identical (same PC trace).
 
+Quartus 17.0, governor (milestone 3 commit): the first fit was 4 LABs over
+the device (41,537 ALMs); the bridge was trimmed where only real time is
+affected (a CPU write to the buffered word invalidates the read-ahead
+buffer instead of merging into it; reads and a write waiting for the posted
+one use the address and data still on the bus; the long-operand check
+compares the low address bits; clocks are given back in steps of at most
+31), leaving 41,176 ALMs (98%, about the same as milestone 2).  Seed 2:
+timing met (worst slack +0.167 ns, in the HDMI domain; seed 3 missed it
+there by 0.9 ns).  With the prefetch model: 41,362 ALMs (99%; the scanner
+and the fetch rule about 190), 348 RAM blocks (the opcode table 72);
+seed 2 meets timing (worst slack +0.155 ns, HDMI domain).

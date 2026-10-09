@@ -12,7 +12,7 @@ O=../obj
 "$VASM" -Fbin -m68030 -no-opt -quiet -o $O/t_timing_rom.bin t_timing_rom.s
 "$VASM" -Ftos -m68030 -no-opt -quiet -o $O/TIMING.PRG t_timing_tos.s
 python3 -I ../../system/rom2hex64.py $O/t_timing_rom.bin $O/t_timing_rom.hex
-$O/vl/tb_bustime +rom=$O/t_timing_rom.hex > $O/timing_core.log 2>&1
+(cd .. && obj/vl/tb_bustime +rom=obj/t_timing_rom.hex) > $O/timing_core.log 2>&1   # (the table path is relative to tb/bustime)
 grep -E "^(PASS|FAIL|governor)" $O/timing_core.log
 if [ -n "${HATARI:-}" ] && [ -n "${TOS:-}" ]; then
 	./hatari_golden.sh $O/TIMING.PRG > $O/timing_hatari.txt

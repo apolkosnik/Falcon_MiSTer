@@ -65,6 +65,17 @@ wire        cpu_ce, cpu_hold, cpu_fmode, cpu_idle, cpu_idle_tick;
 wire  [1:0] cpu_tm_pop, cpu_tm_md;
 wire [31:0] gov_idle, gov_back, idled;
 wire  [7:0] cpu_back;
+wire [95:0] cpu_tm_q;
+wire  [2:0] cpu_tm_qn;
+wire [31:0] cpu_tm_scan, cpu_fetch_stop;
+wire        cpu_tm_flush, cpu_fetch_stop_v, cpu_scan_v;
+wire [31:0] cpu_scan_to;
+falcon_pipescan #(.OPTBL_MEM("../../rtl/falcon/falcon_optbl.mem")) pipescan
+(
+	.clk(clk), .ce(cpu_ce), .enable(cpu_fmode), .q(cpu_tm_q), .qn(cpu_tm_qn), .scan(cpu_tm_scan),
+	.flush(cpu_tm_flush), .stop_v(cpu_fetch_stop_v), .stop_at(cpu_fetch_stop),
+	.scan_v(cpu_scan_v), .scan_to(cpu_scan_to)
+);
 wire  [4:0] cpu_tpos;
 wire  [3:0] cpu_credit;
 wire [15:0] debt, debt_peak;
@@ -94,8 +105,11 @@ ap030_top #(.USE_CE(1)) cpu
 	.reset_n_i(~reset), .reset_n_oe(cpu_reset_oe),
 	.cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
 	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .dbg_halted(cpu_halted),
+	.tm_q(cpu_tm_q), .tm_qn(cpu_tm_qn), .tm_scan(cpu_tm_scan), .tm_flush(cpu_tm_flush),
+	.fetch_stop_v(cpu_fetch_stop_v), .fetch_stop(cpu_fetch_stop),
+	.fetch_scan_v(cpu_scan_v), .fetch_scan_to(cpu_scan_to),
 	.dbg_vbr(), .dbg_cacr(), .dbg_cache_clear(),
-	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0)
+	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0), .fetch_lazy(cpu_fmode)
 );
 
 //----------------------------------------------------------------- bridge
@@ -285,6 +299,17 @@ wire as_act = ~cpu_as_n & cpu_bus_oe;
 integer e = 0;                 // processor rising edges before this clock
 integer started = -1;          // S0 of the first bus cycle
 integer finished = -1;         // S0 of the cycle that writes the result
+integer cur_mark = -1;         // the last timing marker
+integer itrace_mark = -1;      // +itrace=<n>: dispatches while marker n is current
+reg     pe_tb = 1'b0;
+reg     pipescan_stop_d = 1'b0;
+// Hatari's marker point: the instruction boundary after the marker write,
+// i.e. the dispatch of the next instruction once the governor has applied
+// its adjustment for it (Falcon time + the pending adjustment, gA)
+reg     mark_arm = 1'b0, mark_sync = 1'b0;
+reg     itrace_pend = 1'b0;
+reg [23:0] itrace_pc;
+initial if (!$value$plusargs("itrace=%d", itrace_mark)) itrace_mark = -1;
 integer credits = 0;
 reg     in_cyc = 1'b0, c_iack, c_pend = 1'b0;
 integer c_t0, c_exp, c_credit;
@@ -380,7 +405,11 @@ always @(posedge clk) begin
 		if (started < 0) started = c_t0;
 		if (!c_rw && c_a == 24'hFFFF00) finished = c_t0;
 		// timing markers (timing/timing_body.i): the processor clock at S0
-		if (!c_rw && c_a == 24'h0003F0) $display("MARK %0d %0d", cpu_do[31:16], c_t0);
+		if (!c_rw && c_a == 24'h0003F0) begin
+			$display("MARK %0d %0d", cpu_do[31:16], c_t0);
+			cur_mark = cpu_do[31:16];
+			mark_arm = 1'b1;
+		end
 		if (c_fc == 3'd7) begin
 			if (c_a[19:16] == 4'hF) c_iack = 1'b1;
 			else c_exp = 3;
@@ -392,6 +421,30 @@ always @(posedge clk) begin
 		end
 	end
 	if (cpu_inst && cpu_ce) begin k_ym_seen = 1'b0; k_acia_seen = 1'b0; end
+	// +itrace: the Falcon time of each dispatch (the clock after it), and the
+	// bus cycles, while the marker is current
+	if (itrace_pend) begin
+		itrace_pend = 1'b0;
+		$display("I %06x %0d", itrace_pc, e + $signed(cpubus.gA));
+	end
+	if (itrace_mark >= 0 && cur_mark == itrace_mark && pe_tb && cpu_inst) begin
+		itrace_pend = 1'b1; itrace_pc = dbg_pc[23:0];
+	end
+	if (mark_sync) begin
+		mark_sync = 1'b0;
+		$display("MARKE %0d %0d", cur_mark, e + $signed(cpubus.gA));
+	end
+	if (mark_arm && pe_tb && cpu_inst) begin mark_arm = 1'b0; mark_sync = 1'b1; end
+	pe_tb = cpu_ce;
+	// +itrace also shows the pipeline model's flushes and stop points
+	if (itrace_mark >= 0 && cur_mark == itrace_mark) begin
+		if (cpu_tm_flush) $display("F scan=%06x", cpu_tm_scan[23:0]);
+		if (cpu_ce && $test$plusargs("ftrace")) $display("  c scan=%06x qn=%0d fpc=%06x out=%0d due=%0d/%06x sto=%0d/%06x stop=%0d/%06x istb=%0d", cpu.core.scan_pc[23:0], cpu.core.pq_n,
+		                     cpu.core.fetch_pc[23:0], cpu.core.fetch_out, cpu.core.due_v, cpu.core.due_scan[23:0],
+		                     cpu_scan_v, cpu_scan_to[23:0], cpu_fetch_stop_v, cpu_fetch_stop[23:0], cpu.core.i_stb);
+		if (cpu_fetch_stop_v && !pipescan_stop_d) $display("S at=%06x", cpu_fetch_stop[23:0]);
+	end
+	pipescan_stop_d = cpu_fetch_stop_v;
 	if (cpu_hold && in_cyc) n_held_cyc = n_held_cyc + 1;
 	// Falcon time from reset, as falcon_cpuclk's position: processor and idle
 	// clocks, less the clocks the governor gives back
@@ -400,6 +453,7 @@ end
 
 //----------------------------------------------------------------- run
 initial begin
+	#1 if (pipescan.optbl[16'h4E75] == 9'd0) $fatal(1, "FAIL: the opcode table (falcon_optbl.mem) was not loaded: run from tb/bustime");
 	repeat (20) @(posedge clk);
 	reset = 1'b0;
 	while (!done && !cpu_halted && sysclk < maxclk) @(posedge clk);
