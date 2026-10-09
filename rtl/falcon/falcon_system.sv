@@ -120,16 +120,22 @@ wire ld_busy_arb;
 assign ld_busy = ld_busy_arb;
 
 // CPU clock (docs/CPU_TIMING.md): the 68030 advances on the clocks with
-// cpu_ce.  Turbo: every clock (32 MHz).  Falcon: every second clock (16 MHz),
-// or every fourth (8 MHz) when $FF8007 bit 0 is clear, as Hatari switches
-// its 68030 (IoMemTabFalcon_BusCtrl_WriteByte); a change takes effect at once.
-wire       cpu_16mhz;
-reg  [1:0] cpu_div = 2'd0;
-reg        cpu_ce = 1'b1;
-always @(posedge clk) begin
-	cpu_div <= cpu_div + 2'd1;
-	cpu_ce  <= cpu_turbo || (cpu_16mhz ? cpu_div[0] : (cpu_div == 2'd3));
-end
+// cpu_ce.  Turbo: every clock (32 MHz).  Falcon: 16 MHz, or 8 MHz when
+// $FF8007 bit 0 is clear, on Hatari's clock count: falcon_cpubus gives
+// every bus cycle Hatari's length and holds the processor while an answer
+// is late; falcon_cpuclk lets it catch up afterwards.
+wire        cpu_16mhz;
+wire        cpu_ce, cpu_hold, cpu_fmode, cpu_wbuf_busy, cpu_inst;
+wire  [4:0] cpu_tpos;
+wire  [3:0] cpu_credit;
+falcon_cpuclk cpuclk
+(
+	.clk(clk), .reset(reset),
+	.turbo(!cpu_fmode), .cpu_16mhz(cpu_16mhz),
+	.hold(cpu_hold), .credit(cpu_credit),
+	.cpu_ce(cpu_ce), .tpos(cpu_tpos),
+	.debt(), .debt_peak(), .forgiven(), .held()
+);
 
 ap030_top #(.USE_CE(1)) cpu
 (
@@ -144,7 +150,7 @@ ap030_top #(.USE_CE(1)) cpu
 	.ipl_n(ipl_n), .ipend_n(cpu_ipend_n),
 	.reset_n_i(~(reset | sv_busy)), .reset_n_oe(cpu_reset_oe),
 	.cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
-	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(), .dbg_halted(cpu_halted),
+	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .dbg_halted(cpu_halted),
 	.dbg_vbr(), .dbg_cacr(), .dbg_cache_clear(),
 	.snoop_we(snoop_we), .snoop_addr({8'd0, snoop_addr}), .nmi_vec_nocache(1'b0)
 );
@@ -157,6 +163,7 @@ wire        cram_req, cram_we, cram_ack;
 wire [23:2] cram_addr;
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
+wire [63:0] cram_rdata64;
 
 // device bus: the CPU bridge's, or the blitter's while it reaches I/O
 wire        c_dev_cs, c_dev_stb, c_dev_we, c_dev_uds, c_dev_lds, dev_super;
@@ -170,7 +177,7 @@ reg         dev_ack, dev_berr;
 
 wire        iack_req;
 wire  [2:0] iack_level;
-reg         iack_done, iack_avec, iack_spur;
+reg         iack_done, iack_avec, iack_spur, iack_mfp;
 reg   [7:0] iack_vector;
 wire        cpu_cycle_done;
 
@@ -197,7 +204,11 @@ falcon_cpubus cpubus
 	.iack_spur(iack_spur), .iack_vector(iack_vector),
 	.cp_req(cp_req), .cp_we(cp_we), .cp_id(cp_id), .cp_off(cp_off), .cp_siz(cp_siz),
 	.cp_wdata(cp_wdata), .cp_ack(cp_ack), .cp_berr(cp_berr), .cp_rdata(cp_rdata),
-	.cycle_done(cpu_cycle_done)
+	.cycle_done(cpu_cycle_done),
+	.fmode_in(!cpu_turbo), .fmode(cpu_fmode), .cpu_ce(cpu_ce), .tpos(cpu_tpos),
+	.inst(cpu_inst & cpu_ce), .hold(cpu_hold), .credit(cpu_credit), .wbuf_busy(cpu_wbuf_busy),
+	.ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
+	.buf_flush(ld_busy_arb | sv_busy), .iack_mfp(iack_mfp)
 );
 
 
@@ -370,7 +381,7 @@ falcon_memarb memarb
 	.d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
 	.d3_rdata(d3_rdata), .d3_ack(d3_ack),
 	.cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
-	.cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_ack(cram_ack),
+	.cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_rdata64(cram_rdata64), .cpu_ack(cram_ack),
 	.snoop_we(snoop_we), .snoop_addr(snoop_addr),
 	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
@@ -658,7 +669,7 @@ always @(posedge clk) begin
 	end
 	else if (!blit_bg) begin
 		cpu_br_n <= ~blit_br;
-		if (blit_br && !cpu_bg_n && cpu_as_n) begin
+		if (blit_br && !cpu_bg_n && cpu_as_n && !cpu_wbuf_busy) begin   // a posted CPU write first
 			cpu_bgack_n <= 0;
 			cpu_br_n    <= 1;
 			blit_bg     <= 1;
@@ -728,7 +739,7 @@ localparam I_IDLE = 2'd0, I_MFP = 2'd1;
 reg [1:0] ist;
 
 always @(posedge clk) begin
-	iack_done <= 0; iack_avec <= 0; iack_spur <= 0;
+	iack_done <= 0; iack_avec <= 0; iack_spur <= 0; iack_mfp <= 0;
 	mfp_iack  <= 0;
 
 	if (videl_vbl) vbl_pend <= 1;
@@ -754,6 +765,7 @@ always @(posedge clk) begin
 		if (mfp_iack_ack) begin
 			iack_vector <= mfp_vector;     // $18 (spurious) when the request vanished
 			iack_done   <= 1;
+			iack_mfp    <= 1;
 			ist         <= I_IDLE;
 		end
 	default: ist <= I_IDLE;

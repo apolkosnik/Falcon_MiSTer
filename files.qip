@@ -12,6 +12,7 @@ set_global_assignment -name SEARCH_PATH rtl/AP68030/rtl/core
 set_global_assignment -name SEARCH_PATH rtl/falcon
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_system.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpuclk.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_memarb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mbox_test.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_fpu_bridge.sv

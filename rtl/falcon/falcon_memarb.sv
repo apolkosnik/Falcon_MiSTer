@@ -93,6 +93,7 @@ module falcon_memarb
 	input       [3:0] cpu_be,      // [3] = lowest address (D31..D24)
 	input      [31:0] cpu_wdata,
 	output reg [31:0] cpu_rdata,
+	output reg [63:0] cpu_rdata64, // the whole 64-bit word of a read (guest order), with cpu_rdata
 	output reg        cpu_ack,
 
 	// snoop: a non-CPU master wrote RAM
@@ -265,7 +266,7 @@ always @(posedge clk) begin
 				M_D1:  begin d1_rdata <= rd_be[63 - 16 * sub -: 16]; d1_ack <= 1; st <= S_IDLE; end
 				M_D2:  begin d2_rdata <= rd_be[63 - 16 * sub -: 16]; d2_ack <= 1; st <= S_IDLE; end
 				M_D3:  begin d3_rdata <= rd_be[63 - 16 * sub -: 16]; d3_ack <= 1; st <= S_IDLE; end
-				default: begin cpu_rdata <= sub[1] ? rd_be[31:0] : rd_be[63:32]; cpu_ack <= 1; st <= S_IDLE; end
+				default: begin cpu_rdata <= sub[1] ? rd_be[31:0] : rd_be[63:32]; cpu_rdata64 <= rd_be; cpu_ack <= 1; st <= S_IDLE; end
 			endcase
 		end
 

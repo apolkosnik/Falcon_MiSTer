@@ -17,6 +17,12 @@ monitor.
 ## Clocks and reset
 
 - `clk_sys` = 32 MHz.  Everything (CPU, chipset, DSP, DDR3 port) runs on it.
+  The CPU runs on a clock enable (`cpu_ce`, `falcon_cpuclk`): every clock in
+  the OSD's 32 MHz turbo, else 16 or 8 MHz ($FF8007 bit 0) on Hatari's clock
+  count, with `falcon_cpubus` giving every bus cycle Hatari's length
+  (docs/CPU_TIMING.md).  Devices see the CPU bus in `clk_sys` and must hold
+  their answers (`bus_ack`/`bus_berr` pulses are taken by the bridge, which
+  holds the CPU while they are late).
   Devices that need slower timebases derive clock enables from it; every
   device takes `parameter CLK_HZ = 32000000` and computes its enables with a
   fractional accumulator when the ratio is not an integer (MFP 2.4576 MHz,
@@ -195,7 +201,8 @@ input             sd_buff_wr
 |--------|------|-------|
 | `emu` | `Falcon.sv` | MiSTer top: hps_io, PLL, OSD, DDR3, video/audio out |
 | `falcon_system` | `rtl/falcon/falcon_system.sv` | CPU, bus bridge, decode, interrupt logic, device instances |
-| `falcon_cpubus` | `rtl/falcon/falcon_cpubus.sv` | 68030 pin bus to RAM/device bus bridge, CPU space cycles |
+| `falcon_cpubus` | `rtl/falcon/falcon_cpubus.sv` | 68030 pin bus to RAM/device bus bridge, CPU space cycles; Falcon mode: Hatari's cycle lengths, 16-bit RAM/ROM port, posted write, read-ahead buffer |
+| `falcon_cpuclk` | `rtl/falcon/falcon_cpuclk.sv` | CPU clock enable (turbo, 16/8 MHz) and the time accounting (debt) |
 | `falcon_memarb` | `rtl/falcon/falcon_memarb.sv` | ST-RAM arbiter: video, DMA masters, CPU, ROM loader |
 | `falcon_ddram` | `rtl/falcon/falcon_ddram.sv` | DDR3 adapter with bursts |
 | `falcon_combel` | `rtl/falcon/falcon_combel.sv` | $FF8001/6/7, joypads, DIP switches |

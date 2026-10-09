@@ -139,4 +139,9 @@ ddr3_model ddr
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE)
 );
 
+// the CPU clock's time accounting (falcon_cpuclk), in system clocks
+final $display("CPU clock: %s, debt peak %0d, forgiven %0d, held %0d",
+               system.cpu_fmode ? "Falcon" : "turbo", system.cpuclk.debt_peak,
+               system.cpuclk.forgiven, system.cpuclk.held);
+
 endmodule

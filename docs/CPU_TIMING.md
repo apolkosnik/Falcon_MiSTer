@@ -1,8 +1,9 @@
 # A 16 MHz, cycle-accurate 68030 - design
 
-Status (branch `feature/cpu-16mhz`): decisions taken (below); milestone 1
-done (the CPU clock: 16/8 MHz or 32 MHz turbo, see "Milestone 1" at the end);
-milestones 2-4 open.  Until milestone 1 the core ran the AP68030 on every
+Status (branch `feature/cpu-16mhz`): decisions taken (below); milestones 1
+(the CPU clock: 16/8 MHz or 32 MHz turbo) and 2 (the Falcon bus: Hatari's
+cycle lengths on DDR3) done, see the sections at the end; milestones 3-4
+open.  Until milestone 1 the core ran the AP68030 on every
 clock of the 32 MHz system clock and ended every bus cycle as soon as memory
 or the device answered; a Falcon030 runs it at 16 MHz (8 MHz selectable) on
 a 16-bit bus.  This document says what "cycle-accurate" can mean for this
@@ -52,9 +53,10 @@ Padding a cycle to its target length cannot shorten a late one.  Options:
 
 - **A. DDR3 with time accounting.**  The bus model keeps a virtual 16 MHz time:
   a cycle ends at its Hatari-exact time if the data is there, later otherwise,
-  and the lateness ("debt") is paid back by ending later cycles early (cache hits
-  and on-chip time never wait while there is debt) until the CPU is back on
-  schedule.  A read-ahead buffer serves the other three words of a 64-bit DDR3
+  and the lateness ("debt") is paid back until the CPU is back on schedule.
+  (As built in milestone 2: a late cycle does not get longer; the processor's
+  clock is held until the answer is there, and it runs at 32 MHz while it is
+  behind.)  A read-ahead buffer serves the other three words of a 64-bit DDR3
   word without a new DDR3 access, so sequential code (every instruction fetch
   that misses the I-cache) needs one DDR3 read per 4 words: ~13 clk_sys against
   32 clk_sys of real bus time.  Exact whenever DDR3 keeps up (the common case:
@@ -78,12 +80,15 @@ in real software.
 ## Proposed architecture
 
 ```
-AP68030 (ce_rise/ce_fall: 16 or 8 MHz)
+falcon_cpuclk: cpu_ce (16 or 8 MHz, 32 MHz while behind), debt, clock position
+   |  hold (from the bridge)
+AP68030 (USE_CE)
    |  pin-level bus, DSACK1 for ST-RAM/ROM (16-bit port), as on the Falcon
-falcon_cpubus  +  falcon_bustime (new): the Falcon/Hatari bus timing model
-   |   - 16 MHz cycle counter, 4-cycle ST-RAM slots, 3-cycle accesses,
-   |     FAST16 ROM/I/O, per-device waits (Hatari's numbers)
-   |   - virtual time and debt; read-ahead buffer (one 64-bit DDR3 word)
+falcon_cpubus, Falcon mode: the Falcon/Hatari bus timing model
+   |   - 4-clock ST-RAM slots, 3-clock accesses, FAST16 ROM/I/O,
+   |     per-device waits and acknowledge lengths (Hatari's numbers)
+   |   - holds the processor while an answer is late; posted write;
+   |     read-ahead buffer (one 64-bit DDR3 word)
 falcon_memarb (unchanged priorities)  ->  DDR3
 ```
 - **Clock enable** in the AP68030 (`USE_CE`, `ce`; always 1 in the 32 MHz
@@ -120,10 +125,12 @@ falcon_memarb (unchanged priorities)  ->  DDR3
    bit 0), everything else unchanged.  The machine runs at 16 MHz with today's
    bus.
 2. The Falcon bus: 16-bit port for ST-RAM/ROM, Hatari's slot and wait-state
-   timing, virtual time with debt, read-ahead buffer; the timing bench and the
-   Hatari golden.
+   timing, virtual time with debt, read-ahead buffer; the timing bench (the
+   bus-cycle checker; the whole-program comparison with Hatari needs the
+   internal timing of milestone 3 and moves there).
 3. Internal timing governor (Hatari's rules); exceptions and interrupt
-   acknowledge; blitter cycle costs.
+   acknowledge (the 4 idle clocks after it); blitter cycle costs; programs
+   timed in Hatari and on the core.
 4. Hardware: timing program, debt statistics, Quartus fit (the core is at 96%).
 
 ## Hatari's Falcon CPU timing in detail (the reference for milestones 2 and 3)
@@ -302,4 +309,74 @@ matters for TOS code.
   39/39; FPUTEST ALL PASS at 16 MHz; FPUBENCH in simulation FNOP 2.70 us /
   FADD 3.00 us at 16 MHz against 1.80 / 2.25 us in turbo (the bridge's
   latency is in system clocks, so the ratio is below 2).
+
+## Milestone 2: the Falcon bus (done)
+
+In the Falcon setting `falcon_cpubus` runs a second state machine (turbo
+keeps the old one, untouched) that gives every bus cycle Hatari's length in
+processor clocks:
+
+- **Lengths**: CHIP16 (ST-RAM, IDE, unmapped) 3 clocks, plus 2 when S0 is at
+  clock position 2 or 3 mod 4; FAST16 (ROM, cartridge, $FFxxxx) 3 plus the
+  device waits of the table above (MFP, YM first access and every 4th
+  further one in an instruction, FDC/DMA with the sector-count case, ACIA
+  6 + E clock, DSP host port); interrupt acknowledge MFP 12, autovector E
+  clock + 10, DSP and spurious 3; coprocessor and other CPU space 3; bus
+  errors as their space.  Instruction boundaries (for the YM and ACIA rules)
+  come from the AP68030's dispatch pulse; the clock position (slot, E clock)
+  from `falcon_cpuclk` (restarted by reset).
+- **The 16-bit port**: ST-RAM, ROM and cartridge answer with DSACK1 only, so
+  a long is two word cycles as in Hatari.  A word at an odd address is two
+  byte cycles on the 68030's 16-bit port and one access in Hatari; the chip's
+  behaviour is kept (hardware wins).
+- **Timing**: the cycle's length is set by when DSACK (BERR, AVEC) becomes
+  visible: at the falling edge after the processor's (w+1)th rising edge of
+  the cycle.  An answer that is not there by then never lengthens the cycle:
+  `hold` stops the processor's clock until it is, and `falcon_cpuclk` counts
+  the Falcon time that passed as debt and gives the processor a clock on every
+  system clock (32 MHz) until it has caught up.  The processor is also held on
+  the clock a new cycle is first seen (the edge after S0 can be on the next
+  clock while it catches up, before the bridge has decided anything).  So the
+  processor's execution, counted in its own clocks, does not depend on DDR3
+  latency, video load or device delays at all; only its real-time position
+  lags by the debt.  The debt is capped at 4095 system clocks (128 us); above
+  that it is forgiven and counted.
+- **Memory**: RAM writes are posted (one entry; a later RAM read, a device
+  access and the blitter's bus grant wait for it); RAM/ROM reads go through a
+  read-ahead buffer holding the last 64-bit DDR3 word (`falcon_memarb` now
+  also returns the whole word), kept coherent with the posted write and
+  invalidated by other masters' writes (the arbiter's snoop) and while the
+  loader runs, so sequential fetches need one DDR3 read per four words.  The
+  data of a write is taken at S0 (the AP68030 drives its write lanes from
+  there), so a write cycle never waits for DS.
+- **Deviations from Hatari** (hardware wins or Hatari has no bus cycle): odd
+  words (above); a DSP-vectored acknowledge takes a 3-clock cycle (Hatari
+  charges nothing); the 4 idle clocks after an acknowledge are internal time
+  (milestone 3).  FPU latency (the ARM) and DDR3/video contention are debt:
+  Hatari charges nothing for the FPU and models no contention.
+
+Verification:
+
+- **tb/bustime** (new): the AP68030, `falcon_cpuclk`, `falcon_cpubus` and
+  `falcon_memarb` on the DDR3 model (random latency and BUSY), with device,
+  interrupt-controller and DMA models, run `t_bustime.s` (RAM in every size
+  and alignment, buffer and posted-write coherence, a DMA write into the
+  buffered word, ROM, every device class, bus errors in CHIP16/FAST16 space
+  and from user mode, the four acknowledge kinds, TAS; caches off and on).
+  A checker written from the rules above, independently of the bridge,
+  measures every cycle (about 7,200 per run) in processor clocks: all match
+  Hatari, none needed a wait state.  The program runs in five configurations
+  (default; video fetches; 8 MHz; two other device/acknowledge delay seeds
+  with video, one at 8 MHz) and takes exactly the same processor clocks in
+  each (37,551).  With heavy video load the debt reaches the cap.
+- tb/fpu with `FMODE=1` (the bridge's Falcon mode, coprocessor cycles held
+  for the ARM): 7167/7167; tb/integration 57 + 39 checks (its pin-driven
+  bus cycles now go through the Falcon mode); FPUTEST passes on the whole
+  system at 16 MHz (the debt reaches the cap: FPU latency).
+- Turbo is bit-identical to milestone 1: FPUTEST's whole run in tb/system
+  with `--turbo` gives the same PC trace (651 samples) as the milestone 1
+  build.
+- Quartus 17.0, seed 3: timing met (+2.70 ns setup on the system clock),
+  41,175 ALMs (98%, +892 over milestone 1): milestones 3 and 4 have about
+  700 ALMs left.
 

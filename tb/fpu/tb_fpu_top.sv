@@ -14,7 +14,8 @@
 
 module tb_fpu_top #(
     parameter int CLK_HZ = 200000,
-    parameter int CPU_DIV = 1           // the CPU on every CPU_DIV-th clock (falcon_system: 1 turbo, 2 = 16 MHz, 4 = 8 MHz)
+    parameter int CPU_DIV = 1,          // the CPU on every CPU_DIV-th clock (falcon_system: 1 turbo, 2 = 16 MHz, 4 = 8 MHz)
+    parameter int FMODE = 0             // 1: the bus bridge's Falcon mode at 16 MHz, paced by falcon_cpuclk (CPU_DIV unused)
 ) (
     input             clk,
     input             por,          // power-on reset (arbiter, bridge presence)
@@ -82,11 +83,21 @@ wire [31:0] dbg_pc;
 wire dev_reset = reset | cpu_reset_oe;      // as in falcon_system: RESET resets the peripherals only
 
 reg [1:0] cpu_div = 2'd0;
-reg       cpu_ce = 1'b1;
+reg       div_ce = 1'b1;
 always @(posedge clk) begin
     cpu_div <= (cpu_div == CPU_DIV - 1) ? 2'd0 : cpu_div + 2'd1;
-    cpu_ce  <= (CPU_DIV == 1) || (cpu_div == CPU_DIV - 1);
+    div_ce  <= (CPU_DIV == 1) || (cpu_div == CPU_DIV - 1);
 end
+wire       fc_ce, cpu_hold, cpu_fmode, cpu_inst;
+wire [4:0] cpu_tpos;
+wire [3:0] cpu_credit;
+falcon_cpuclk cpuclk
+(
+    .clk(clk), .reset(reset), .turbo(!cpu_fmode), .cpu_16mhz(1'b1),
+    .hold(cpu_hold), .credit(cpu_credit), .cpu_ce(fc_ce), .tpos(cpu_tpos),
+    .debt(), .debt_peak(), .forgiven(), .held()
+);
+wire cpu_ce = (FMODE != 0) ? fc_ce : div_ce;
 
 ap030_top #(.USE_CE(1)) cpu
 (
@@ -114,6 +125,7 @@ wire        cram_req, cram_we, cram_ack;
 wire [23:2] cram_addr;
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
+wire [63:0] cram_rdata64;
 
 wire        cp_req, cp_we, cp_ack, cp_berr;
 wire  [2:0] cp_id;
@@ -150,7 +162,11 @@ falcon_cpubus cpubus
     .iack_spur(1'b0), .iack_vector(8'd0),
     .cp_req(cp_req), .cp_we(cp_we), .cp_id(cp_id), .cp_off(cp_off), .cp_siz(cp_siz),
     .cp_wdata(cp_wdata), .cp_ack(cp_ack), .cp_berr(cp_berr), .cp_rdata(cp_rdata),
-    .cycle_done(cpu_cycle_done)
+    .cycle_done(cpu_cycle_done),
+    .fmode_in(FMODE != 0), .fmode(cpu_fmode), .cpu_ce(cpu_ce), .tpos(cpu_tpos),
+    .inst(cpu_dbg_inst & cpu_ce), .hold(cpu_hold), .credit(cpu_credit), .wbuf_busy(),
+    .ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
+    .buf_flush(1'b0), .iack_mfp(1'b0)
 );
 
 // ---------------------------------------------------------------- FPU bridge
@@ -185,7 +201,7 @@ falcon_memarb memarb
     .d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
     .d3_rdata(d3_rdata), .d3_ack(d3_ack),
     .cpu_req(cram_req), .cpu_we(cram_we), .cpu_addr(cram_addr), .cpu_be(cram_be),
-    .cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_ack(cram_ack),
+    .cpu_wdata(cram_wdata), .cpu_rdata(cram_rdata), .cpu_rdata64(cram_rdata64), .cpu_ack(cram_ack),
     .snoop_we(snoop_we), .snoop_addr(snoop_addr),
     .DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
     .DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
