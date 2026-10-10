@@ -5,6 +5,7 @@ db/
 incremental_db/
 output_files/
 *.qws
+*_assignment_defaults.qdf
 tb/*/obj_dir*/
 tb/*/build/
 tb/*/syn/
