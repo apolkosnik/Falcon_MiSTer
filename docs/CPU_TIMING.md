@@ -720,3 +720,21 @@ on the full system; turbo is still bit-identical (same PC trace); the
 AP68030 is unchanged since milestone 3.  Quartus 17.0: 41,441 ALMs (99%;
 falcon_tstat 72, the scanner 199 with its shadow, falcon_cpuclk 31), 348
 RAM blocks; seed 2 meets timing (worst slack +0.063 ns, HDMI domain).
+
+**AP68030 fixes** (2026-10-10).  `rtl/AP68030` pins e19343e: apolkosnik/AP68030#4,
+on top of #3.  #3 gained a fix of `fetch_lazy`'s guard against wrong model
+inputs (it counted only with the queue empty, so a wrong stop with one word
+queued could hang the processor; it now counts while the sequencer waits for
+a word that is neither queued nor on the way).  #4 has six fixes from an audit
+of the AP68030, four of them reachable here: RMC stuck after a CAS mismatch
+(the bus never granted to the blitter), cpScc Dn's upper bytes (FScc with the
+FPU bridge), a snoop during a cache fill (FDC/SCSI DMA) and bus cycles during
+the RESET pulse (the devices reset from it); also the stack pointer forwarding
+and a false double bus fault.  Falcon time is unchanged: CPUTIME's 73 markers
+in the full-system simulation are the same (ref.i).  tb/bustime takes 20,252
+processor clocks in all five configurations (its TAS: no prefetch inside the
+read-modify-write now, as Hatari's 68030 TAS, which prefetches after the
+write); tb/integration, tb/l2 and tb/fpu (both modes) pass, FPUTEST passes
+at 16 MHz and in turbo (the fetch guard never fired).  Quartus 17.0: 40,268
+ALMs (96%), 414 RAM blocks; seed 3 meets timing (worst slack +0.119 ns, HDMI
+domain; seed 2 missed it by 0.117 ns).
