@@ -6,6 +6,7 @@
 #   STRIDE=n  FPUTEST: only every nth check (default 25; 1 = the whole sequence)
 #   PASSES=n  FPUTEST passes (default 1)
 #   MS=n      simulated milliseconds at most (default 4000)
+#   TURBO=1   the CPU at 32 MHz (OSD turbo) instead of the Falcon's 16 MHz
 #   VASM=/path/to/vasmm68k_mot
 # Needs tb/system/build.sh to have been run.
 set -e
@@ -26,4 +27,4 @@ fi
 $VASM -Fbin -m68030 -m68882 -no-opt -quiet -I$OUT -o $OUT/simrom.img simrom.s
 python3 -I $ROOT/tb/system/rom2hex64.py $OUT/simrom.img $OUT/simrom.hex
 cd $ROOT/tb/system
-./obj_dir/Vtb_top +rom=$OUT/simrom.hex --ms ${MS:-4000} --fpu --text 100000 --done FFFF0 | grep -v "frame [0-9]*:"
+./obj_dir/Vtb_top +rom=$OUT/simrom.hex --ms ${MS:-4000} --fpu ${TURBO:+--turbo} --text 100000 --done FFFF0 | grep -v "frame [0-9]*:"

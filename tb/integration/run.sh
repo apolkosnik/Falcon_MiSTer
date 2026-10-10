@@ -15,6 +15,7 @@ verilator --binary --timing --build -j 8 -O2 -Wno-fatal -Wno-WIDTH \
  $R/AP68030/rtl/*.v $R/falcon/*.sv $R/falcon/dsp/*.sv \
  > $O.build.log 2>&1 || { tail -30 $O.build.log; exit 1; }
 ./$O/Vtb_bus | tee $O.run.log
+./$O/Vtb_bus +falcon | tee $O.falcon.log
 
 # DMA memory types at the arbiter's ports
 verilator --binary --timing --build -j 8 -Wno-fatal -Wno-WIDTH -Wno-PINMISSING -Wno-TIMESCALEMOD \

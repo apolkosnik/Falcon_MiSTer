@@ -10,6 +10,9 @@
 //     --monitor M       0 mono, 1 RGB, 2 VGA (default), 3 TV
 //     --ram MB          4 or 14 (default 14)
 //     --ramtos          the ROM image is a RAM TOS behind its loader (TOS 4.92)
+//     --turbo           CPU on every clock (OSD 32 MHz turbo); default: the
+//                       Falcon's 16 MHz (8 MHz by $FF8007 bit 0)
+//     --tstat           the timing counters at $FFF000 (OSD "Timing counters")
 //     --pctrace N       print the PC every N clocks
 //     --berrtrace       print every bus error cycle
 //     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
@@ -106,7 +109,7 @@ int main(int argc, char **argv) {
     unsigned io_lo = 1, io_hi = 0;
     double io_from = 0;
     Disk disk[7];
-    bool fpu_service = false, cptrace = false, cookies = false;
+    bool fpu_service = false, cptrace = false, cookies = false, turbo = false, tstat = false;
     uint32_t text_addr = 0, done_addr = 0;
     double wrlat_ms = 0, rdlat_ms = 0;
     std::vector<Event> events;
@@ -143,6 +146,8 @@ int main(int argc, char **argv) {
         else if (a == "--key") { double t; unsigned c; sscanf(next().c_str(), "%lf:%x", &t, &c); events.push_back({t, 0, (int)c, 0, 0}); }
         else if (a == "--mouse") { double t; int dx, dy, b; sscanf(next().c_str(), "%lf:%d:%d:%d", &t, &dx, &dy, &b); events.push_back({t, 1, dx, dy, b}); }
         else if (a == "--fpu") fpu_service = true;
+        else if (a == "--turbo") turbo = true;
+        else if (a == "--tstat") tstat = true;
         else if (a == "--cptrace") cptrace = true;
         else if (a == "--cookies") cookies = true;
         else if (a == "--text") text_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
@@ -159,6 +164,8 @@ int main(int argc, char **argv) {
     top->monitor = mon_map[monitor & 3];
     top->ram_mb = ram;
     top->ram_tos = ramtos;
+    top->cpu_turbo = turbo;
+    top->tstat_en = tstat;
     top->joy0 = 0;
     top->ps2_key = 0;
     top->ps2_mouse = 0;
