@@ -738,3 +738,24 @@ write); tb/integration, tb/l2 and tb/fpu (both modes) pass, FPUTEST passes
 at 16 MHz and in turbo (the fetch guard never fired).  Quartus 17.0: 40,268
 ALMs (96%), 414 RAM blocks; seed 3 meets timing (worst slack +0.119 ns, HDMI
 domain; seed 2 missed it by 0.117 ns).
+
+**The rest of the audit** (2026-10-10).  `rtl/AP68030` pins 81bd25d (AP68030
+main): apolkosnik/AP68030#5 (every remaining finding of the audit:
+posted-write faults taken as one bus error with the instruction's long
+frame, trace after exceptions, the coprocessor dialogue, illegal-instruction
+and PMMU encodings, the cache's burst errors, bus arbitration, the MMU's
+table search) and #6.  #5 made the AP68030 340 ALUTs larger, and the whole
+design about 3,100 (the speed-optimized synthesis spread it): 42,645 ALMs,
+which does not fit.  #6 gives the room back without changing behaviour: the
+cpTRAPcc decode as one branch (about 750 ALUTs fewer across the design) and
+the register file in LUT RAM, the change that was
+`extra/ap68030_regfile_mlab.patch` (removed: it is in the AP68030 now).
+Falcon time is unchanged: CPUTIME's 73 markers in the full-system simulation
+are the same (ref.i).  tb/bustime takes 20,252 processor clocks in all five
+configurations; tb/integration, tb/l2 and tb/fpu (both modes) pass, FPUTEST
+passes at 16 MHz and in turbo, and TOS 4.04 boots as before (20 simulated
+seconds: the same frames and CPU clock statistics).  Quartus 17.0: 41,496
+ALMs (99%), 414 RAM blocks; seed 5 meets timing (worst slack +0.216 ns, HDMI
+domain).  The fit is tight: of seeds 2-5, 7 and 8, seeds 4, 7 and 8 do not
+fit (one needs 4,195 LABs of 4,191), seed 2 misses timing by 2.9 ns and seed
+3 the HDMI domain by 0.255 ns.
