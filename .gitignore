@@ -42,4 +42,4 @@ tools/falcon_fpu/falcon_fpu
 tools/falcon_fpu/falcon_fpu_host
 tools/falcon_fpu/engine/build/
 tools/fputest/build/
-CLAUDE.md
+tools/cputime/build/

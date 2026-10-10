@@ -61,6 +61,8 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[6]    MIDI on the user port UART
 //   status[7]    cold reset (clears the warm start flag)
 //   status[8]    reset NVRAM to defaults for the selected monitor
+//   status[9]    CPU: Falcon 16 MHz (8 MHz by $FF8007), 32 MHz turbo
+//   status[10]   timing counters at $FFF000 (falcon_tstat; off: bus error there)
 `include "build_id.v"
 localparam CONF_STR = {
 	"Falcon;;",
@@ -78,6 +80,8 @@ localparam CONF_STR = {
 	"O[3],ST-RAM,14 MB,4 MB;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[6],UART,Serial,MIDI;",
+	"O[9],CPU,Falcon 16 MHz,32 MHz turbo;",
+	"O[10],Timing counters,Off,On;",
 	"-;",
 	"T[0],Reset;",
 	"T[7],Cold Reset;",
@@ -244,6 +248,8 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.ram_mb(status[3] ? 4'd4 : 4'd14),
 	.ram_tos(ram_tos),
 	.monitor(status[2:1] == 2'd0 ? 2'b10 : status[2:1] == 2'd1 ? 2'b01 : status[2:1] == 2'd2 ? 2'b11 : 2'b00),
+	.cpu_turbo(status[9]),
+	.tstat_en(status[10]),
 
 	.ld_wr(ioctl_wr & (rom_download | cart_download)),
 	.ld_addr(ld_addr),

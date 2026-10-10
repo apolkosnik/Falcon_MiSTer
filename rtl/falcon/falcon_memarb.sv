@@ -14,7 +14,10 @@
 //    d2   DMA port 2 (blitter)
 //    d3   DMA port 3: the FPU bridge's HPS mailbox (falcon_fpu_bridge), or
 //         in measurement builds the mailbox latency probe (falcon_mbox_test)
-//    cpu  68030 data/instruction accesses, 32 bit with byte enables
+//    cpu  68030 data/instruction accesses, 32 bit with byte enables, or
+//         (cpu_burst) a read of the four 64-bit words from cpu_addr[23:5]
+//         for the CPU's line cache (falcon_l2): one cpu_beat per word,
+//         cpu_ack with the last
 //
 //  One command is outstanding at a time.  DMA writes are reported on the
 //  snoop port so the CPU data cache never holds stale lines.
@@ -93,7 +96,14 @@ module falcon_memarb
 	input       [3:0] cpu_be,      // [3] = lowest address (D31..D24)
 	input      [31:0] cpu_wdata,
 	output reg [31:0] cpu_rdata,
+	output reg [63:0] cpu_rdata64, // the whole 64-bit word of a read (guest order), with cpu_rdata
 	output reg        cpu_ack,
+	input             cpu_burst,   // with cpu_req, a read: four words from cpu_addr[23:5]
+	output reg        cpu_beat,    // a word of the burst in cpu_rdata64 (in address order)
+	// every write by another master (DMA, the loader), when its DDR3 command
+	// goes out: the CPU's line cache drops that line (falcon_l2)
+	output reg        owr_we,
+	output reg [23:3] owr_addr,
 
 	// snoop: a non-CPU master wrote RAM
 	output reg        snoop_we,
@@ -138,6 +148,7 @@ reg  [2:0] owner;
 reg  [1:0] sub;         // 16-bit word index or 32-bit half within the 64-bit word
 reg  [1:0] beats;
 reg        cmd_we;
+reg        cmd_burst;   // a CPU burst read
 
 // the selected master's request, in guest big-endian form
 reg        g_we;
@@ -172,7 +183,7 @@ always @* begin : sel
 		g_owner = M_D3; g_we = d3_we; g_addr = d3_addr[23:3]; g_sub = d3_addr[2:1];
 		g_wdata = {4{d3_wdata}}; g_be = {6'd0, d3_be} << (6 - 2 * d3_addr[2:1]);
 	end else if (cpu_req) begin
-		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_addr[23:3]; g_sub = {cpu_addr[2], 1'b0};
+		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_burst ? {cpu_addr[23:5], 2'b00} : cpu_addr[23:3]; g_sub = {cpu_addr[2], 1'b0};
 		g_wdata = {2{cpu_wdata}}; g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
 	end else g_any = 0;
 
@@ -193,6 +204,8 @@ always @(posedge clk) begin
 	d0_ack <= 0; d1_ack <= 0; d2_ack <= 0; cpu_ack <= 0;
 	d3_ack <= 0;
 	snoop_we <= 0;
+	cpu_beat <= 0;
+	owr_we <= 0;
 
 	ld_take = 0;
 
@@ -219,7 +232,8 @@ always @(posedge clk) begin
 			sub        <= g_sub;
 			cmd_we     <= g_we;
 			DDRAM_ADDR <= DDR_BASE | {8'd0, g_addr};
-			DDRAM_BURSTCNT <= (g_owner == M_VID) ? 8'd4 : 8'd1;
+			DDRAM_BURSTCNT <= (g_owner == M_VID || (g_owner == M_CPU && cpu_burst && !g_we)) ? 8'd4 : 8'd1;
+			cmd_burst  <= (g_owner == M_CPU && cpu_burst && !g_we);
 			DDRAM_DIN  <= swap64(g_wdata);
 			DDRAM_BE   <= g_we ? rev8(g_be) : 8'hFF;
 			DDRAM_WE   <= g_we;
@@ -231,6 +245,10 @@ always @(posedge clk) begin
 			if (g_we && g_owner != M_CPU && g_owner != M_LD) begin
 				snoop_we   <= 1;
 				snoop_addr <= {g_addr, g_sub, 1'b0};
+			end
+			if (g_we && g_owner != M_CPU) begin
+				owr_we   <= 1;
+				owr_addr <= g_addr;
 			end
 		end
 
@@ -265,7 +283,15 @@ always @(posedge clk) begin
 				M_D1:  begin d1_rdata <= rd_be[63 - 16 * sub -: 16]; d1_ack <= 1; st <= S_IDLE; end
 				M_D2:  begin d2_rdata <= rd_be[63 - 16 * sub -: 16]; d2_ack <= 1; st <= S_IDLE; end
 				M_D3:  begin d3_rdata <= rd_be[63 - 16 * sub -: 16]; d3_ack <= 1; st <= S_IDLE; end
-				default: begin cpu_rdata <= sub[1] ? rd_be[31:0] : rd_be[63:32]; cpu_ack <= 1; st <= S_IDLE; end
+				default:
+					if (cmd_burst) begin
+						cpu_rdata64 <= rd_be;
+						cpu_beat    <= 1;
+						beats       <= beats + 1'd1;
+						if (beats == 2'd3) begin cpu_ack <= 1; st <= S_IDLE; end
+					end else begin
+						cpu_rdata <= sub[1] ? rd_be[31:0] : rd_be[63:32]; cpu_rdata64 <= rd_be; cpu_ack <= 1; st <= S_IDLE;
+					end
 			endcase
 		end
 

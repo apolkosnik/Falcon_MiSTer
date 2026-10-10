@@ -150,9 +150,14 @@ static uint32_t gr32(uint32_t a)
 {
 	return ((uint32_t)ddr[a] << 24) | ((uint32_t)ddr[a + 1] << 16) | ((uint32_t)ddr[a + 2] << 8) | ddr[a + 3];
 }
+// (a write the CPU polls for: the CPU's line cache, falcon_l2, is told at the
+// next clock, as for another master's write)
+static bool inv_pend = false;
+static uint32_t inv_addr = 0;
 static void gw32(uint32_t a, uint32_t v)
 {
 	ddr[a] = v >> 24; ddr[a + 1] = v >> 16; ddr[a + 2] = v >> 8; ddr[a + 3] = (uint8_t)v;
+	inv_pend = true; inv_addr = a;
 }
 
 // DDR3 command / data model
@@ -171,7 +176,8 @@ static void ddr_pre()
 		uint64_t byte = (uint64_t)T->DDRAM_ADDR * 8;
 		bool inr = byte >= DDR_BYTE0 && byte < DDR_BYTE0 + DDR_SIZE;
 		int burst = T->DDRAM_BURSTCNT;
-		bool ok = !(rd && wr) && inr && rd_left == 0 && burst == 1;
+		// (reads of 4: the CPU's line cache, falcon_l2, as the video's bursts)
+		bool ok = !(rd && wr) && inr && rd_left == 0 && (burst == 1 || (rd && burst == 4));
 		if (!ok) {
 			ddr_proto_err++;
 			if (ddr_first_err.empty())
@@ -421,6 +427,7 @@ static void step()
 {
 	ddr_pre();
 	T->por = g_por; T->reset = g_reset; T->ipl_n = (~g_ipl) & 7;
+	T->tbinv_we = inv_pend; T->tbinv_addr = (inv_addr >> 3) & 0x1FFFFF; inv_pend = false;
 	T->clk = 1; T->eval();
 	T->DDRAM_DOUT = nxt_dout; T->DDRAM_DOUT_READY = nxt_ready; T->DDRAM_BUSY = nxt_busy;
 	T->clk = 0; T->eval();
@@ -713,7 +720,7 @@ static void bus_checks(const char *tag)
 
 static void ddr_checks()
 {
-	check_eq("ddr", "DDRAM protocol violations (one command at a time, burst 1, guest window)", 0, ddr_proto_err,
+	check_eq("ddr", "DDRAM protocol violations (one command at a time, burst 1 or a read of 4, guest window)", 0, ddr_proto_err,
 	         "MiSTer DDRAM semantics / falcon_memarb", 1);
 	if (ddr_proto_err) printf("        first: %s\n", ddr_first_err.c_str());
 }

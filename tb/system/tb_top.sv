@@ -13,6 +13,8 @@ module tb_top
 	input       [3:0] ram_mb,
 	input             ram_tos,
 	input       [1:0] monitor,
+	input             cpu_turbo,
+	input             tstat_en,
 
 	input      [10:0] ps2_key,
 	input      [24:0] ps2_mouse,
@@ -113,7 +115,7 @@ assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk), .reset(reset), .cold_reset(cold_reset), .por(por),
-	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
 	.nv_init(1'b0), .nv_addr(6'd0), .nv_din(8'd0), .nv_wr(1'b0),
@@ -137,5 +139,21 @@ ddr3_model ddr
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE)
 );
+
+// the CPU clock's time accounting (falcon_cpuclk), in system clocks; and
+// what would make Falcon time depend on real time: wait states the bridge
+// could not avoid (credit), fetches let through by the AP68030's guard
+// against a stop that never ends, scans given up (falcon_pipescan)
+integer n_credit = 0, n_starve = 0, n_gone = 0, lag_max = 0;   // lag: words the scan is behind the queue head
+always @(posedge clk) begin
+	n_credit <= n_credit + system.cpu_credit;
+	if (system.cpu_ce && system.cpu.core.stop_starve) n_starve <= n_starve + 1;
+	if (system.cpu_ce && system.pipescan.act && system.pipescan.gone && !system.pipescan.flush) n_gone <= n_gone + 1;
+	if (system.cpu_ce && system.pipescan.act && !system.pipescan.flush && $signed(system.pipescan.off) < 0 &&
+	    -($signed(system.pipescan.off) / 2) > lag_max) lag_max <= -($signed(system.pipescan.off) / 2);
+end
+final $display("CPU clock: %s, debt peak %0d, forgiven %0d, held %0d; credit %0d, stop guard %0d, scans lost %0d, scan lag %0d words",
+               system.cpu_fmode ? "Falcon" : "turbo", system.cpuclk.debt_peak,
+               system.cpuclk.forgiven, system.cpuclk.held, n_credit, n_starve, n_gone, lag_max);
 
 endmodule
