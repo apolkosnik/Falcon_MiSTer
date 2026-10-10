@@ -286,8 +286,11 @@ matters for TOS code.
 1. Timing target: **Hatari-exact**; where the real 68030 differs, the chip's
    behaviour wins and is documented.
 2. Memory: **DDR3 with time accounting** (virtual time, debt, read-ahead buffer).
-3. Speed: OSD **Falcon 16 MHz (default) / 32 MHz turbo**; in the Falcon setting
+3. Speed: OSD **32 MHz turbo (default) / Falcon 16 MHz**; in the Falcon setting
    $FF8007 bit 0 switches 8/16 MHz.  Turbo keeps today's behaviour bit for bit.
+   Turbo is the default until the Falcon setting's real time (not only its
+   Falcon time) is measured on the board: memory-heavy code there can run
+   behind a real Falcon when the debt reaches its cap (Milestone 4).
 4. Contention: none beyond Hatari's for now.
 5. No real Falcon is available: Hatari is the golden; hardware runs on the
    MiSTer check the debt and the timing program against Hatari.

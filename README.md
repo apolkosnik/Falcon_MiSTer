@@ -163,6 +163,8 @@ Quartus rewrites the project file when it closes it, including the
 ## Not yet done
 
 - Hardware testing.
-- 16 MHz CPU option (the CPU runs from the 32 MHz system clock).
+- The Falcon 16 MHz CPU setting keeps Hatari's Falcon time, but its real
+  time on the board is not measured yet; 32 MHz turbo is the default
+  (docs/CPU_TIMING.md).
 - SCC serial ports (registers only), Centronics printer,
   microphone input, `.MSA`/`.STX` floppy images.

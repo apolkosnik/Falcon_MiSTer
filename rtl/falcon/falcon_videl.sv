@@ -549,7 +549,12 @@ wire [14:0] pos_l  = {pos_hh[13:0], 1'b0};          // line length
 wire [14:0] pos_hbe = {6'd0, lt_hbe} << lt_sd;
 wire [14:0] pos_hbb = pos_hh + ({6'd0, lt_hbb} << lt_sd);
 wire [14:0] pos_hss = pos_hh + ({6'd0, lt_hss} << lt_sd);
-wire [14:0] pos_hdb = (lt_hdb[9] ? pos_hh : 15'd0) + ({6'd0, lt_hdb[8:0]} << lt_sd);
+// HDB beyond the line end (second half, HDB[8:0] > HHT+2: 124 Beers Later on
+// VGA, HHT $C6 with HDB $2F0) counts on into the next line, as Hatari places
+// the picture (VIDEL_getScreenWidth: left border = HDB - HHT - 2 - HBE + ...)
+wire [14:0] pos_hdb_r = (lt_hdb[9] ? pos_hh : 15'd0) + ({6'd0, lt_hdb[8:0]} << lt_sd);
+wire        hdb_wrap  = (pos_hdb_r >= pos_l);
+wire [14:0] pos_hdb   = hdb_wrap ? pos_hdb_r - pos_l : pos_hdb_r;
 
 // display offsets (base clocks)
 wire [8:0]  q128   = 9'd128 >> lt_bpl;               // 128/bpp for bitplanes
@@ -576,7 +581,8 @@ wire [14:0] de_len  = (npx_clk > {2'd0, len_max}) ? len_max : npx_clk[14:0];
 // HDB lies in this line (first half: VFC, second half: VFC+1) or, when the
 // DE start wraps past the line end, in the previous line (-2)
 wire        deon_wrap = (deon_raw >= {1'b0, pos_l});
-wire [11:0] vfc_dl   = {1'b0, vfc} + (lt_hdb[9] ? 12'd1 : 12'd0) - (deon_wrap ? 12'd2 : 12'd0);
+// (a wrapped HDB fires in the first half of the following line: VFC)
+wire [11:0] vfc_dl   = {1'b0, vfc} + ((lt_hdb[9] && !hdb_wrap) ? 12'd1 : 12'd0) - (deon_wrap ? 12'd2 : 12'd0);
 wire        disp_ln  = !vfc_dl[11] && (vfc_dl[10:0] >= vdb_m) && (vfc_dl[10:0] < vde_m);
 
 wire [14:0] hhc_full = ((hpos >= pos_hh) ? (hpos - pos_hh) : hpos) >> lt_sd;

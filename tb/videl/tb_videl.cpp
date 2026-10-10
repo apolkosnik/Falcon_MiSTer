@@ -472,10 +472,11 @@ static uint32_t expect_px(const Mode &m, uint32_t la, int x, int hs, int bank)
 
 // compare a captured field image with the framebuffer
 static int g_blanked;   // DE pixels found blanked by the last compare_image
+static int g_lof = 0;   // $820E words added to the line stride (Hatari nextline = $8210 + $820E)
 static int compare_image(const Mode &m, const FrameRec &f, uint32_t base, int hs, int bank,
                          int *checked)
 {
-	int words = m.lwd + (hs ? (m.bpp == 16 ? 16 : m.bpp) : 0);
+	int words = m.lwd + g_lof + (hs ? (m.bpp == 16 ? 16 : m.bpp) : 0);
 	uint32_t stride = 2 * words;
 	int errs = 0;
 	*checked = 0;
@@ -902,6 +903,128 @@ static void test_1600x600(bool worst_latency)
 		      "field %zu (%s): pixel colours match the framebuffer (%d pixels checked, %d errors)",
 		      k, f.field ? "odd" : "even", checked, errs);
 	}
+}
+
+// $820E line offset: every line starts $8210 + $820E words after the
+// previous one (Hatari VIDEL_renderScreen nextline, VIDEL_VideoRasterHBL).
+// 124 Beers Later on a VGA monitor: true colour, VMD 1/5 (line doubled),
+// $8210 = $140, $820E = $10/$40/$80.
+static void test_lineoffset(int mi, int lof)
+{
+	const Mode &m = modes[mi];
+	printf("\n== Line offset $820E = $%03X in %s ==\n", lof, m.name);
+	do_reset(m.monitor);
+	uint32_t base = 0x100000;
+	fill_ram(base, 1500000, 820 + lof);
+	set_palettes(14 + lof);
+	program_mode(m, base);
+	ww(0xFF820E, lof);
+	mon.border_rgb = m.stpal ? ste_rgb(spal[0]) : falcon_rgb(fpal[0]);
+	mon.capture = true;
+	bool ok = run_frames(1, 4000000) && run_frames(1, 4000000);
+	check(ok, "frames produced");
+	if (!ok) return;
+	const FrameRec &f = mon.frames.back();
+	check(f.de_lines == m.height && f.min_de == m.width && f.max_de == m.width,
+	      "%d lines of %d pixels (expected %d x %d)", f.de_lines, f.min_de, m.width, m.height);
+	int checked = 0;
+	g_lof = lof;
+	int errs = compare_image(m, f, base, 0, 0, &checked);
+	g_lof = 0;
+	check(errs == 0 && checked == m.width * m.height,
+	      "lines %d words apart ($8210 + $820E) (%d checked, %d errors)", m.lwd + lof, checked, errs);
+}
+
+// 124 Beers Later on a VGA monitor (Hatari trace, VGA): TOS's VGA timing,
+// then the demo's writes in order.  Scene A: $820E $40, $8210 $140, VMD 5,
+// VCO $186, SPSHIFT 0 then $100 (true colour), VMD 1, HDB $2BA, HDE $9F,
+// base $08D1A8.  Scene B: $820E 0, $8210 $140, VMD 5, VCO $186, SPSHIFT
+// 0/$100, VMD 1, HDB $2B4, HDE $99, $8210 $C8, HDB $2F0, HDE $5D, base
+// $1C9720.  Every DE pixel must decode from base + line * ($8210 + $820E).
+static void test_beers_vga(int scene)
+{
+	printf("\n== 124 Beers Later VGA true colour scene %c ==\n", 'A' + scene);
+	do_reset(MON_VGA);
+	mon.hs_pol = false; mon.vs_pol = false;
+	static const uint16_t t[12] = {0x00c6,0x008d,0x0015,0x02ac,0x0091,0x0096, 0x0419,0x03ff,0x003f,0x003f,0x03ff,0x0415};
+	static const uint32_t ta[12] = {0xFF8282,0xFF8284,0xFF8286,0xFF8288,0xFF828A,0xFF828C,
+	                                0xFF82A2,0xFF82A4,0xFF82A6,0xFF82A8,0xFF82AA,0xFF82AC};
+	uint32_t base = scene ? 0x1C9720 : 0x08D1A8;
+	int lof = scene ? 0 : 0x40, lwd = scene ? 0xC8 : 0x140;
+	fill_ram(base & ~0xFFFFu, 0x100000, 124 + scene);
+	set_palettes(9);
+	for (int i = 0; i < 12; i++) ww(ta[i], t[i]);
+	wb(0xFF8201, (base >> 16) & 0xFF); wb(0xFF8203, (base >> 8) & 0xFF); wb(0xFF820D, base & 0xFF);
+	ww(0xFF820E, lof);
+	ww(0xFF8210, 0x140);
+	ww(0xFF82C2, 0x0005);
+	ww(0xFF82C0, 0x0186);
+	ww(0xFF8266, 0x0000);
+	ww(0xFF8266, 0x0100);
+	ww(0xFF82C2, 0x0001);
+	if (!scene) { ww(0xFF8288, 0x02BA); ww(0xFF828A, 0x009F); }
+	else { ww(0xFF8288, 0x02B4); ww(0xFF828A, 0x0099); ww(0xFF8210, 0x00C8); ww(0xFF8288, 0x02F0); ww(0xFF828A, 0x005D); }
+	mon.border_rgb = falcon_rgb(fpal[0]);
+	mon.capture = true;
+	bool ok = run_frames(1, 4000000) && run_frames(1, 4000000);
+	check(ok, "frames produced");
+	if (!ok) return;
+	const FrameRec &f = mon.frames.back();
+	Mode m = modes[1];
+	m.lwd = lwd; m.vmd = 1; m.width = lwd;
+	check(f.min_de == lwd && f.max_de == lwd, "active pixels per line %d..%d, expected %d", f.min_de, f.max_de, lwd);
+	check(f.de_lines == 480, "%d active lines (240 source lines doubled)", f.de_lines);
+	int checked = 0;
+	g_lof = lof;
+	int errs = compare_image(m, f, base, 0, 0, &checked);
+	g_lof = 0;
+	check(errs == 0 && checked == f.de_lines * lwd,
+	      "lines %d words apart ($8210 + $820E) (%d checked, %d errors)", lwd + lof, checked, errs);
+}
+
+// 124 Beers Later on VGA, scene C (the "One Hundred and Twenty Four
+// Beers Later" title picture, Hatari trace): HHT $18E HBB $11D HBE $2D HDB 0
+// HDE $119 HSS $12E, TOS's VGA vertical set, base $124998, $820E $80, $8210
+// $280, VMD 9 (one dot per pixel, line doubled), VCO $186, SPSHIFT 0 then
+// $100, HDB $1C, HDE $135.  Hatari: 640x240 true colour, doubled to 480.
+static void test_beers_vga_title(bool worst_latency = false)
+{
+	printf("\n== 124 Beers Later VGA true colour scene C (title, VMD 9)%s ==\n", worst_latency ? " [40-clock bursts]" : "");
+	do_reset(MON_VGA);
+	mem.fixed_worst = worst_latency;
+	mon.hs_pol = false; mon.vs_pol = false;
+	static const uint16_t t[12] = {0x018e,0x011d,0x002d,0x0000,0x0119,0x012e, 0x0419,0x03ff,0x003f,0x003f,0x03ff,0x0415};
+	static const uint32_t ta[12] = {0xFF8282,0xFF8284,0xFF8286,0xFF8288,0xFF828A,0xFF828C,
+	                                0xFF82A2,0xFF82A4,0xFF82A6,0xFF82A8,0xFF82AA,0xFF82AC};
+	uint32_t base = 0x124998;
+	fill_ram(0x100000, 0x100000, 1240);
+	set_palettes(10);
+	for (int i = 0; i < 12; i++) ww(ta[i], t[i]);
+	wb(0xFF8201, (base >> 16) & 0xFF); wb(0xFF8203, (base >> 8) & 0xFF); wb(0xFF820D, base & 0xFF);
+	ww(0xFF820E, 0x80);
+	ww(0xFF8210, 0x280);
+	ww(0xFF82C2, 0x0009);
+	ww(0xFF82C0, 0x0186);
+	ww(0xFF8266, 0x0000);
+	ww(0xFF8266, 0x0100);
+	ww(0xFF8288, 0x001C);
+	ww(0xFF828A, 0x0135);
+	mon.border_rgb = falcon_rgb(fpal[0]);
+	mon.capture = true;
+	bool ok = run_frames(1, 4000000) && run_frames(1, 4000000);
+	check(ok, "frames produced");
+	if (!ok) return;
+	const FrameRec &f = mon.frames.back();
+	Mode m = modes[1];
+	m.lwd = 0x280; m.vmd = 9; m.width = 640;
+	check(f.min_de == 640 && f.max_de == 640, "active pixels per line %d..%d, expected 640", f.min_de, f.max_de);
+	check(f.de_lines == 480, "%d active lines (240 source lines doubled)", f.de_lines);
+	int checked = 0;
+	g_lof = 0x80;
+	int errs = compare_image(m, f, base, 0, 0, &checked);
+	g_lof = 0;
+	check(errs == 0 && checked == f.de_lines * 640,
+	      "lines %d words apart ($8210 + $820E) (%d checked, %d errors, %d blanked)", 0x280 + 0x80, checked, errs, g_blanked);
 }
 
 // register writes in the middle of a frame / line are latched
@@ -1508,6 +1631,16 @@ int main(int argc, char **argv)
 	test_mode(modes[8], true);      // RGB 640x200 TC, every burst 40 clocks
 	test_mode(modes[2], true);      // VGA 640x480x256, every burst 40 clocks
 	test_counters();
+	test_beers_vga_title();
+	test_beers_vga_title(true);
+	test_beers_vga(0);
+	test_beers_vga(1);
+	test_lineoffset(1, 0x040);      // VGA 320x240 TC doubled, 124 Beers
+	test_lineoffset(1, 0x080);
+	test_lineoffset(1, 0x010);
+	test_lineoffset(0, 0x040);      // VGA 640x480x16, not doubled
+	test_lineoffset(4, 0x040);      // RGB 640x400x16 interlaced
+	test_lineoffset(5, 0x040);      // RGB 320x200 TC
 	test_1600x600(false);           // \"1600 x 600\" demo mode, random latency
 	test_1600x600(true);            // the same, every burst 40 clocks
 	test_hscroll(0, 3, 0);          // VGA 640x480x16
