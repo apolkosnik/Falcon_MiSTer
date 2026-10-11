@@ -46,6 +46,7 @@ initial begin
 	integer i;
 	for (i = 0; i < (1<<21); i = i + 1) mem[i] = 64'd0;
 	if ($value$plusargs("rom=%s", f)) $readmemh(f, mem, 'hE00000 >> 3);
+	if ($value$plusargs("ram=%s", f)) $readmemh(f, mem, 0);    // RAM image from 0 (rom2hex64.py format)
 	if ($value$plusargs("cart=%s", f)) $readmemh(f, mem, 'hFA0000 >> 3);
 	DDRAM_BUSY = 0;
 	DDRAM_DOUT_READY = 0;

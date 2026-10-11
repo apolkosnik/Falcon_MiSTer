@@ -33,7 +33,7 @@ verilator --cc --exe --build -j 8 -O3 --x-assign fast --x-initial fast \
     --top-module falcon_dsp \
     $DSP_RTL \
     "$HERE/tb_dsp.cpp" "$HERE/tb_common.cpp" "$HERE/tb_gen.cpp" "$HERE/tb_lockstep.cpp" \
-    "$HERE/tb_tests.cpp" "$HERE/tb_directed.cpp" "$HERE/tb_host.cpp" -o tb_dsp \
+    "$HERE/tb_tests.cpp" "$HERE/tb_directed.cpp" "$HERE/tb_host.cpp" "$HERE/tb_replay.cpp" -o tb_dsp \
     > "$BUILD/verilator.log" 2>&1 || { grep -v "^%Warning\|^ " "$BUILD/verilator.log" | tail -40; exit 1; }
 
 # integration with the real crossbar (rtl/falcon/falcon_crossbar.sv)

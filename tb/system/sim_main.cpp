@@ -26,6 +26,8 @@
 //     --cookies         print the TOS cookie jar at the end
 //     --text ADDR       print the NUL-terminated text at guest ADDR (hex) at the end
 //     --done ADDR       end the run once the long at guest ADDR (hex) reads $D0E0600D
+//     --dump A:LEN:FILE write LEN bytes of guest memory from A (hex) to FILE at the end
+//     +ram=FILE         (plusarg) preload guest RAM from 0 with a rom2hex64.py image
 #include "Vtb_top.h"
 #include "Vtb_top__Dpi.h"
 #include "verilated.h"
@@ -111,6 +113,7 @@ int main(int argc, char **argv) {
     Disk disk[7];
     bool fpu_service = false, cptrace = false, cookies = false, turbo = false, tstat = false;
     uint32_t text_addr = 0, done_addr = 0;
+    std::string dump_spec;      // --dump ADDR:LEN:FILE  guest memory written to FILE at the end
     double wrlat_ms = 0, rdlat_ms = 0;
     std::vector<Event> events;
 
@@ -152,6 +155,7 @@ int main(int argc, char **argv) {
         else if (a == "--cookies") cookies = true;
         else if (a == "--text") text_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
         else if (a == "--done") done_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
+        else if (a == "--dump") dump_spec = next();
     }
     if (!frames_dir.empty()) mkdir(frames_dir.c_str(), 0755);
     svSetScope(svGetScopeFromName("TOP.tb_top.ddr"));
@@ -375,6 +379,15 @@ int main(int argc, char **argv) {
     printf("simulated %.3f ms, %llu clocks\n", cyc / CLK_HZ * 1e3, (unsigned long long)cyc);
     if (fpu_service)
         printf("FPU mailbox: MAGIC %04x HEARTBEAT %04x\n", guest_rd32(0xE90000) >> 16, guest_rd32(0xE90000) & 0xFFFF);
+    if (!dump_spec.empty()) {
+        unsigned long da = 0, dl = 0; char fn[512] = {0};
+        if (sscanf(dump_spec.c_str(), "%lx:%lx:%511s", &da, &dl, fn) == 3) {
+            FILE *df = fopen(fn, "wb");
+            for (unsigned long i = 0; df && i < dl; i++) fputc(guest_rd8((uint32_t)(da + i)), df);
+            if (df) fclose(df);
+            printf("dumped %06lx..%06lx to %s\n", da, da + dl, fn);
+        }
+    }
     if (text_addr) {
         printf("text at %06x:\n", text_addr);
         for (uint32_t i = 0; i < 65536; i++) {

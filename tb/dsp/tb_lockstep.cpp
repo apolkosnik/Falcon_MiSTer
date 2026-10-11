@@ -184,7 +184,7 @@ int Lockstep::step(const HostEv *h, const SsiEv *s, uint16_t *host_rd, uint16_t 
     golden_read_state(gs);
     rtl.read_state(rs);
     n += compare_state(gs, rs, ctx, v);
-    n += compare_memories(rtl, ctx, v);
+    if (mem_every <= 1 || (++nstep % mem_every) == 0) n += compare_memories(rtl, ctx, v);
     if (s && s->valid && s->tx_en && g_tx != r_tx) {
         if (v) printf("  MISMATCH %s: SSI transmitted word expected (Hatari) %04x, RTL %04x\n", ctx, g_tx, r_tx);
         n++;
