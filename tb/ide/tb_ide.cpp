@@ -27,7 +27,7 @@ static uint32_t mnt_pulse = 0;
 
 static void tick() {
 	if (dut->sd_lba0 != dut->sd_lba1 || dut->sd_buff_din0 != dut->sd_buff_din1) { printf("FAIL: sd_lba0/1 or sd_buff_din0/1 differ\n"); fails++; }
-	hps->step(dut->sd_rd, dut->sd_wr, dut->sd_lba0, dut->sd_buff_din0);
+	hps->step(dut->sd_rd, dut->sd_wr, dut->sd_lba0, dut->sd_buff_din0, dut->sd_blk_cnt);
 	dut->clk = 1;
 	dut->eval();
 	cycle++;
@@ -483,6 +483,7 @@ int main(int argc, char **argv) {
 		CHECKEQ(w59, 0x104, "IDENTIFY word 59 after SET MULTIPLE 4");
 
 		uint32_t l = 5000;
+		uint64_t rq0 = hps->reqs_rd, op0 = hps->ops_rd;
 		set_lba(l, 0, 10);
 		wb(R_CMD, 0xC4);
 		int k = 0, blocks = 0, bad = 0;
@@ -498,8 +499,11 @@ int main(int argc, char **argv) {
 		CHECK(bad == 0, "READ MULTIPLE data (%d bad)", bad);
 		CHECKEQ(blocks, 3, "READ MULTIPLE 10 sectors in blocks of 4,4,2");
 		CHECKEQ(rb(R_CMD), 0x50, "status after READ MULTIPLE");
+		CHECKEQ(hps->reqs_rd - rq0, 3, "READ MULTIPLE (LBA): one HPS request per block");
+		CHECKEQ(hps->ops_rd - op0, 10, "READ MULTIPLE: 10 sectors read from the image");
 
 		l = 9000;
+		uint64_t wq0 = hps->reqs_wr;
 		set_lba(l, 0, 6);
 		wb(R_CMD, 0xC5);
 		k = 0; blocks = 0;
@@ -520,6 +524,57 @@ int main(int argc, char **argv) {
 			if (hps->img[0].get(l + kk, 2 * i) != (v >> 8) || hps->img[0].get(l + kk, 2 * i + 1) != (v & 0xFF)) bad++;
 		}
 		CHECK(bad == 0, "WRITE MULTIPLE image (%d bad)", bad);
+		CHECKEQ(hps->reqs_wr - wq0, 2, "WRITE MULTIPLE (LBA): one HPS request per block");
+
+		// blocks of 16: READ MULTIPLE 40 sectors = 16,16,8 in three requests
+		wb(R_NSEC, 16);
+		wb(R_CMD, 0xC6); wait_irq();
+		CHECKEQ(rb(R_CMD), 0x40, "SET MULTIPLE 16 ok");
+		l = 12000; rq0 = hps->reqs_rd; op0 = hps->ops_rd;
+		set_lba(l, 0, 40);
+		wb(R_CMD, 0xC4);
+		k = 0; blocks = 0; bad = 0;
+		while (k < 40) {
+			if (!wait_irq()) { CHECK(false, "READ MULTIPLE 16 irq block %d", blocks); break; }
+			CHECKEQ(rb(R_CMD), 0x58, "READ MULTIPLE 16 DRQ");
+			int n = (40 - k) < 16 ? (40 - k) : 16;
+			for (int j = 0; j < n; j++, k++)
+				for (int i = 0; i < 256; i++) if (rw(R_DATA) != img_word(0, l + k, i, true)) bad++;
+			blocks++;
+		}
+		CHECK(bad == 0, "READ MULTIPLE 16 data (%d bad)", bad);
+		CHECKEQ(blocks, 3, "READ MULTIPLE 40 sectors in blocks of 16,16,8");
+		CHECKEQ(hps->reqs_rd - rq0, 3, "READ MULTIPLE 16: three HPS requests of 16, 16, 8 sectors");
+		CHECKEQ(hps->ops_rd - op0, 40, "READ MULTIPLE 16: 40 sectors read from the image");
+		CHECKEQ(rb(R_CMD), 0x50, "status after READ MULTIPLE 16");
+		// the LBA registers hold the last sector transferred (ATA)
+		CHECKEQ(rb(R_SECT) | (rb(R_LCYL) << 8) | (rb(R_HCYL) << 16), l + 39, "READ MULTIPLE 16: LBA registers at the last sector");
+
+		// a block crossing the image end: the request stops at the end, then IDNF
+		l = (uint32_t)nb0 - 3; rq0 = hps->reqs_rd; op0 = hps->ops_rd;
+		set_lba(l, 0, 8);
+		wb(R_CMD, 0xC4);
+		CHECK(wait_irq(), "READ MULTIPLE across the image end: irq");
+		CHECKEQ(rb(R_CMD), 0x41, "READ MULTIPLE across the image end: ERR (DRDY | ERR, as the IDNF test above)");
+		CHECKEQ(rb(R_ERR), 0x10, "READ MULTIPLE across the image end: IDNF");
+		CHECKEQ(hps->reqs_rd - rq0, 1, "READ MULTIPLE across the image end: one request");
+		CHECKEQ(hps->ops_rd - op0, 3, "READ MULTIPLE across the image end: only the 3 sectors before the end read");
+
+		// CHS mode: one request per sector (unchanged)
+		rq0 = hps->reqs_rd; op0 = hps->ops_rd;
+		set_chs(2, 1, 1, 0, 8);
+		wb(R_CMD, 0xC4);
+		k = 0; blocks = 0;
+		while (k < 8) {
+			if (!wait_irq()) { CHECK(false, "READ MULTIPLE CHS irq"); break; }
+			rb(R_CMD);
+			for (int j = 0; j < 8; j++, k++) for (int i = 0; i < 256; i++) rw(R_DATA);
+			blocks++;
+		}
+		CHECKEQ(rb(R_CMD), 0x50, "status after READ MULTIPLE in CHS mode");
+		CHECKEQ(hps->reqs_rd - rq0, 8, "READ MULTIPLE in CHS mode: one HPS request per sector");
+		CHECKEQ(hps->ops_rd - op0, 8, "READ MULTIPLE in CHS mode: 8 sectors");
+
 		// disable multiple mode: READ MULTIPLE aborts
 		wb(R_NSEC, 0);
 		wb(R_CMD, 0xC6); wait_irq(); rb(R_CMD);

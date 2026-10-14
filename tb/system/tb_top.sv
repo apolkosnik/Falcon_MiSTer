@@ -15,6 +15,7 @@ module tb_top
 	input       [1:0] monitor,
 	input             cpu_turbo,
 	input             tstat_en,
+	input       [1:0] fast_ram,     // ap060 CT60 mode: 0 off, 1 64 MB, 2 128 MB, 3 240 MB
 
 	input      [10:0] ps2_key,
 	input      [24:0] ps2_mouse,
@@ -48,6 +49,9 @@ module tb_top
 	output            midi_tx,
 
 	output     [31:0] dbg_pc,
+	output            dbg_retire,   // dbg_pc is a retired instruction's this clock
+	output            dbg_busown,   // the bus bridge owns the bus (ap060: snooping DMA writes / the blitter)
+	output            dbg_snoop,    // a snoop transfer this clock
 	output            dbg_halted,
 	output      [2:0] dbg_ipl,
 	output            dbg_as,
@@ -75,6 +79,14 @@ module tb_top
 );
 
 assign dbg_pc     = system.dbg_pc;
+assign dbg_retire = system.cpu_inst;
+`ifdef FALCON_CPU060
+assign dbg_busown = system.cpubus.owned;
+assign dbg_snoop  = ~system.cpubus.ts_n_i;
+`else
+assign dbg_busown = system.blit_bg;
+assign dbg_snoop  = 1'b0;
+`endif
 assign dbg_halted = system.cpu_halted;
 assign dbg_ipl    = system.ipl;
 assign dbg_as     = ~system.cpu_as_n & system.cpu_bus_oe;
@@ -115,7 +127,7 @@ assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk), .reset(reset), .cold_reset(cold_reset), .por(por),
-	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en), .fast_ram(fast_ram),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
 	.nv_init(1'b0), .nv_addr(6'd0), .nv_din(8'd0), .nv_wr(1'b0),
@@ -140,6 +152,39 @@ ddr3_model ddr
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE)
 );
 
+`ifdef FALCON_CPU060
+final $display("CPU clock: turbo (AP68060)");
+// the snooper's data cache queue lost invalidations (sticky)
+reg ovf_seen = 0;
+always @(posedge clk) if (system.cpu.sn_ovf && !ovf_seen) begin
+	ovf_seen <= 1;
+	$display("[%9.3f ms] SNOOP QUEUE OVERFLOW: data cache invalidations lost", clk_n / 32000.0);
+end
+// the AP68060's fetch redirects into the vector area and the snoop
+// refetches, with their cause (bring-up debugging)
+integer clk_n = 0;
+reg        d_ref = 0, d_xgo = 0, d_redir = 0;
+reg  [7:0] d_xvec = 0, d_wbexc = 0;
+reg [31:0] d_wbpc = 0;
+always @(posedge clk) begin
+	clk_n   <= clk_n + 1;
+	d_ref   <= system.cpu.be.wb_refetch;
+	d_xgo   <= system.cpu.be.x_go;
+	d_xvec  <= system.cpu.be.x_vec;
+	d_wbpc  <= system.cpu.be.wb_u.pc;
+	d_wbexc <= system.cpu.be.wb_exc;
+	d_redir <= system.cpu.be.wb_commit && system.cpu.be.wb_redir;
+	if (system.cpu.be.redir_v && system.cpu.be.redir_pc < 32'h1000)
+		$display("[%9.3f ms] redirect to %08x: refetch %b, exception %b (vector %0d), branch %b; WB pc %08x exc %02x; snp_pend %b",
+		         clk_n / 32000.0, system.cpu.be.redir_pc, d_ref, d_xgo, d_xvec, d_redir, d_wbpc, d_wbexc, system.cpu.be.snp_pend);
+	if (system.cpu.be.ag_snref)
+		$display("[%9.3f ms] snoop refetch marks the uop at AG: pc %08x op %0d first %b last %b exc %02x ser %b",
+		         clk_n / 32000.0, system.cpu.be.ag_u.pc, system.cpu.be.ag_u.op,
+		         system.cpu.be.ag_u.first, system.cpu.be.ag_u.last, system.cpu.be.ag_u.exc, system.cpu.be.ag_u.ser);
+	if (system.cpu.sn_ihit)
+		$display("[%9.3f ms] snoop hit on the instruction cache (every line: %b) pc %08x", clk_n / 32000.0, system.cpu.fetch.inv_scope == 2'd3, dbg_pc);
+end
+`else
 // the CPU clock's time accounting (falcon_cpuclk), in system clocks; and
 // what would make Falcon time depend on real time: wait states the bridge
 // could not avoid (credit), fetches let through by the AP68030's guard
@@ -155,5 +200,26 @@ end
 final $display("CPU clock: %s, debt peak %0d, forgiven %0d, held %0d; credit %0d, stop guard %0d, scans lost %0d, scan lag %0d words",
                system.cpu_fmode ? "Falcon" : "turbo", system.cpuclk.debt_peak,
                system.cpuclk.forgiven, system.cpuclk.held, n_credit, n_starve, n_gone, lag_max);
+
+`endif
+
+// activity per 100 ms (+actlog): instructions retired, CPU bus transfers,
+// clocks the blitter is busy and (ap060) clocks the bridge holds the bus
+integer a_clk = 0, a_inst = 0, a_cyc = 0, a_blt = 0, a_own = 0;
+bit actlog = 0;
+initial actlog = $test$plusargs("actlog");
+always @(posedge clk) if (actlog) begin
+	a_clk  <= a_clk + 1;
+	a_inst <= a_inst + (system.cpu_inst ? 1 : 0);
+	a_cyc  <= a_cyc + (system.cpu_cycle_done ? 1 : 0);
+	a_blt  <= a_blt + (system.blit_busy ? 1 : 0);
+`ifdef FALCON_CPU060
+	a_own  <= a_own + (system.cpubus.owned ? 1 : 0);
+`endif
+	if (a_clk == 3200000 - 1) begin
+		$display("ACT inst %0d  bus %0d  blitter-busy %0d  bus-held %0d (per 100 ms)", a_inst, a_cyc, a_blt, a_own);
+		a_clk <= 0; a_inst <= 0; a_cyc <= 0; a_blt <= 0; a_own <= 0;
+	end
+end
 
 endmodule

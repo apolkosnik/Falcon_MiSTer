@@ -149,6 +149,24 @@ edition (which Quartus refuses to open), and leaves `Falcon.qsf` as it was:
 Quartus rewrites the project file when it closes it, including the
 `FALCON_BRINGUP` macros `files.qip` adds.
 
+The ap060 variant puts the [AP68060](https://github.com/apolkosnik/AP68060)
+(a pipelined 68060) in place of the AP68030, on its own bus bridge
+(`rtl/falcon/falcon_cpubus060.sv`, the synchronous 68060 bus with
+invalidate-only snooping of the DMA writes).  The core runs at 32 MHz with
+its bus at 16 MHz (the 68060's half-speed bus mode, CLKEN) in every OSD
+CPU mode (no Falcon timing, no `$FFF000` counters), and it does not fit
+together with the DSP, so it is built without the DSP and the FPU service:
+
+```
+FALCON_BRINGUP="CPU060 NO_DSP NO_FPU" ./scripts/build.sh
+```
+
+Its OSD has a Fast RAM option (CT60 mode, `docs/CT60_MODE.md`): 64, 128 or
+240 MB of TT-RAM at `$01000000` on a 32-bit address bus, as on a CT60, with
+the 060 bus at full speed and the Falcon's own memory and I/O at their
+16 MHz-bus speed; EmuTOS finds it and reports it as Alt-RAM.  A size change
+takes effect after a cold reset.
+
 ## Simulation
 
 - Unit benches: `tb/<module>/run.sh` (Verilator; most compare against Hatari's
@@ -156,7 +174,8 @@ Quartus rewrites the project file when it closes it, including the
 - Persistence: `MAIN=/path/to/Main_MiSTer_falcon tb/nvram_store/run.sh` links
   the production Main save/load implementation to the real `hps_io`, NVRAM
   and persistence-controller RTL, using temporary files for storage.
-- Full system: `tb/system/build.sh`, then
+- Full system: `tb/system/build.sh` (`BRINGUP="CPU060 NO_DSP NO_FPU" OBJ=obj_060`
+  for the ap060 variant), then
   `tb/system/obj_dir/Vtb_top +rom=<emutos.hex> --ms 25000 --ide0 disk.img --frames out`
   (see the header of `tb/system/sim_main.cpp`; `rom2hex64.py` converts a ROM).
 

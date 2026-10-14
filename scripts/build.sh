@@ -31,6 +31,23 @@ cp $P.qsf $KEEP
 trap 'cp -f $KEEP $P.qsf; rm -f $KEEP' EXIT
 trap 'exit 130' INT TERM
 
+# The ap060 variant (FALCON_BRINGUP with CPU060) is at the edge of the
+# device: synthesis for area (the core is ~1,300 ALUTs smaller), registers
+# packed harder.  Quartus 17.0 Lite ignores per-instance optimization
+# techniques, and the HIGH PERFORMANCE EFFORT mode forces speed in
+# synthesis, so synthesis runs in BALANCED mode with technique AREA; the
+# fitter then runs in HIGH PERFORMANCE EFFORT again (the HDMI clock needs
+# its timing effort).  Project-file assignments win over files.qip's, so
+# these go into Falcon.qsf (restored on exit like the rest).
+AREA060=0
+case " ${FALCON_BRINGUP:-} " in *" CPU060 "*)
+	AREA060=1
+	sed -i -e 's/^set_global_assignment -name OPTIMIZATION_MODE .*/set_global_assignment -name OPTIMIZATION_MODE BALANCED/' \
+	       -e 's/^set_global_assignment -name OPTIMIZATION_TECHNIQUE .*/set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA/' \
+	       -e 's/^set_global_assignment -name ALM_REGISTER_PACKING_EFFORT .*/set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH/' $P.qsf
+	echo "== CPU060: synthesis for area (BALANCED, AREA), register packing HIGH; the fitter in HIGH PERFORMANCE EFFORT" | tee -a $LOG ;;
+esac
+
 # A project database written by another Quartus version or edition is
 # refused ("not compatible with the installed version"): start that one from
 # scratch.  The whole version line counts, e.g. "17.0.0 Build 595 04/25/2017
@@ -52,6 +69,7 @@ run() {
 # passes it "<flow> <project> <revision>", the stand-alone stages do not run it
 run "$Q"/quartus_sh -t sys/build_id.tcl compile $P $P || { echo "build_id.tcl failed (see $LOG)"; exit 1; }
 run "$Q"/quartus_map $P || { echo "synthesis failed (see $LOG)"; exit 1; }
+[ $AREA060 = 1 ] && sed -i 's/^set_global_assignment -name OPTIMIZATION_MODE .*/set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"/' $P.qsf
 run "$Q"/quartus_fit $P
 if ! grep -q "Fitter Status : Successful" output_files/$P.fit.summary 2>/dev/null; then
 	echo "fit failed (see $LOG)"; exit 1

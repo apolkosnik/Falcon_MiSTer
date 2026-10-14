@@ -77,6 +77,7 @@ wire [63:0] DDRAM_DOUT, DDRAM_DIN;
 
 falcon_memarb memarb
 (
+	.snoop_hold(1'b0),
 	.clk(clk), .reset(reset), .ram_mb(4'd4),
 	.vid_req(vid_req), .vid_addr(vid_addr), .vid_ack(vid_ack), .vid_data(), .vid_valid(),
 	.ld_wr(ld_wr), .ld_addr(ld_addr), .ld_data(ld_data), .ld_busy(ld_busy),

@@ -29,7 +29,11 @@
 // sd_lba0/sd_lba1 and sd_buff_din0/sd_buff_din1 (the per slot hps_io
 // inputs) carry the same value.  The shared sd_buff_* inputs are only
 // accepted while one of our sd_ack bits is set.  At most one sd_rd/sd_wr bit
-// is set at a time.  led: an image transfer is in progress.
+// is set at a time.  led: an image transfer is in progress.  In LBA mode the
+// sectors of a READ/WRITE MULTIPLE block go in one request (sd_blk_cnt: up to
+// the block, the command and the image end, at most 16): one HPS round trip
+// per block, not per sector; the per-sector bookkeeping (address registers,
+// counts, errors) is unchanged.
 //
 // irq: ATA INTRQ, active high (the system ORs it onto MFP GPIP5 low).
 // It follows the selected device's interrupt pending flag and is disabled by
@@ -103,7 +107,8 @@ module falcon_ide #(
 	output reg  [1:0] sd_rd,
 	output reg  [1:0] sd_wr,
 	input       [1:0] sd_ack,
-	input       [8:0] sd_buff_addr,
+	input      [13:0] sd_buff_addr,    // byte in the request (a multi-block request counts on)
+	output      [5:0] sd_blk_cnt,      // blocks - 1 of the pending request (both units)
 	input       [7:0] sd_buff_dout,
 	output      [7:0] sd_buff_din0,
 	output      [7:0] sd_buff_din1,
@@ -392,7 +397,23 @@ reg        srst_rel;        // SRST released, apply signature when idle
 reg        h_ack_seen;
 reg        h_unit;
 reg        h_wr;
-reg  [3:0] h_sec;           // buffer sector
+reg  [3:0] h_sec;           // buffer sector (of the request's first block)
+reg  [4:0] h_n;             // blocks in the request
+reg  [4:0] have;            // sectors of the current block already in the buffer / written
+reg        pre;             // the sector was in a batched request: no request of its own
+assign sd_blk_cnt = {1'b0, h_n} - 6'd1;
+// the sectors one request may take from bcnt on: the rest of the block, of
+// the command and of the image; CHS mode one at a time
+function [4:0] batch;
+	input [4:0] nb; input [8:0] rem; input [27:0] left; input lbam;
+	reg [4:0] n;
+	begin
+		n = nb;
+		if ({4'd0, n} > rem) n = rem[4:0];
+		if ({23'd0, n} > left) n = left[4:0];
+		batch = lbam ? n : 5'd1;
+	end
+endfunction
 reg        h_done;          // one clock pulse
 
 wire       mnt_busy = (est == E_MNT_W || est == E_MNT_DIV || est == E_MNT_DW);
@@ -403,6 +424,7 @@ initial begin
 	nbs[0] = 28'd0; nbs[1] = 28'd0; dcyl[0] = 14'd2; dcyl[1] = 14'd2;
 	mnt_pend = 2'b00; mnt_ro = 2'b00;
 	h_act = 1'b0; h_ack_seen = 1'b0; h_unit = 1'b0; h_wr = 1'b0; h_sec = 4'd0;
+	h_n = 5'd1; have = 5'd0; pre = 1'b0;
 	sd_rd = 2'b00; sd_wr = 2'b00; sd_lba = 32'd0;
 end
 
@@ -499,7 +521,7 @@ reg [15:0] acc_din;
 
 // read port address: hps byte address while sending a sector, else the
 // data register word pointer (the RAM output is valid one clock later)
-assign l_raddr = (h_act & h_wr) ? {h_sec, sd_buff_addr[8:1]} : ptr[11:0];
+assign l_raddr = (h_act & h_wr) ? {h_sec + sd_buff_addr[12:9], sd_buff_addr[8:1]} : ptr[11:0];
 
 // sd_buff_din: lane select by the current hps byte address
 assign sd_buff_din0 = sd_buff_addr[0] ? lo_q : le_q;
@@ -588,15 +610,15 @@ always @(posedge clk) begin
 	end
 	// incoming sector data
 	if (h_act & ~h_wr & sd_buff_wr & sd_ack[h_unit]) begin
-		l_waddr <= {h_sec, sd_buff_addr[8:1]};
+		l_waddr <= {h_sec + sd_buff_addr[12:9], sd_buff_addr[8:1]};
 		if (sd_buff_addr[0]) begin lo_we <= 1'b1; lo_wdata <= sd_buff_dout; end
 		else begin le_we <= 1'b1; le_wdata <= sd_buff_dout; end
 		if (mnt_scan) begin
-			if (sd_buff_addr == 9'h1FE) mb_1fe <= sd_buff_dout;
-			if (sd_buff_addr == 9'h1FF) mb_1ff <= sd_buff_dout;
-			if (sd_buff_addr == 9'h1C6) mb_1c6 <= sd_buff_dout;
-			if (sd_buff_addr == 9'h1C8) mb_1c8 <= sd_buff_dout;
-			if (sd_buff_addr == 9'h1C9) mb_1c9 <= sd_buff_dout;
+			if (sd_buff_addr == 14'h1FE) mb_1fe <= sd_buff_dout;
+			if (sd_buff_addr == 14'h1FF) mb_1ff <= sd_buff_dout;
+			if (sd_buff_addr == 14'h1C6) mb_1c6 <= sd_buff_dout;
+			if (sd_buff_addr == 14'h1C8) mb_1c8 <= sd_buff_dout;
+			if (sd_buff_addr == 14'h1C9) mb_1c9 <= sd_buff_dout;
 		end
 	end
 
@@ -788,7 +810,7 @@ always @(posedge clk) begin
 				r_status[eu] <= ST_BSY;
 				mb_1fe <= 8'h00; mb_1ff <= 8'h00; mb_1c6 <= 8'h00; mb_1c8 <= 8'h00; mb_1c9 <= 8'h00;
 				mnt_scan <= 1'b1;
-				h_act <= 1'b1; h_unit <= eu; h_wr <= 1'b0; h_sec <= 4'd0;
+				h_act <= 1'b1; h_unit <= eu; h_wr <= 1'b0; h_sec <= 4'd0; h_n <= 5'd1;
 				sd_lba <= 32'd0;
 				sd_rd[eu] <= 1'b1;
 				est <= E_MNT_W;
@@ -988,6 +1010,7 @@ always @(posedge clk) begin
 		// ---------------- READ SECTORS / MULTIPLE ----------------
 		E_RBLK: begin
 			bcnt <= 5'd0;
+			have <= 5'd0;
 			est <= E_RSEC;
 		end
 		E_RSEC: begin
@@ -1018,14 +1041,21 @@ always @(posedge clk) begin
 		end
 		E_RA3: begin
 			if (addr_bad || lba >= nbs[eu]) fin(ST_DRDY | ST_ERR, ER_IDNF, 1'b1);
+			else if (bcnt < have) begin
+				pre <= 1'b1;        // read with an earlier sector of the block
+				est <= E_RWAIT;
+			end
 			else begin
 				h_act <= 1'b1; h_unit <= eu; h_wr <= 1'b0; h_sec <= bcnt[3:0];
+				h_n   <= batch(blk - bcnt, remain, nbs[eu] - lba, e_lba_mode);
+				have  <= bcnt + batch(blk - bcnt, remain, nbs[eu] - lba, e_lba_mode);
 				sd_lba <= {4'd0, lba};
 				sd_rd[eu] <= 1'b1;
 				est <= E_RWAIT;
 			end
 		end
-		E_RWAIT: if (h_done) begin
+		E_RWAIT: if (h_done || pre) begin
+			pre <= 1'b0;
 			remain <= remain - 9'd1;
 			r_nsec <= r_nsec - 8'd1;
 			bcnt <= bcnt + 5'd1;
@@ -1059,6 +1089,7 @@ always @(posedge clk) begin
 			pend_words <= {((remain < {4'd0, blk}) ? remain[4:0] : blk), 8'd0};
 			ptr <= 13'd0;
 			bcnt <= 5'd0;
+			have <= 5'd0;
 			drq_dir_wr <= 1'b1;
 			drq_act <= 1'b1;
 			r_status[eu] <= ST_DRDY | ST_DSC | ST_DRQ;
@@ -1079,14 +1110,21 @@ always @(posedge clk) begin
 		E_WA3: begin
 			if (addr_bad || lba >= nbs[eu]) fin(ST_DRDY | ST_ERR, ER_IDNF, 1'b1);
 			else if (ro[eu]) fin(ST_DRDY | ST_ERR, ER_ABRT, 1'b1);
+			else if (bcnt < have) begin
+				pre <= 1'b1;        // written with an earlier sector of the block
+				est <= E_WWAIT;
+			end
 			else begin
 				h_act <= 1'b1; h_unit <= eu; h_wr <= 1'b1; h_sec <= bcnt[3:0];
+				h_n   <= batch(bsz - bcnt, remain, nbs[eu] - lba, e_lba_mode);
+				have  <= bcnt + batch(bsz - bcnt, remain, nbs[eu] - lba, e_lba_mode);
 				sd_lba <= {4'd0, lba};
 				sd_wr[eu] <= 1'b1;
 				est <= E_WWAIT;
 			end
 		end
-		E_WWAIT: if (h_done) begin
+		E_WWAIT: if (h_done || pre) begin
+			pre <= 1'b0;
 			remain <= remain - 9'd1;
 			r_nsec <= r_nsec - 8'd1;
 			bcnt <= bcnt + 5'd1;

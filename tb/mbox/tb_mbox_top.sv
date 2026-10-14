@@ -83,6 +83,7 @@ falcon_mbox_test #(.CLK_HZ(CLK_HZ)) mbox_test
 
 falcon_memarb memarb
 (
+	.snoop_hold(1'b0),
     .clk(clk), .reset(reset),
     .vid_req(vid_req), .vid_addr(vid_addr), .vid_ack(vid_ack), .vid_data(vid_data), .vid_valid(vid_valid),
     .ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(ld_busy_unused),

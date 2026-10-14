@@ -762,7 +762,11 @@ always @(posedge clk) begin
 
 		endcase
 
-		if (buf_flush || (snoop_we && snoop_addr[23:3] == rb_tag)) rb_valid <= 0;
+		// a DMA write to the buffered word, or to the word being loaded into
+		// the buffer this clock (its data was read before the write)
+		if (buf_flush || (snoop_we && (snoop_addr[23:3] == rb_tag ||
+		                               (rd_inflight && ram_ack && snoop_addr[23:3] == maddr_rd[23:3]))))
+			rb_valid <= 0;
 		// a new instruction: its first YM/ACIA access waits again (an access
 		// seen on the same clock belongs to the previous instruction)
 		if (inst) begin ym_seen <= 0; acia_seen <= 0; end

@@ -8,6 +8,14 @@
 //  SCC, IPL4 VBL, IPL2 HBL), mfp.c (GPIP wiring).
 //============================================================================
 
+// The ap060 variant (FALCON_CPU060): the AP68060 on its own bus bridge
+// (falcon_cpubus060), turbo only; no coprocessor interface, so no FPU bridge
+`ifdef FALCON_CPU060
+`ifndef FALCON_NO_FPU
+`define FALCON_NO_FPU
+`endif
+`endif
+
 module falcon_system #(parameter CLK_HZ = 32000000)
 (
 	input             clk,
@@ -17,6 +25,7 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 
 	input       [3:0] ram_mb,
 	input             ram_tos,      // loaded TOS is a RAM TOS behind its loader
+	input       [1:0] fast_ram,     // ap060 CT60 mode: Fast RAM 0 off, 1 64 MB, 2 128 MB, 3 240 MB (docs/CT60_MODE.md)
 	input       [1:0] monitor,
 	input             cpu_turbo,    // 1: CPU on every clock (32 MHz); 0: Falcon, 16/8 MHz ($FF8007 bit 0)
 	input             tstat_en,     // OSD: the timing counters at $FFF000 (falcon_tstat); 0: bus error there
@@ -111,6 +120,10 @@ wire  [2:0] ipl_n;
 reg         cpu_br_n = 1, cpu_bgack_n = 1;
 wire        snoop_we;
 wire [23:0] snoop_addr;
+wire        snoop_hold;   // ap060: the bridge's snoop queue is nearly full
+`ifndef FALCON_CPU060
+assign snoop_hold = 1'b0;
+`endif
 wire [31:0] dbg_pc;
 
 // The RESET instruction resets the peripherals only (cpu_reset_oe); the
@@ -134,6 +147,7 @@ wire  [2:0] cpu_tm_qn;
 wire [31:0] cpu_tm_scan, cpu_fetch_stop;
 wire        cpu_tm_flush, cpu_fetch_stop_v, cpu_scan_v;
 wire [31:0] cpu_scan_to;
+`ifndef FALCON_CPU060
 // Hatari's prefetch pipeline (stops before unconditional branches)
 falcon_pipescan pipescan
 (
@@ -175,18 +189,62 @@ ap030_top #(.USE_CE(1)) cpu
 	.fetch_lazy(cpu_fmode)   // Falcon mode: Hatari's instruction prefetch
 );
 
+`else
+// turbo only: the processor runs on every clock, no Falcon timing
+assign cpu_ce = 1'b1, cpu_fmode = 1'b0, cpu_idle_tick = 1'b0, cpu_wbuf_busy = 1'b0, cpu_idle = 1'b0;
+assign cpu_hold = 1'b0;
+wire        cpu060_a_oe, cpu060_d_oe, cpu060_bb_oe, cpu060_rsto_n, cpu060_retire;
+wire        cpu060_rw_n, cpu060_ts_n, cpu060_ta_n, cpu060_tea_n, cpu060_tci_n, cpu060_tbi_n, cpu060_avec_n;
+wire        cpu060_bg_n, cpu060_bb_n_i, cpu060_btt_n_i, cpu060_ts_n_i, cpu060_snoop_n;
+wire  [1:0] cpu060_siz, cpu060_tt, cpu060_tt_i;
+wire  [2:0] cpu060_tm;
+wire  [3:0] cpu060_bs_n;
+wire [31:0] cpu060_a_i;
+// the 68060's half-speed bus mode, BCLK = CLK/2 (16 MHz) through CLKEN, with Fast RAM off
+// CT60 mode (Fast RAM on, taken at reset): the bus at full speed, BCLK = CLK
+// (docs/CT60_MODE.md); the bridge slows the Falcon-space transfers itself
+reg cpu060_bclk = 0;
+reg cpu060_full = 0;
+always @(posedge clk) begin
+	if (reset) cpu060_full <= (fast_ram != 2'd0);
+	cpu060_bclk <= cpu060_full ? 1'b1 : ~cpu060_bclk;
+end
+assign cpu_reset_oe = ~cpu060_rsto_n;   // the RESET instruction: RSTO
+assign cpu_inst = cpu060_retire;
+// the 030 bus names the bench traces: TM is the function code for normal
+// accesses, acknowledge cycles (TT 11) are CPU space
+assign cpu_as_n = cpu060_ts_n, cpu_bus_oe = cpu060_a_oe, cpu_rw = cpu060_rw_n, cpu_siz = cpu060_siz;
+assign cpu_fc = (cpu060_tt == 2'b11) ? 3'd7 : cpu060_tm;
+assign berr_n = cpu060_tea_n;
+ap68060 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0)) cpu
+(
+	.clk(clk), .bclk_en(cpu060_bclk), .rsti_n(~(reset | sv_busy)),
+	.a_o(cpu_a), .a_oe(cpu060_a_oe), .a_i(cpu060_a_i), .ts_n_i(cpu060_ts_n_i), .tt_i(cpu060_tt_i), .snoop_n(cpu060_snoop_n),
+	.d_i(cpu_di), .d_o(cpu_do), .d_oe(cpu060_d_oe),
+	.rw_n(cpu060_rw_n), .siz(cpu060_siz), .bs_n(cpu060_bs_n), .tt(cpu060_tt), .tm(cpu060_tm), .tln(), .upa(),
+	.ciout_n(), .lock_n(), .locke_n(), .lock_oe(), .ts_n(cpu060_ts_n), .tip_n(), .tip_oe(), .sas_n(), .sas_oe(),
+	.ta_n(cpu060_ta_n), .tea_n(cpu060_tea_n), .tra_n(1'b1), .tci_n(cpu060_tci_n), .tbi_n(cpu060_tbi_n), .cla_n(1'b1),
+	.ipl_n((reset | sv_busy) ? 3'b111 : ipl_n),   // at reset: no special bus modes (7.14)
+	.avec_n(cpu060_avec_n),
+	.br_n(), .bg_n(cpu060_bg_n), .bgr_n(1'b1), .bb_n_i(cpu060_bb_n_i), .bb_n_o(), .bb_oe(cpu060_bb_oe),
+	.btt_n_i(cpu060_btt_n_i), .btt_n_o(), .btt_oe(),
+	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(cpu_ipend_n), .pst(),
+	.dbg_pc(dbg_pc), .dbg_retire(cpu060_retire), .dbg_halted(cpu_halted)
+);
+`endif
+
 //////////////////////////////////////////////////////////////////
 //  Bus bridge
 //////////////////////////////////////////////////////////////////
 
 wire        cram_req, cram_we, cram_ack;
-wire [23:2] cram_addr;
+wire [27:2] cram_addr;   // [27:24]: the ap060's Fast RAM only
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
 wire [63:0] cram_rdata64;
 // the same port behind the CPU's line cache (falcon_l2), to falcon_memarb
 wire        mram_req, mram_we, mram_ack, mram_burst, mram_beat;
-wire [23:2] mram_addr;
+wire [27:2] mram_addr;
 wire  [3:0] mram_be;
 wire [31:0] mram_wdata, mram_rdata;
 wire [63:0] mram_rdata64;
@@ -222,6 +280,7 @@ wire [23:1] blt_addr;
 wire  [1:0] blt_be;
 wire [15:0] blt_wdata, blt_rdata;
 
+`ifndef FALCON_CPU060
 falcon_cpubus cpubus
 (
 	.clk(clk), .reset(reset | sv_busy),
@@ -229,7 +288,7 @@ falcon_cpubus cpubus
 	.a(cpu_a), .fc(cpu_fc), .siz(cpu_siz), .rw(cpu_rw), .as_n(cpu_as_n), .ds_n(cpu_ds_n),
 	.bus_oe(cpu_bus_oe), .d_o(cpu_do), .d_i(cpu_di),
 	.dsack0_n(dsack0_n), .dsack1_n(dsack1_n), .berr_n(berr_n), .avec_n(avec_n), .ciin_n(ciin_n),
-	.ram_req(cram_req), .ram_we(cram_we), .ram_addr(cram_addr), .ram_be(cram_be),
+	.ram_req(cram_req), .ram_we(cram_we), .ram_addr(cram_addr[23:2]), .ram_be(cram_be),
 	.ram_wdata(cram_wdata), .ram_rdata(cram_rdata), .ram_ack(cram_ack),
 	.dev_cs(c_dev_cs), .dev_stb(c_dev_stb), .dev_we(c_dev_we), .dev_addr(c_dev_addr),
 	.dev_uds(c_dev_uds), .dev_lds(c_dev_lds), .dev_din(c_dev_din), .dev_dout(dev_dout),
@@ -247,6 +306,29 @@ falcon_cpubus cpubus
 	.idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(!cpu_bgack_n), .blit_acc(blt_ack),
 	.gov_idle(), .gov_back()
 );
+
+`else
+assign cp_req = 1'b0, cp_we = 1'b0, cp_id = 3'd0, cp_off = 5'd0, cp_siz = 2'd0, cp_wdata = 32'd0;
+falcon_cpubus060 cpubus
+(
+	.clk(clk), .bclk_en(cpu060_bclk), .reset(reset | sv_busy),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .fast_ram(fast_ram),
+	.a(cpu_a), .a_oe(cpu060_a_oe), .d_o(cpu_do), .d_oe(cpu060_d_oe), .rw_n(cpu060_rw_n), .siz(cpu060_siz),
+	.bs_n(cpu060_bs_n), .tt(cpu060_tt), .tm(cpu060_tm), .ts_n(cpu060_ts_n), .bb_oe(cpu060_bb_oe),
+	.d_i(cpu_di), .ta_n(cpu060_ta_n), .tea_n(cpu060_tea_n), .tci_n(cpu060_tci_n), .tbi_n(cpu060_tbi_n),
+	.avec_n(cpu060_avec_n), .bg_n(cpu060_bg_n), .bb_n_i(cpu060_bb_n_i), .btt_n_i(cpu060_btt_n_i),
+	.a_i(cpu060_a_i), .ts_n_i(cpu060_ts_n_i), .tt_i(cpu060_tt_i), .snoop_n(cpu060_snoop_n),
+	.ram_req(cram_req), .ram_we(cram_we), .ram_addr(cram_addr), .ram_be(cram_be),
+	.ram_wdata(cram_wdata), .ram_rdata(cram_rdata), .ram_rdata64(cram_rdata64), .ram_ack(cram_ack),
+	.dev_cs(c_dev_cs), .dev_stb(c_dev_stb), .dev_we(c_dev_we), .dev_addr(c_dev_addr),
+	.dev_uds(c_dev_uds), .dev_lds(c_dev_lds), .dev_din(c_dev_din), .dev_dout(dev_dout),
+	.dev_ack(dev_ack), .dev_berr(dev_berr), .dev_super(dev_super),
+	.iack_req(iack_req), .iack_level(iack_level), .iack_done(iack_done), .iack_avec(iack_avec),
+	.iack_spur(iack_spur), .iack_vector(iack_vector),
+	.snoop_we(snoop_we), .snoop_addr(snoop_addr), .snoop_hold(snoop_hold), .blit_br(blit_br), .blit_bg(blit_bg),
+	.cycle_done(cpu_cycle_done)
+);
+`endif
 
 
 //////////////////////////////////////////////////////////////////
@@ -399,16 +481,25 @@ falcon_fpu_bridge #(.CLK_HZ(CLK_HZ)) fpu
 );
 `endif
 
+`ifndef FALCON_CPU060
 // the CPU's line cache in block RAM (Falcon mode; turbo passes straight through)
 falcon_l2 l2
 (
 	.clk(clk), .reset(reset), .en(cpu_fmode),
-	.c_req(cram_req), .c_we(cram_we), .c_addr(cram_addr), .c_be(cram_be), .c_wdata(cram_wdata),
+	.c_req(cram_req), .c_we(cram_we), .c_addr(cram_addr[23:2]), .c_be(cram_be), .c_wdata(cram_wdata),
 	.c_rdata(cram_rdata), .c_rdata64(cram_rdata64), .c_ack(cram_ack),
-	.m_req(mram_req), .m_we(mram_we), .m_addr(mram_addr), .m_be(mram_be), .m_wdata(mram_wdata),
+	.m_req(mram_req), .m_we(mram_we), .m_addr(mram_addr[23:2]), .m_be(mram_be), .m_wdata(mram_wdata),
 	.m_burst(mram_burst), .m_rdata(mram_rdata), .m_rdata64(mram_rdata64), .m_beat(mram_beat), .m_ack(mram_ack),
 	.owr_we(owr_we), .owr_addr(owr_addr)
 );
+// the 030's address space is 24 bits (Fast RAM is the ap060's)
+assign cram_addr[27:24] = 4'd0;
+assign mram_addr[27:24] = 4'd0;
+
+`else
+assign mram_req = cram_req, mram_we = cram_we, mram_addr = cram_addr, mram_be = cram_be, mram_wdata = cram_wdata, mram_burst = 1'b0;
+assign cram_rdata = mram_rdata, cram_rdata64 = mram_rdata64, cram_ack = mram_ack;
+`endif
 
 falcon_memarb memarb
 (
@@ -426,7 +517,7 @@ falcon_memarb memarb
 	.cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),
 	.cpu_wdata(mram_wdata), .cpu_rdata(mram_rdata), .cpu_rdata64(mram_rdata64), .cpu_ack(mram_ack),
 	.cpu_burst(mram_burst), .cpu_beat(mram_beat), .owr_we(owr_we), .owr_addr(owr_addr),
-	.snoop_we(snoop_we), .snoop_addr(snoop_addr),
+	.snoop_we(snoop_we), .snoop_addr(snoop_addr), .snoop_hold(snoop_hold),
 	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE)
@@ -457,7 +548,11 @@ wire sel_scc     = (da[23:3]  == 21'h1FF190);                  // FF8C80-FF8C87
 wire sel_dsp     = (da[23:3]  == 21'h1FF440);                  // FFA200-FFA207
 wire sel_mfp     = (da[23:6]  == 18'h3FFE8) && (da[5:0] < 6'h30); // FFFA00-FFFA2F
 wire sel_acia    = (da[23:3]  == 21'h1FFF80);                  // FFFC00-FFFC07
+`ifdef FALCON_CPU060
+wire sel_tstat   = 1'b0;                                          // no timing counters: bus error
+`else
 wire sel_tstat   = tstat_en && (da[23:5] == 19'h7FF80);        // FFF000-FFF01F, OSD option (bus error otherwise)
+`endif
 
 // addresses that read as $FF/write nothing instead of bus erroring
 // (IoMem_FixVoidAccessForCompatibleFalcon in the STE-compatible bus mode,
@@ -522,6 +617,7 @@ end
 //////////////////////////////////////////////////////////////////
 
 // ---- CPU timing counters (core diagnostic, OSD option) ----
+`ifndef FALCON_CPU060
 falcon_tstat tstat
 (
 	.clk(clk), .reset(reset),
@@ -530,6 +626,10 @@ falcon_tstat tstat
 	.fmode(cpu_fmode), .cpu_16mhz(cpu_16mhz), .cpu_ce(cpu_ce), .idle_tick(cpu_idle_tick),
 	.back(cpu_back), .credit(cpu_credit), .debt(cpu_debt)
 );
+
+`else
+assign tstat_dout = 16'hFFFF, tstat_ack = 1'b0;
+`endif
 
 falcon_combel combel
 (
@@ -627,6 +727,7 @@ falcon_nvram #(.CLK_HZ(CLK_HZ)) nvram
 `ifndef FALCON_NO_IDE
 // ---- IDE ----
 wire ide_led;
+wire [5:0] ide_blk_cnt;      // blocks - 1 of the IDE's pending HPS request
 assign hdd_led = ide_led | scsi_led;
 falcon_ide ide
 (
@@ -635,7 +736,7 @@ falcon_ide ide
 	.irq(ide_irq),
 	.img_mounted(img_mounted[3:2]), .img_readonly(img_readonly), .img_size(img_size),
 	.sd_lba0(sd_lba[2]), .sd_lba1(sd_lba[3]), .sd_rd(sd_rd[3:2]), .sd_wr(sd_wr[3:2]), .sd_ack(sd_ack[3:2]),
-	.sd_buff_addr(sd_buff_addr[8:0]), .sd_buff_dout(sd_buff_dout),
+	.sd_buff_addr(sd_buff_addr), .sd_blk_cnt(ide_blk_cnt), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din0(sd_buff_din[2]), .sd_buff_din1(sd_buff_din[3]), .sd_buff_wr(sd_buff_wr),
 	.led(ide_led)
 );
@@ -643,6 +744,7 @@ falcon_ide ide
 `else
 // bring-up build without the IDE controller
 assign ide_dout = 16'hFFFF; assign ide_ack = dev_stb & sel_ide; assign ide_irq = 0; assign ide_led = 0;
+assign ide_blk_cnt = 6'd0;
 assign sd_lba[2] = 0; assign sd_lba[3] = 0; assign sd_rd[3:2] = 0; assign sd_wr[3:2] = 0;
 assign sd_buff_din[2] = 0; assign sd_buff_din[3] = 0;
 `endif
@@ -651,7 +753,7 @@ assign sd_buff_din[2] = 0; assign sd_buff_din[3] = 0;
 // ---- FDC + DMA ----
 wire        hdc_acc, hdc_we, hdc_irq_set, hdc_irq_clr, scsi_led;
 wire  [5:0] scsi_blk_cnt;
-assign sd_blk_cnt[0] = 6'd0; assign sd_blk_cnt[1] = 6'd0; assign sd_blk_cnt[2] = 6'd0; assign sd_blk_cnt[3] = 6'd0;
+assign sd_blk_cnt[0] = 6'd0; assign sd_blk_cnt[1] = 6'd0; assign sd_blk_cnt[2] = ide_blk_cnt; assign sd_blk_cnt[3] = ide_blk_cnt;
 assign sd_blk_cnt[4] = scsi_blk_cnt; assign sd_blk_cnt[5] = scsi_blk_cnt; assign sd_blk_cnt[6] = scsi_blk_cnt;
 wire  [2:0] hdc_rs;
 wire  [7:0] hdc_wdata, hdc_rdata, hdc_push_byte, hdc_pull_byte;
@@ -700,13 +802,17 @@ assign fdc_dout = 16'hFFFF; assign fdc_ack = dev_stb & sel_fdc; assign fdc_berr 
 assign fdc_dreq = 0; assign fdc_dwe = 0; assign fdc_daddr = 0; assign fdc_dbe = 0; assign fdc_dwdata = 0;
 assign sd_lba[0] = 0; assign sd_lba[1] = 0; assign sd_rd[1:0] = 0; assign sd_wr[1:0] = 0;
 assign sd_buff_din[0] = 0; assign sd_buff_din[1] = 0;
-assign sd_blk_cnt[0] = 0; assign sd_blk_cnt[1] = 0; assign sd_blk_cnt[2] = 0; assign sd_blk_cnt[3] = 0;
+assign sd_blk_cnt[0] = 0; assign sd_blk_cnt[1] = 0; assign sd_blk_cnt[2] = ide_blk_cnt; assign sd_blk_cnt[3] = ide_blk_cnt;
 assign sd_blk_cnt[4] = 0; assign sd_blk_cnt[5] = 0; assign sd_blk_cnt[6] = 0;
 `endif
 
 // ---- Blitter: owns the bus through BR/BG/BGACK ----
 wire blit_br;
+`ifdef FALCON_CPU060
+wire blit_bg;
+`else
 reg  blit_bg = 0;
+`endif
 falcon_blitter blitter
 (
 	.clk(clk), .reset(dev_reset),
@@ -718,6 +824,7 @@ falcon_blitter blitter
 	.dma_wdata(blt_wdata), .dma_rdata(blt_rdata), .dma_ack(blt_ack)
 );
 
+`ifndef FALCON_CPU060
 // MC68030 arbitration (UM 7.7): BR -> BG -> the new master asserts BGACK,
 // negates BR, and keeps BGACK while it owns the bus
 always @(posedge clk) begin
@@ -737,6 +844,9 @@ always @(posedge clk) begin
 		blit_bg     <= 0;
 	end
 end
+
+`else
+`endif
 
 // ---- DMA sound / crossbar / codec ----
 wire        ssi_slot_stb, ssi_frame, ssi_tx_valid, ssi_tx_en, ssi_rx_en, ssi_rx_frame, ssi_hs_play_req;

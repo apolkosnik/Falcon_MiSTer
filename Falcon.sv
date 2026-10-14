@@ -63,6 +63,8 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[8]    reset NVRAM to defaults for the selected monitor
 //   status[9]    CPU: 32 MHz turbo (default), Falcon 16 MHz (8 MHz by $FF8007)
 //   status[10]   timing counters at $FFF000 (falcon_tstat; off: bus error there)
+//   status[12:11] ap060 builds only: Fast RAM off, 64, 128, 240 MB (CT60 mode,
+//                docs/CT60_MODE.md; taken at reset, a size change needs a cold reset)
 `include "build_id.v"
 localparam CONF_STR = {
 	"Falcon;;",
@@ -82,6 +84,9 @@ localparam CONF_STR = {
 	"O[6],UART,Serial,MIDI;",
 	"O[9],CPU,32 MHz turbo,Falcon 16 MHz;",
 	"O[10],Timing counters,Off,On;",
+`ifdef FALCON_CPU060
+	"O[12:11],Fast RAM,Off,64 MB,128 MB,240 MB;",
+`endif
 	"-;",
 	"T[0],Reset;",
 	"T[7],Cold Reset;",
@@ -250,6 +255,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.monitor(status[2:1] == 2'd0 ? 2'b10 : status[2:1] == 2'd1 ? 2'b01 : status[2:1] == 2'd2 ? 2'b11 : 2'b00),
 	.cpu_turbo(~status[9]),
 	.tstat_en(status[10]),
+	.fast_ram(status[12:11]),
 
 	.ld_wr(ioctl_wr & (rom_download | cart_download)),
 	.ld_addr(ld_addr),

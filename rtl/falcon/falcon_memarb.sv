@@ -15,7 +15,10 @@
 //    d3   DMA port 3: the FPU bridge's HPS mailbox (falcon_fpu_bridge), or
 //         in measurement builds the mailbox latency probe (falcon_mbox_test)
 //    cpu  68030 data/instruction accesses, 32 bit with byte enables, or
-//         (cpu_burst) a read of the four 64-bit words from cpu_addr[23:5]
+//         (cpu_burst) a read of the four 64-bit words from cpu_addr[23:5];
+//         its address is 28 bits wide for the ap060 build's Fast RAM
+//         (CT60 mode: guest $01000000-$0FFFFFFF, DDR3 0x31000000+), the
+//         other masters' are 24
 //         for the CPU's line cache (falcon_l2): one cpu_beat per word,
 //         cpu_ack with the last
 //
@@ -92,7 +95,7 @@ module falcon_memarb
 	// CPU: 32 bit, level request, one-clock acknowledge
 	input             cpu_req,
 	input             cpu_we,
-	input      [23:2] cpu_addr,
+	input      [27:2] cpu_addr,    // [27:24] non-zero only for the ap060's Fast RAM
 	input       [3:0] cpu_be,      // [3] = lowest address (D31..D24)
 	input      [31:0] cpu_wdata,
 	output reg [31:0] cpu_rdata,
@@ -108,6 +111,7 @@ module falcon_memarb
 	// snoop: a non-CPU master wrote RAM
 	output reg        snoop_we,
 	output reg [23:0] snoop_addr,
+	input             snoop_hold,   // the CPU's snoop queue is nearly full: no DMA writes for now
 
 	// MiSTer DDRAM interface
 	input             DDRAM_BUSY,
@@ -152,7 +156,7 @@ reg        cmd_burst;   // a CPU burst read
 
 // the selected master's request, in guest big-endian form
 reg        g_we;
-reg [23:3] g_addr;
+reg [27:3] g_addr;
 reg [63:0] g_wdata;
 reg  [7:0] g_be;        // [7] = lowest address
 reg  [2:0] g_owner;
@@ -163,27 +167,27 @@ reg        g_ok;        // 0: a DMA access outside writable/readable memory, no 
 wire [23:0] ram_top = {ram_mb, 20'd0};
 
 always @* begin : sel
-	reg [23:0] wa;
+	reg [27:0] wa;
 	g_any = 1; g_we = 0; g_addr = 0; g_wdata = 0; g_be = 0; g_owner = M_CPU; g_sub = 0; g_ok = 1;
 	if (vid_req) begin
 		g_owner = M_VID; g_addr = vid_addr; g_be = 8'hFF;
 	end else if (ld_pend) begin
 		g_owner = M_LD; g_we = 1; g_addr = ld_a[23:3];
 		g_wdata = {8{ld_d}}; g_be = 8'h80 >> ld_a[2:0];
-	end else if (d0_req) begin
+	end else if (d0_req && !(snoop_hold && d0_we)) begin
 		g_owner = M_D0; g_we = d0_we; g_addr = d0_addr[23:3]; g_sub = d0_addr[2:1];
 		g_wdata = {4{d0_wdata}}; g_be = {6'd0, d0_be} << (6 - 2 * d0_addr[2:1]);
-	end else if (d1_req) begin
+	end else if (d1_req && !(snoop_hold && d1_we)) begin
 		g_owner = M_D1; g_we = d1_we; g_addr = d1_addr[23:3]; g_sub = d1_addr[2:1];
 		g_wdata = {4{d1_wdata}}; g_be = {6'd0, d1_be} << (6 - 2 * d1_addr[2:1]);
-	end else if (d2_req) begin
+	end else if (d2_req && !(snoop_hold && d2_we)) begin
 		g_owner = M_D2; g_we = d2_we; g_addr = d2_addr[23:3]; g_sub = d2_addr[2:1];
 		g_wdata = {4{d2_wdata}}; g_be = {6'd0, d2_be} << (6 - 2 * d2_addr[2:1]);
-	end else if (d3_req) begin
+	end else if (d3_req && !(snoop_hold && d3_we)) begin
 		g_owner = M_D3; g_we = d3_we; g_addr = d3_addr[23:3]; g_sub = d3_addr[2:1];
 		g_wdata = {4{d3_wdata}}; g_be = {6'd0, d3_be} << (6 - 2 * d3_addr[2:1]);
 	end else if (cpu_req) begin
-		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_burst ? {cpu_addr[23:5], 2'b00} : cpu_addr[23:3]; g_sub = {cpu_addr[2], 1'b0};
+		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_burst ? {cpu_addr[27:5], 2'b00} : cpu_addr[27:3]; g_sub = {cpu_addr[2], 1'b0};
 		g_wdata = {2{cpu_wdata}}; g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
 	end else g_any = 0;
 
@@ -231,7 +235,7 @@ always @(posedge clk) begin
 			owner      <= g_owner;
 			sub        <= g_sub;
 			cmd_we     <= g_we;
-			DDRAM_ADDR <= DDR_BASE | {8'd0, g_addr};
+			DDRAM_ADDR <= DDR_BASE | {4'd0, g_addr};
 			DDRAM_BURSTCNT <= (g_owner == M_VID || (g_owner == M_CPU && cpu_burst && !g_we)) ? 8'd4 : 8'd1;
 			cmd_burst  <= (g_owner == M_CPU && cpu_burst && !g_we);
 			DDRAM_DIN  <= swap64(g_wdata);
@@ -244,11 +248,11 @@ always @(posedge clk) begin
 			if (g_owner == M_LD)  ld_take = 1;
 			if (g_we && g_owner != M_CPU && g_owner != M_LD) begin
 				snoop_we   <= 1;
-				snoop_addr <= {g_addr, g_sub, 1'b0};
+				snoop_addr <= {g_addr[23:3], g_sub, 1'b0};
 			end
 			if (g_we && g_owner != M_CPU) begin
 				owr_we   <= 1;
-				owr_addr <= g_addr;
+				owr_addr <= g_addr[23:3];
 			end
 		end
 

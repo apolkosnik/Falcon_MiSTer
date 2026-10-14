@@ -32,6 +32,7 @@ wire [28:0] ddr_addr;
 wire [63:0] din, dout;
 wire snoop_we;
 falcon_memarb dut(
+	.snoop_hold(1'b0),
  .clk(clk), .reset(reset), .ram_mb(ram_mb),
  .vid_req(1'b0), .vid_addr(21'd0), .ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0),
  .d0_req(req[0]), .d0_we(we), .d0_addr(addr), .d0_be(2'b11), .d0_wdata(data), .d0_rdata(rd[0]), .d0_ack(ack[0]),
