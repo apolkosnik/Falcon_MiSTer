@@ -762,3 +762,23 @@ ALMs (99%), 414 RAM blocks; seed 5 meets timing (worst slack +0.216 ns, HDMI
 domain).  The fit is tight: of seeds 2-5, 7 and 8, seeds 4, 7 and 8 do not
 fit (one needs 4,195 LABs of 4,191), seed 2 misses timing by 2.9 ns and seed
 3 the HDMI domain by 0.255 ns.
+
+**A smaller AP68030** (2026-10-14).  `rtl/AP68030` pins 4772ea4 (AP68030
+main): apolkosnik/AP68030#7 makes the AP68030 about 11% smaller (a third
+fewer registers) and gives several instructions fewer internal clocks
+(MOVEM, not-taken Bcc.B/DBcc, LEA, JSR/BSR, LINK/UNLK, word multiply and
+divide); behaviour is unchanged.  The governor still maps that time onto
+Hatari's, but a few instructions now end in another slot: of the 35
+sequences of tb/bustime/timing, jsr/rts x25 takes 1232 clocks (Hatari's,
+before +4) and divu.l x20 500 (Hatari 492, before +4); the others and the
+total (29,281 against Hatari's 29,342) are unchanged.  CPUTIME's spans
+change the same way, 4 clocks in 23 of its 72 marker intervals (42,784 to
+42,692 in all), so ref.i is regenerated: the board must match the new
+numbers with this bitstream.  tb/bustime takes 20,252 processor clocks in
+all five configurations; tb/integration, tb/l2 and tb/fpu (both modes)
+pass, FPUTEST passes at 16 MHz and in turbo, and TOS 4.04 shows the same
+frames for 20 simulated seconds (forgiven debt 4% lower).  Quartus 17.0:
+38,281 ALMs (91%, 3,215 fewer), 414 RAM blocks; seed 9 meets timing (worst
+slack +0.245 ns; HDMI setup +0.419 ns).  Seed 5 misses the HDMI domain by
+0.687 ns, seeds 1, 2 and 8 miss timing by 0.11-0.61 ns, seeds 3 and 6 meet
+it.

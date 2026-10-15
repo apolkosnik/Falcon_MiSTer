@@ -13,7 +13,7 @@ Atari Falcon030 core for MiSTer (DE10-Nano).
 Status: untested on hardware. In full-system simulation (Verilator, the real
 RTL, EmuTOS 1.3) the machine boots to the GEM desktop from floppy, IDE and
 SCSI disks, with keyboard and mouse input, matching Hatari's boot frame by
-frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
+frame.  The complete core fits (91% of the logic) and meets timing at 32 MHz.
 
 ## What is in the FPGA
 
