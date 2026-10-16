@@ -217,7 +217,9 @@ wire  [1:0] cp_siz;
 wire [31:0] cp_wdata, cp_rdata;
 
 // the blitter's DMA port (its accesses also count in the CPU's Falcon time)
-wire        blt_req, blt_we, blt_ack;
+wire        blt_req, blt_we, blt_ack, blt_pace;
+wire        blit_br;
+reg         blit_bg = 0;       // the blitter owns the bus
 wire [23:1] blt_addr;
 wire  [1:0] blt_be;
 wire [15:0] blt_wdata, blt_rdata;
@@ -244,7 +246,7 @@ falcon_cpubus cpubus
 	.ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
 	.buf_flush(ld_busy_arb | sv_busy), .iack_mfp(iack_mfp),
 	.dispatch(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md),
-	.idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(!cpu_bgack_n), .blit_acc(blt_ack),
+	.idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(!cpu_bgack_n), .blit_acc(blt_ack), .blit_pace(blt_pace),
 	.gov_idle(), .gov_back()
 );
 
@@ -420,7 +422,7 @@ falcon_memarb memarb
 	.d1_req(fdc_dreq), .d1_we(fdc_dwe), .d1_addr(fdc_daddr), .d1_be(fdc_dbe), .d1_wdata(fdc_dwdata),
 	.d1_rdata(fdc_drdata), .d1_ack(fdc_dack),
 	.d2_req(blt_req & ~blt_io), .d2_we(blt_we), .d2_addr(blt_addr), .d2_be(blt_be), .d2_wdata(blt_wdata),
-	.d2_rdata(mblt_rdata), .d2_ack(mblt_ack),
+	.d2_rdata(mblt_rdata), .d2_ack(mblt_ack), .d2_hold(blit_bg),
 	.d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
 	.d3_rdata(d3_rdata), .d3_ack(d3_ack),
 	.cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),
@@ -705,14 +707,12 @@ assign sd_blk_cnt[4] = 0; assign sd_blk_cnt[5] = 0; assign sd_blk_cnt[6] = 0;
 `endif
 
 // ---- Blitter: owns the bus through BR/BG/BGACK ----
-wire blit_br;
-reg  blit_bg = 0;
 falcon_blitter blitter
 (
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_blit), .bus_addr(dev_addr[5:1]), .bus_dout(blit_dout), .bus_ack(blit_ack),
 	.br(blit_br), .bg(blit_bg), .cpu_bus_cycle(cpu_cycle_done),
-	.fmode(cpu_fmode), .ftick(cpu_ce | cpu_idle_tick),
+	.fmode(cpu_fmode), .ftick(cpu_ce | cpu_idle_tick), .fpace(blt_pace),
 	.busy(blit_busy),
 	.dma_req(blt_req), .dma_we(blt_we), .dma_addr(blt_addr), .dma_be(blt_be),
 	.dma_wdata(blt_wdata), .dma_rdata(blt_rdata), .dma_ack(blt_ack)

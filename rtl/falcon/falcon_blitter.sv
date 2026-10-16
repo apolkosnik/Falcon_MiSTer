@@ -45,7 +45,10 @@
 //   share is NONHOG_CPU_CLOCKS (256) of its clocks in Falcon time (ftick),
 //   as Hatari runs the 68030 between two non-hog bursts (blitter.c:931-937,
 //   BLITTER_NONHOG_BUS_CPU * 4); the time of the blit itself is accounted
-//   by falcon_cpubus (Hatari's 4 clocks per access and arbitration).
+//   by falcon_cpubus (Hatari's 4 clocks per access and arbitration), which
+//   raises fpace while the blit is ahead of Falcon time: no access starts
+//   then, so in real time the blit takes Hatari's time (or more when the
+//   memory is slower).
 //   Writing control with bit 7 = 1 while the CPU owns the bus restarts the
 //   blitter at once (keeping its word state); writing bit 7 = 0 pauses it
 //   (busy stays 1, no bus request) until bit 7 is written to 1 again.
@@ -112,6 +115,7 @@ module falcon_blitter #(
     input             cpu_bus_cycle,
     input             fmode,        // Falcon bus timing: the CPU's share in its clocks
     input             ftick,        // a CPU clock of Falcon time
+    input             fpace,        // Falcon mode: the blit is ahead of Falcon time
 
     output            busy
 );
@@ -162,13 +166,11 @@ module falcon_blitter #(
     localparam P_PAUSE = 2'd3;     // stopped by writing busy = 0
     reg [1:0] phase;
 
-    localparam F_STEP   = 3'd0;    // word setup (Blitter_Step head)
-    localparam F_DECIDE = 3'd1;    // choose next read (Blitter_ProcessWord)
-    localparam F_RD     = 3'd2;    // read in progress
-    localparam F_PRE    = 3'd3;    // xcount=1 & NFSR pre-shift
-    localparam F_CALC   = 3'd4;    // compute destination word
-    localparam F_WR     = 3'd5;    // write in progress
-    reg [2:0] fsm;
+    localparam F_STEP   = 2'd0;    // word setup (Blitter_Step head), first read
+    localparam F_RD     = 2'd1;    // read in progress
+    localparam F_CALC   = 2'd2;    // xcount=1 & NFSR pre-shift, destination word
+    localparam F_WR     = 2'd3;    // write in progress
+    reg [1:0] fsm;
 
     localparam RK_FXSR = 2'd0;
     localparam RK_SRC  = 2'd1;
@@ -213,9 +215,11 @@ module falcon_blitter #(
         shift_fetch = neg ? {w, b[31:16]} : {b[15:0], w};
     endfunction
 
-    // Blitter_SourceRead
+    // Blitter_SourceRead, after the special case x_count=1 and NFSR=1 (the
+    // shift before the LOP, taken into the buffer in F_CALC)
+    wire [31:0] buf_in   = weird ? shift_fetch(buffer, bus_word, src_neg) : buffer;
     /* verilator lint_off UNUSEDSIGNAL */
-    wire [31:0] buf_sh   = buffer >> v_skew;
+    wire [31:0] buf_sh   = buf_in >> v_skew;
     /* verilator lint_on UNUSEDSIGNAL */
     wire [15:0] src_word = buf_sh[15:0];
     // Blitter_GetHalftoneWord
@@ -264,6 +268,28 @@ module falcon_blitter #(
     wire        first_word = (x_count == x_count_reset);
     wire [15:0] mask_sel   = (first_word || x_count_reset == 17'd1) ? endmask1 :
                              (x_count == 17'd1) ? endmask3 : endmask2;
+    wire        nx_fxsr    = first_word ? v_fxsr : st_fxsr;
+    wire        nx_nfsr    = first_word ? 1'b0 : st_nfsr;
+    wire        nx_nsrc    = lop_need_src && (hop[1] || (hop == 2'd1 && ctl_smudge));
+    wire        nx_ndst    = lop_need_dst || (mask_sel != 16'hFFFF);
+    // the next read of the word (Blitter_ProcessWord), chosen in F_STEP and,
+    // in F_RD, from the state after the read being acknowledged
+    wire        k_step = (fsm == F_STEP);
+    wire        k_fx   = k_step ? nx_fxsr : st_fxsr;
+    wire        k_nf   = k_step ? nx_nfsr : st_nfsr;
+    wire        k_ns   = k_step ? nx_nsrc : need_src;
+    wire        k_nd   = k_step ? nx_ndst : need_dst;
+    wire        k_hfx  = have_fxsr || (!k_step && rd_kind == RK_FXSR);
+    wire        k_hs   = have_src  || (!k_step && rd_kind == RK_SRC);
+    wire        k_hd   = have_dst  || (!k_step && rd_kind == RK_DST);
+    wire        k_rfx  = k_fx && !k_hfx && k_ns;
+    wire        k_rs   = k_ns && !k_hs && !k_nf;
+    wire        k_rd   = k_rfx || k_rs || (k_nd && !k_hd);
+    wire [1:0]  k_kind = k_rfx ? RK_FXSR : k_rs ? RK_SRC : RK_DST;
+    wire [23:1] k_addr = !(k_rfx || k_rs) ? dst_addr :
+                         (!k_step && rd_kind == RK_FXSR) ? src_addr + src_xinc_ext : src_addr;
+    // an access may start
+    wire        go     = (phase == P_RUN) && bg && !fpace;
 
     // ------------------------------------------------------------------
     // register read mux
@@ -367,35 +393,24 @@ module falcon_blitter #(
                         st_nfsr <= 1'b0;
                         st_fxsr <= v_fxsr;
                     end
-                    need_src <= lop_need_src && (hop[1] || (hop == 2'd1 && ctl_smudge));
-                    need_dst <= lop_need_dst || (mask_sel != 16'hFFFF);
-                    fsm <= F_DECIDE;
+                    need_src <= nx_nsrc;
+                    need_dst <= nx_ndst;
+                    weird    <= v_nfsr && (x_count == 17'd1);
+                    if (k_rd) begin
+                        rd_kind  <= k_kind;
+                        dma_addr <= k_addr;
+                        dma_we   <= 1'b0;
+                        dma_req  <= !fpace;
+                        fsm      <= F_RD;
+                    end else begin
+                        fsm <= F_CALC;
+                    end
                 end
-            end
-
-            F_DECIDE: begin
-                if (st_fxsr && !have_fxsr && need_src) begin
-                    rd_kind  <= RK_FXSR;
-                    dma_addr <= src_addr;
-                    fsm      <= F_RD;
-                end else if (need_src && !have_src && !st_nfsr) begin
-                    rd_kind  <= RK_SRC;
-                    dma_addr <= src_addr;
-                    fsm      <= F_RD;
-                end else if (need_dst && !have_dst) begin
-                    rd_kind  <= RK_DST;
-                    dma_addr <= dst_addr;
-                    fsm      <= F_RD;
-                end else begin
-                    fsm <= F_PRE;
-                end
-                dma_we <= 1'b0;
-                weird  <= v_nfsr && (x_count == 17'd1);
             end
 
             F_RD: begin
                 if (!dma_req) begin
-                    if (phase == P_RUN && bg)
+                    if (go)
                         dma_req <= 1'b1;
                 end else if (dma_ack) begin
                     dma_req  <= 1'b0;
@@ -425,29 +440,30 @@ module falcon_blitter #(
                             cpu_cnt <= 8'd0;
                             tmo_cnt <= 16'd0;
                         end
+                    end else if (k_rd) begin
+                        rd_kind  <= k_kind;
+                        dma_addr <= k_addr;
+                        dma_req  <= go;
                     end else begin
-                        fsm <= F_DECIDE;
+                        fsm <= F_CALC;
                     end
                 end
             end
 
-            F_PRE: begin
-                // special case x_count=1 and NFSR=1, before the LOP
-                if (weird)
-                    buffer <= shift_fetch(buffer, bus_word, src_neg);
-                fsm <= F_CALC;
-            end
-
             F_CALC: begin
-                wdata <= dst_data;
-                fsm   <= F_WR;
+                buffer    <= buf_in;
+                wdata     <= dst_data;
+                dma_wdata <= dst_data;
+                dma_addr  <= dst_addr;
+                dma_we    <= 1'b1;
+                dma_req   <= go;
+                fsm       <= F_WR;
             end
 
             F_WR: begin
                 if (!dma_req) begin
-                    if (phase == P_RUN && bg) begin
+                    if (go) begin
                         dma_req   <= 1'b1;
-                        dma_we    <= 1'b1;
                         dma_addr  <= dst_addr;
                         dma_wdata <= wdata;
                     end

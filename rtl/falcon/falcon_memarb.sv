@@ -22,6 +22,16 @@
 //  One command is outstanding at a time.  DMA writes are reported on the
 //  snoop port so the CPU data cache never holds stale lines.
 //
+//  The blitter (d2) reads through a buffer of two 64-bit lines: a blit reads
+//  its source and its destination in address order, so one DDR3 read serves
+//  up to four word reads.  A hit is answered from the buffer, also while
+//  another master's command is out.  Every write that goes to the DDR3, by
+//  any master (the blitter's own included), updates a buffered copy of its
+//  line, so the buffer never holds stale data; it is emptied whenever the
+//  blitter does not own the bus (d2_hold low).  The blitter's writes are
+//  acknowledged when the command is issued (their data is in the buffer and
+//  the next command waits for this one).
+//
 //  DMA accesses (d0..d2) follow Hatari's memory banks: ST-RAM is read and
 //  written directly (SysMem_wget reads the RAM, not the ROM vectors), ROM
 //  and cartridge are read only (ROMmem_wput never stores), and anything else
@@ -80,6 +90,7 @@ module falcon_memarb
 	input      [15:0] d2_wdata,
 	output reg [15:0] d2_rdata,
 	output reg        d2_ack,
+	input             d2_hold,     // the blitter owns the bus: its read buffer may keep lines
 
 	input             d3_req,
 	input             d3_we,
@@ -129,6 +140,15 @@ endfunction
 function [7:0] rev8;
 	input [7:0] x;
 	rev8 = {x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]};
+endfunction
+
+// the bytes of a write (guest order, be[7] = lowest address) over a line
+function [63:0] merge64;
+	input [63:0] old;
+	input [63:0] wd;
+	input  [7:0] be;
+	integer i;
+	for (i = 0; i < 8; i = i + 1) merge64[8*i +: 8] = be[i] ? wd[8*i +: 8] : old[8*i +: 8];
 endfunction
 
 localparam [28:0] DDR_BASE = 29'h6000000;    // byte 0x30000000 / 8
@@ -199,6 +219,21 @@ end
 
 wire [63:0] rd_be = swap64(DDRAM_DOUT);      // guest order
 
+// the blitter's read buffer (guest order)
+reg   [1:0] b_v = 2'b00;
+reg  [23:3] b_tag0, b_tag1;
+reg  [63:0] b_dat0, b_dat1;
+reg         b_lru = 0;          // the entry the next fill replaces
+wire        b_h0   = b_v[0] && (b_tag0 == d2_addr[23:3]);
+wire        b_h1   = b_v[1] && (b_tag1 == d2_addr[23:3]);
+wire [63:0] b_line = b_h0 ? b_dat0 : b_dat1;
+// a read hit (not the request just acknowledged, nor that of a read in the DDR3)
+wire        d2_hit = d2_req && !d2_we && !d2_ack && (b_h0 || b_h1) && !(st != S_IDLE && owner == M_D2 && !cmd_we);
+wire        g_hit  = (g_owner == M_D2) && d2_hit;
+// a master that was acknowledged last clock still shows its old request this
+// clock, so never start right after an acknowledge
+wire        ack_blk = d0_ack | d1_ack | d2_ack | d3_ack | cpu_ack;
+
 always @(posedge clk) begin
 	vid_ack <= 0; vid_valid <= 0;
 	d0_ack <= 0; d1_ack <= 0; d2_ack <= 0; cpu_ack <= 0;
@@ -216,9 +251,7 @@ always @(posedge clk) begin
 	end
 	else case (st)
 	S_IDLE:
-		// a master that was acknowledged last clock still shows its old
-		// request this clock, so never start right after an acknowledge
-		if (g_any && !g_ok && !(d0_ack | d1_ack | d2_ack | d3_ack | cpu_ack)) begin
+		if (g_any && !g_ok && !ack_blk && !g_hit) begin
 			// bus-error region, ROM write or reset-vector write: no DDR3 cycle
 			// (g_ok is checked for d0..d2 only; the d3 mailbox is always a DDR3 cycle)
 			case (g_owner)
@@ -227,7 +260,7 @@ always @(posedge clk) begin
 				default: begin d2_rdata <= 16'h0000; d2_ack <= 1; end
 			endcase
 		end
-		else if (g_any && !(d0_ack | d1_ack | d2_ack | d3_ack | cpu_ack)) begin
+		else if (g_any && !ack_blk && !g_hit) begin
 			owner      <= g_owner;
 			sub        <= g_sub;
 			cmd_we     <= g_we;
@@ -250,6 +283,9 @@ always @(posedge clk) begin
 				owr_we   <= 1;
 				owr_addr <= g_addr;
 			end
+			if (g_we && g_owner == M_D2) d2_ack <= 1;
+			if (g_we && b_v[0] && b_tag0 == g_addr) b_dat0 <= merge64(b_dat0, g_wdata, g_be);
+			if (g_we && b_v[1] && b_tag1 == g_addr) b_dat1 <= merge64(b_dat1, g_wdata, g_be);
 		end
 
 	S_CMD:
@@ -261,7 +297,6 @@ always @(posedge clk) begin
 				case (owner)
 					M_D0:  d0_ack  <= 1;
 					M_D1:  d1_ack  <= 1;
-					M_D2:  d2_ack  <= 1;
 					M_D3:  d3_ack  <= 1;
 					M_CPU: cpu_ack <= 1;
 					default: ;
@@ -281,7 +316,12 @@ always @(posedge clk) begin
 				end
 				M_D0:  begin d0_rdata <= rd_be[63 - 16 * sub -: 16]; d0_ack <= 1; st <= S_IDLE; end
 				M_D1:  begin d1_rdata <= rd_be[63 - 16 * sub -: 16]; d1_ack <= 1; st <= S_IDLE; end
-				M_D2:  begin d2_rdata <= rd_be[63 - 16 * sub -: 16]; d2_ack <= 1; st <= S_IDLE; end
+				M_D2:  begin
+					d2_rdata <= rd_be[63 - 16 * sub -: 16]; d2_ack <= 1; st <= S_IDLE;
+					if (b_lru) begin b_dat1 <= rd_be; b_tag1 <= DDRAM_ADDR[20:0]; b_v[1] <= 1; end
+					else       begin b_dat0 <= rd_be; b_tag0 <= DDRAM_ADDR[20:0]; b_v[0] <= 1; end
+					b_lru <= !b_lru;
+				end
 				M_D3:  begin d3_rdata <= rd_be[63 - 16 * sub -: 16]; d3_ack <= 1; st <= S_IDLE; end
 				default:
 					if (cmd_burst) begin
@@ -303,6 +343,13 @@ always @(posedge clk) begin
 		ld_pend <= 1; ld_a <= ld_addr; ld_d <= ld_data;
 	end
 	else if (ld_take) ld_pend <= 0;
+
+	if (d2_hit) begin
+		d2_rdata <= b_line[63 - 16 * d2_addr[2:1] -: 16];
+		d2_ack   <= 1;
+		b_lru    <= b_h0;
+	end
+	if (reset || !d2_hold) b_v <= 2'b00;
 end
 
 endmodule
