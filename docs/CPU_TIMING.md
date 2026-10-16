@@ -431,7 +431,10 @@ milestone 2:
   access, 4 when it takes the bus and 4 when it gives it back
   (Blitter_BusArbitration, blitter.c:254-452); in non-hog mode the CPU's
   share between bursts is 256 of its clocks in Falcon time (blitter.c:931,
-  falcon_blitter `fmode`/`ftick`), not 64 CPU bus cycles.
+  falcon_blitter `fmode`/`ftick`), not 64 CPU bus cycles.  The blitter
+  starts no access while more than one access's clocks are still to pass
+  (`blit_pace`), so in real time a blit takes Hatari's time, or more when
+  the DDR3 is slower (the debt grows and is caught up at 32 MHz).
 
 **Real time.**  Falcon time is now Hatari's; real time follows as far as
 the hardware keeps up.  The AP68030 at 32 MHz makes up for its slow memory
@@ -782,3 +785,46 @@ frames for 20 simulated seconds (forgiven debt 4% lower).  Quartus 17.0:
 slack +0.245 ns; HDMI setup +0.419 ns).  Seed 5 misses the HDMI domain by
 0.687 ns, seeds 1, 2 and 8 miss timing by 0.11-0.61 ns, seeds 3 and 6 meet
 it.
+
+**A faster blitter** (2026-10-16).  The blitter ran at about half a
+Falcon's speed in real time, at 16 MHz and in turbo alike (its Falcon time
+was right; the rest was debt, forgiven at the cap): every word it read was
+a DDR3 read of its own (about 13 clocks with the arbitration) and its
+sequencer spent 4-5 clocks around every access, where Hatari charges 4
+processor clocks (8 system clocks at 16 MHz) an access.  Now
+`falcon_memarb` reads for the blitter through two buffered 64-bit lines (a
+source or destination run takes one DDR3 read per four words; every DDR3
+write, by any master, updates a buffered line; the buffer is emptied when
+the blitter gives up the bus) and acknowledges its writes when they are
+issued; `falcon_blitter` chooses a word's next read as the last one is
+acknowledged and computes the destination word in one clock; and in Falcon
+mode `falcon_cpubus` holds the blitter's next access while more than one
+access's clocks are still to pass (`blit_pace`), so a blit takes Hatari's
+time in real time, or more when the DDR3 is slower, never less.
+`tools/blitbench` times five blits of 16,000 words (320x200, 4 planes) on
+tb/system, in system clocks (Hatari's time at 16 MHz is twice the Falcon
+time):
+
+| blit | Hatari | 16 MHz before | 16 MHz now | turbo before | turbo now |
+|------|-------:|--------------:|-----------:|-------------:|----------:|
+| copy | 256,126 | 455,493 | 252,215 | 460,568 | 171,789 |
+| fill (writes only) | 128,126 | 152,961 | 126,412 | 145,585 | 77,183 |
+| or (two reads a word) | 384,126 | 759,370 | 382,570 | 759,753 | 262,751 |
+| shifted (FXSR, end masks, or) | 385,726 | 755,894 | 384,046 | 755,224 | 267,998 |
+| copy, non-hog | 399,820 | 672,011 | 431,774 | 710,973 | 457,739 |
+
+At 16 MHz a hog blit can end a little below Hatari's time: it catches up
+debt the processor ran up before it; the non-hog copy stays 8% above it
+(not investigated).  The hog blits' Falcon time is unchanged and the same under the DDR3 model's
+extra latency (+20), BUSY stretches and latency spikes, before and now; with
+20 clocks more latency the copy takes 370,067 system clocks (before
+1,053,790).  The non-hog copy's Falcon time is 15 clocks shorter in all
+(199,910, before 199,925), the same under every DDR3 timing.  tb/blitter
+runs its 20,000 random blits against Hatari with random pacing; tb/integration
+checks the buffer at the arbiter (hits, updates by the blitter and by another
+master, replacement, emptying, bus-error regions, a hit during another
+master's read); tb/bustime takes 20,252 processor clocks in all five
+configurations; tb/l2 and tb/fpu (both modes) pass, FPUTEST passes at 16 MHz
+and in turbo, CPUTIME's ref.i is unchanged, and TOS 4.04 shows the same
+frames for 20 simulated seconds.  Quartus 17.0: 38,647 ALMs (92%, 366 more),
+414 RAM blocks; seed 9 meets timing (worst slack +0.216 ns, HDMI setup).

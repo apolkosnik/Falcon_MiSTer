@@ -2,7 +2,8 @@
 //
 // The real RTL module is driven through its register bus, with a RAM model
 // (random latency) behind its DMA port, a CPU bus-grant model (bg follows br
-// with random latency) and CPU bus cycle pulses.  Every operation is also
+// with random latency), CPU bus cycle pulses and random Falcon-mode pacing
+// (fpace: no access may start while it is high).  Every operation is also
 // executed by Hatari's src/blitter.c (compiled unmodified, see golden/) with
 // the same register writes and the same initial memory.  Compared:
 //   - the complete sequence of bus accesses (read/write, address, data),
@@ -90,6 +91,7 @@ static bool pulse_at_rise_edge = false;
 static uint64_t br_fall_cyc = 0, br_rise_cyc = 0;
 static int br_rises = 0;
 static bool bus_access_active = false;
+static int pace_pct = 0;                 // fpace high in this percentage of clocks
 
 static void env_before_edge() {
     // ---- RAM ----
@@ -131,6 +133,9 @@ static void env_before_edge() {
     }
     prev_req = top->dma_req;
 
+    // ---- Falcon-mode pacing ----
+    top->fpace = pace_pct && (int)(rnd() % 100) < pace_pct;
+
     // ---- bus grant: bg follows br with latency ----
     if (top->br && !top->bg) {
         if (++bg_cnt >= bg_lat_on) { top->bg = 1; bg_cnt = 0; }
@@ -155,8 +160,12 @@ static void tick() {
     top->clk = 0; top->eval();
     env_before_edge();
     bool pulse = top->cpu_bus_cycle;
+    bool req0 = top->dma_req, acked = top->dma_ack, paced = top->fpace;
     top->clk = 1; top->eval();
     cyc++;
+    // a new access (the request rises, or stays up for another access after
+    // an acknowledge) never starts on an edge with fpace
+    CHECK(!(top->dma_req && (!req0 || acked) && paced), "an access started while fpace = 1");
     // ---- after the edge ----
     if (pulse) pulses_since_fall++;
     bool br = top->br;
@@ -510,6 +519,7 @@ int main(int argc, char **argv) {
           new_memory();
           bg_lat_on = rnd_range(1, 4); bg_lat_off = rnd_range(1, 3); ram_lat_max = rnd_range(1, 10);
           pulse_min = 1; pulse_max = rnd_range(1, 4);
+          pace_pct = rnd_range(0, 2) ? rnd_range(10, 80) : 0;
           Cfg c = random_cfg(i);
           write_cfg(c);
           char ctx[64]; snprintf(ctx, sizeof ctx, "blit %d (hop %d lop %x ctrl %02x skew %02x x %d y %d)", i, c.hop, c.lop, c.ctrl, c.skew, c.xc, c.yc);
@@ -518,6 +528,7 @@ int main(int argc, char **argv) {
           if (errors != e1 && errors < 40) printf("  config: sxi %d syi %d dxi %d dyi %d src %06x dst %06x em %04x %04x %04x\n",
                                                 c.sxi, c.syi, c.dxi, c.dyi, c.saddr, c.daddr, c.em1, c.em2, c.em3);
       }
+      pace_pct = 0;
       char nm[96]; snprintf(nm, sizeof nm, "T3 %d random blits vs Hatari blitter.c", nrand);
       section(nm, e0); }
 
@@ -548,11 +559,13 @@ int main(int argc, char **argv) {
       const int acts[] = {ACT_NONE, ACT_RESTART, ACT_PAUSE, ACT_MODIFY};
       for (int a = 0; a < 4; a++) for (int i = 0; i < 20; i++) {
           new_memory();
+          pace_pct = (i & 1) ? rnd_range(10, 80) : 0;
           Cfg c = random_cfg(rnd());
           c.ctrl &= ~0x40; c.xc = rnd_range(1, 30); c.yc = rnd_range(3, 8);
           write_cfg(c);
           run_blit(c, acts[a], "action");
       }
+      pace_pct = 0;
       section("T6 non-hog: 64/64 sharing, restart (bset), pause/resume, modify", e0); }
 
     // ---- 7. x count / y count = 65536 ----

@@ -91,7 +91,7 @@ falcon_memarb memarb
     .d1_req(d1_req), .d1_we(d1_we), .d1_addr(d1_addr), .d1_be(d1_be), .d1_wdata(d1_wdata),
     .d1_rdata(d1_rdata), .d1_ack(d1_ack),
     .d2_req(d2_req), .d2_we(d2_we), .d2_addr(d2_addr), .d2_be(d2_be), .d2_wdata(d2_wdata),
-    .d2_rdata(d2_rdata), .d2_ack(d2_ack),
+    .d2_rdata(d2_rdata), .d2_ack(d2_ack), .d2_hold(1'b0),
     .d3_req(mbx_req), .d3_we(mbx_we), .d3_addr(mbx_addr), .d3_be(mbx_be), .d3_wdata(mbx_wdata),
     .d3_rdata(mbx_rdata), .d3_ack(mbx_ack),
     .cpu_req(cpu_req), .cpu_we(cpu_we), .cpu_addr(cpu_addr), .cpu_be(cpu_be),

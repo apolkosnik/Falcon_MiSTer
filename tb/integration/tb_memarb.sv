@@ -14,6 +14,8 @@
 //  d3 (docs/FPU_ARM.md): the mailbox at guest $E90000 lies in the ROM area,
 //  and the bridge and the ARM service exchange requests there, so d3 reads
 //  and writes are always DDR3 cycles.
+//  Last, the blitter's read buffer (d2_hold, falcon_memarb's header): DDR3
+//  read commands are counted at the model.
 //============================================================================
 module tb_memarb;
 reg clk = 0;
@@ -24,6 +26,7 @@ reg [3:0] req = 0;
 reg we = 0;
 reg [23:1] addr = 0;
 reg [15:0] data = 0;
+reg hold = 0;
 wire [3:0] ack;
 wire [15:0] rd[4];
 wire busy, dout_ready, ddr_rd, ddr_we;
@@ -36,7 +39,7 @@ falcon_memarb dut(
  .vid_req(1'b0), .vid_addr(21'd0), .ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0),
  .d0_req(req[0]), .d0_we(we), .d0_addr(addr), .d0_be(2'b11), .d0_wdata(data), .d0_rdata(rd[0]), .d0_ack(ack[0]),
  .d1_req(req[1]), .d1_we(we), .d1_addr(addr), .d1_be(2'b11), .d1_wdata(data), .d1_rdata(rd[1]), .d1_ack(ack[1]),
- .d2_req(req[2]), .d2_we(we), .d2_addr(addr), .d2_be(2'b11), .d2_wdata(data), .d2_rdata(rd[2]), .d2_ack(ack[2]),
+ .d2_req(req[2]), .d2_we(we), .d2_addr(addr), .d2_be(2'b11), .d2_wdata(data), .d2_rdata(rd[2]), .d2_ack(ack[2]), .d2_hold(hold),
  .d3_req(req[3]), .d3_we(we), .d3_addr(addr), .d3_be(2'b11), .d3_wdata(data), .d3_rdata(rd[3]), .d3_ack(ack[3]),
  .cpu_req(1'b0), .cpu_we(1'b0), .cpu_addr(22'd0), .cpu_be(4'd0), .cpu_wdata(32'd0),
  .snoop_we(snoop_we), .DDRAM_BUSY(busy), .DDRAM_BURSTCNT(burstcnt), .DDRAM_ADDR(ddr_addr),
@@ -46,6 +49,8 @@ ddr3_model mem(.clk(clk), .DDRAM_BUSY(busy), .DDRAM_BURSTCNT(burstcnt), .DDRAM_A
  .DDRAM_DOUT(dout), .DDRAM_DOUT_READY(dout_ready), .DDRAM_RD(ddr_rd),
  .DDRAM_DIN(din), .DDRAM_BE(be), .DDRAM_WE(ddr_we));
 integer checks = 0, errors = 0;
+integer nrd = 0;                 // read commands the DDR3 took
+always @(posedge clk) if (ddr_rd && !busy) nrd = nrd + 1;
 reg [15:0] result;
 task check(input bit ok, input string msg);
  begin checks++; if (!ok) begin errors++; $display("FAIL: %s",msg); end else $display("PASS: %s",msg); end
@@ -66,7 +71,8 @@ task access(input integer master, input bit write_en, input [23:0] a, input [15:
   result=rd[master]; @(negedge clk); req=0; repeat(3) @(negedge clk);
  end
 endtask
-integer m, cfg;
+integer m, cfg, n0, n, t1, t2;
+reg [15:0] r1, r2;
 initial begin
  repeat(5) @(negedge clk); reset=0;
  // Regression controls: allowed RAM, blocked ROM, blocked unmapped space,
@@ -115,6 +121,41 @@ initial begin
   begin repeat(40) begin @(posedge clk); #1; if (snoop_we) errors++; end end
  join
  checks++;
+ // the blitter's read buffer, while the blitter owns the bus
+ hold=1;
+ poke('h2000,'h1111); poke('h2002,'h2222); poke('h2004,'h3333); poke('h2006,'h4444);
+ poke('h3000,'h5555); poke('h4000,'h6666);
+ n0=nrd;
+ access(2,0,'h2000,0);
+ check(result=='h1111 && nrd==n0+1,$sformatf("DMA2 buffer: a miss reads the DDR3 (%04x)",result));
+ access(2,0,'h2002,0); r1=result; access(2,0,'h2006,0);
+ check(r1=='h2222 && result=='h4444 && nrd==n0+1,$sformatf("DMA2 buffer: the line's other words without DDR3 reads (%04x %04x, %0d reads)",r1,result,nrd-n0));
+ access(2,1,'h2002,'hbeef); access(2,0,'h2002,0);
+ check(result=='hbeef && peek('h2002)=='hbeef && nrd==n0+1,$sformatf("DMA2 buffer: the blitter's write updates the line and the DDR3 (%04x %04x)",result,peek('h2002)));
+ access(1,1,'h2004,'hcafe); access(2,0,'h2004,0);
+ check(result=='hcafe && nrd==n0+1,$sformatf("DMA2 buffer: another master's write updates the line (%04x)",result));
+ access(2,0,'h3000,0); r1=result; access(2,0,'h2000,0);
+ check(r1=='h5555 && result=='h1111 && nrd==n0+2,"DMA2 buffer: two lines");
+ access(2,0,'h4000,0); r1=result; access(2,0,'h2006,0);
+ check(r1=='h6666 && result=='h4444 && nrd==n0+3,"DMA2 buffer: a fill replaces the line used least recently");
+ access(2,0,'h3000,0);
+ check(result=='h5555 && nrd==n0+4,"DMA2 buffer: the replaced line is read again");
+ hold=0; @(negedge clk); hold=1;
+ access(2,0,'h2000,0);
+ check(result=='h1111 && nrd==n0+5,"DMA2 buffer: emptied when the blitter gives up the bus");
+ access(2,0,'hf10000,0); r1=result; access(2,0,'hf10000,0);
+ check(r1==0 && result==0 && nrd==n0+5,"DMA2 buffer: a bus-error region reads $0000 and is not buffered");
+ // a hit is answered while another master's read is in the DDR3
+ t1=0; t2=0; n=0;
+ @(negedge clk); req=4'b0110; we=0; addr=23'h001001;      // $2002
+ while ((t1==0 || t2==0) && n<1000) begin
+  @(posedge clk); #1; n++;
+  if (ack[1] && t1==0) begin t1=n; r1=rd[1]; req[1]=0; end
+  if (ack[2] && t2==0) begin t2=n; r2=rd[2]; req[2]=0; end
+ end
+ req=0; repeat(3) @(negedge clk);
+ check(t2!=0 && t1!=0 && t2<t1 && r1=='hbeef && r2=='hbeef,$sformatf("DMA2 buffer: hit after %0d clocks, the other master's read after %0d (%04x %04x)",t2,t1,r2,r1));
+ hold=0;
  $display("SUMMARY: %0d checks, %0d failures",checks,errors);
  if(errors) $fatal(1,"DMA memory type test failed");
  $finish;

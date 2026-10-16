@@ -150,7 +150,9 @@ input             dma_ack      // one clock; the next request may follow at once
 ```
 
 Latency is variable (DDR3, typically 6..20 clocks).  A device that needs a
-guaranteed rate keeps its own FIFO.
+guaranteed rate keeps its own FIFO.  The blitter's port reads through two
+buffered 64-bit lines in the arbiter (a hit is answered in a clock) and its
+writes are acknowledged when they are issued (falcon_memarb).
 
 The arbiter applies the memory types to every DMA access, as Hatari's
 STMemory_DMA_ReadWord/WriteWord and Hatari's memory banks do: ST-RAM is read

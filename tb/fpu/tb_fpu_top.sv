@@ -195,7 +195,7 @@ falcon_cpubus cpubus
     .ram_rdata64(cram_rdata64), .snoop_we(snoop_we), .snoop_addr(snoop_addr),
     .buf_flush(1'b0), .iack_mfp(1'b0),
     .dispatch(cpu_dbg_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md),
-    .idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(1'b0), .blit_acc(1'b0),
+    .idle(cpu_idle), .idle_tick(cpu_idle_tick), .back(cpu_back), .bus_lost(1'b0), .blit_acc(1'b0), .blit_pace(),
     .gov_idle(), .gov_back()
 );
 
@@ -246,7 +246,7 @@ falcon_memarb memarb
     .d1_req(1'b0), .d1_we(1'b0), .d1_addr(23'd0), .d1_be(2'b00), .d1_wdata(16'd0),
     .d1_rdata(), .d1_ack(),
     .d2_req(1'b0), .d2_we(1'b0), .d2_addr(23'd0), .d2_be(2'b00), .d2_wdata(16'd0),
-    .d2_rdata(), .d2_ack(),
+    .d2_rdata(), .d2_ack(), .d2_hold(1'b0),
     .d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
     .d3_rdata(d3_rdata), .d3_ack(d3_ack),
     .cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),

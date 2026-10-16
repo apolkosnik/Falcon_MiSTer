@@ -176,6 +176,7 @@ module falcon_cpubus
 	output      [7:0] back,        // give back processor clocks (falcon_cpuclk)
 	input             bus_lost,    // another master owns the bus (blitter)
 	input             blit_acc,    // ... and made an access (one clock)
+	output            blit_pace,   // the blit is ahead of Falcon time: no new access
 	output reg [31:0] gov_idle,    // idle clocks inserted (Hatari slower than the AP68030)
 	output reg [31:0] gov_back     // processor clocks given back (Hatari faster)
 );
@@ -285,7 +286,12 @@ assign hold = fmode && (((fst == F_RUN) && !fready && (fk >= (fplan ? fw : 5'd0)
 // the processor is held (Hatari stops the 68030 for a blit) and the blit
 // takes Hatari's time in idle clocks: 4 per access, 4 when it takes the bus
 // and 4 when it gives it back (Blitter_BusArbitration, BLITTER_CYCLES_PER_
-// BUS_READ/WRITE, blitter.c:254-452).  Events of a processor clock are taken on the
+// BUS_READ/WRITE, blitter.c:254-452).  The blitter starts no access while
+// more than one access's clocks are pending (blit_pace), so it keeps to
+// Hatari's time in real time too; when it falls behind (DDR3 latency), the
+// time is debt that falcon_cpuclk catches up at 32 MHz.  (A cycle the bus
+// master starts meanwhile, which a 68030 does not, stops the idle clocks;
+// the blitter then runs unpaced.)  Events of a processor clock are taken on the
 // system clock after it (pe), when it is known whether that clock was
 // outside a bus cycle (no AS yet, not the S0 of the cycle just seen).
 //----------------------------------------------------------------------------
@@ -309,6 +315,10 @@ wire [10:0] g_dlt  = !g_sync ? 11'd0 : {2'b00, g_ahd} - ((g_ex > 9'd32) ? 11'd32
 // adjustments only between bus cycles: idle clocks one by one, clocks given back at once
 wire        g_ok   = fmode && ((fst == F_GOV) || ((fst == F_IDLE) && !as_act));
 assign idle = g_ok && !gA[10] && (gA != 11'd0);
+// the blitter waits while more than one access's clocks are pending (with
+// this clock's charge), unless they cannot pass now
+wire [10:0] g_pace = gA + {7'd0, g_blit};
+assign blit_pace = g_ok && !g_pace[10] && (g_pace > 11'd4);
 wire [10:0] g_neg  = -gA;
 assign back = (g_ok && gA[10]) ? ((g_neg > 11'd31) ? 8'd31 : g_neg[7:0]) : 8'd0;
 // the window of the cycle that ends: its operand's visible span

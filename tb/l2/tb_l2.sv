@@ -82,7 +82,7 @@ falcon_memarb memarb
 	.ld_wr(ld_wr), .ld_addr(ld_addr), .ld_data(ld_data), .ld_busy(ld_busy),
 	.d0_req(1'b0), .d0_we(1'b0), .d0_addr(23'd0), .d0_be(2'b00), .d0_wdata(16'd0), .d0_rdata(), .d0_ack(),
 	.d1_req(d1_req), .d1_we(d1_we), .d1_addr(d1_addr), .d1_be(d1_be), .d1_wdata(d1_wdata), .d1_rdata(), .d1_ack(d1_ack),
-	.d2_req(1'b0), .d2_we(1'b0), .d2_addr(23'd0), .d2_be(2'b00), .d2_wdata(16'd0), .d2_rdata(), .d2_ack(),
+	.d2_req(1'b0), .d2_we(1'b0), .d2_addr(23'd0), .d2_be(2'b00), .d2_wdata(16'd0), .d2_rdata(), .d2_ack(), .d2_hold(1'b0),
 	.d3_req(1'b0), .d3_we(1'b0), .d3_addr(23'd0), .d3_be(2'b00), .d3_wdata(16'd0), .d3_rdata(), .d3_ack(),
 	.cpu_req(m_req), .cpu_we(m_we), .cpu_addr(m_addr), .cpu_be(m_be),
 	.cpu_wdata(m_wdata), .cpu_rdata(m_rdata), .cpu_rdata64(m_rdata64), .cpu_ack(m_ack),
