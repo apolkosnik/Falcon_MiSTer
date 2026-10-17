@@ -256,17 +256,24 @@ module dsp56k_alu (
     wire        d_ovf = (d_q == 56'h80000000000000);
     wire [23:0] d1 = d_q[47:24];
 
+    // CMP, CMPM: the flags of the difference (they write nothing)
+    wire        is_cmp = op_q[6] ? (!op_q[7] && (op_q[2:0] == 3'd5 || op_q[2:0] == 3'd7))
+                                 : (!op_q[7] && op_q[5:4] == 2'd0 && (op_q[2:0] == 3'd5 || op_q[2:0] == 3'd7));
+
     reg  [23:0] l24;
+    reg         use_e;      // E, U, N, Z from the result (or the difference)
+    reg  [15:0] e_sr;
     always @* begin
         wr_d   = 1'b0;
         res    = d_q;
         sr_out = sr;
         l24    = d1;
+        use_e  = 1'b0;
         if (op_q[7]) begin
             // mpy / mpyr / mac / macr
             wr_d = 1'b1;
             res  = op_q[0] ? rnd_r : mr;
-            sr_out = euzn(sr, res);
+            use_e = 1'b1;
             if (op_q[1]) begin
                 sr_out[1] = v_m;
                 if (v_m) sr_out[6] = 1'b1;
@@ -277,14 +284,14 @@ module dsp56k_alu (
             case (op_q[2:0])
                 3'd0, 3'd4: begin                         // add / sub
                     wr_d = 1'b1; res = mr;
-                    sr_out = euzn(sr, mr);
+                    use_e = 1'b1;
                     sr_out[0] = c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                 end
                 3'd1: begin                               // tfr
                     wr_d = 1'b1; res = spre_q;
                 end
                 3'd5, 3'd7: begin                         // cmp / cmpm
-                    sr_out = euzn(sr, mr);
+                    use_e = 1'b1;
                     sr_out[0] = c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                 end
                 default: begin                            // or / eor / and
@@ -306,32 +313,32 @@ module dsp56k_alu (
                 5'b00_001: begin wr_d = 1'b1; res = spre_q; end   // tfr acc
                 5'b00_010, 5'b00_110: begin               // addr / subr
                     wr_d = 1'b1; res = mr;
-                    sr_out = euzn(sr, mr);
+                    use_e = 1'b1;
                     sr_out[0] = c_pre_q | c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                 end
                 5'b00_011: begin                          // tst
-                    sr_out = euzn(sr, d_q);
+                    use_e = 1'b1;
                     sr_out[1] = 1'b0;
                 end
                 5'b00_100: ;                              // undefined
                 5'b00_101, 5'b00_111: begin               // cmp / cmpm
-                    sr_out = euzn(sr, mr);
+                    use_e = 1'b1;
                     sr_out[0] = c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                 end
                 5'b01_000, 5'b01_100,                     // add / sub acc
                 5'b10_000, 5'b10_100,                     // add / sub x
                 5'b11_000, 5'b11_100: begin               // add / sub y
                     wr_d = 1'b1; res = mr;
-                    sr_out = euzn(sr, mr);
+                    use_e = 1'b1;
                     sr_out[0] = c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                 end
                 5'b01_001: begin                          // rnd
                     wr_d = 1'b1; res = rnd_r;
-                    sr_out = euzn(sr, rnd_r);
+                    use_e = 1'b1;
                 end
                 5'b01_010, 5'b01_110: begin               // addl / subl
                     wr_d = 1'b1; res = mr;
-                    sr_out = euzn(sr, mr);
+                    use_e = 1'b1;
                     sr_out[0] = c_pre_q | c_m;
                     sr_out[1] = v_pre_q | v_m;
                     if (v_pre_q | v_m) sr_out[6] = 1'b1;
@@ -351,12 +358,12 @@ module dsp56k_alu (
                     wr_d = 1'b1;
                     if (sr[0]) begin
                         res = inc_r;
-                        sr_out = euzn(sr, inc_r);
+                        use_e = 1'b1;
                         sr_out[0] = c_m | c_inc; sr_out[1] = v_m | v_inc;
                         if (v_m | v_inc) sr_out[6] = 1'b1;
                     end else begin
                         res = mr;
-                        sr_out = euzn(sr, mr);
+                        use_e = 1'b1;
                         sr_out[0] = c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                     end
                 end
@@ -364,23 +371,23 @@ module dsp56k_alu (
                     wr_d = 1'b1;
                     if (sr[0]) begin
                         res = dec_r;
-                        sr_out = euzn(sr, dec_r);
+                        use_e = 1'b1;
                         sr_out[0] = c_m | c_dec; sr_out[1] = v_m | v_dec;
                         if (v_m | v_dec) sr_out[6] = 1'b1;
                     end else begin
                         res = mr;
-                        sr_out = euzn(sr, mr);
+                        use_e = 1'b1;
                         sr_out[0] = c_m; sr_out[1] = v_m; if (v_m) sr_out[6] = 1'b1;
                     end
                 end
                 5'b10_010: begin                          // asr
                     wr_d = 1'b1; res = dpre_q;
-                    sr_out = euzn(sr, dpre_q);
+                    use_e = 1'b1;
                     sr_out[0] = c_pre_q; sr_out[1] = 1'b0;
                 end
                 5'b11_010: begin                          // asl
                     wr_d = 1'b1; res = dpre_q;
-                    sr_out = euzn(sr, dpre_q);
+                    use_e = 1'b1;
                     sr_out[0] = c_pre_q; sr_out[1] = v_pre_q; if (v_pre_q) sr_out[6] = 1'b1;
                 end
                 5'b10_011: begin                          // lsr
@@ -406,15 +413,18 @@ module dsp56k_alu (
                 5'b10_110: begin                          // abs
                     wr_d = 1'b1; res = dpre_q;
                     sr_out[1] = d_ovf; if (d_ovf) sr_out[6] = 1'b1;
-                    sr_out = euzn(sr_out, dpre_q);
+                    use_e = 1'b1;
                 end
                 5'b11_110: begin                          // neg
                     wr_d = 1'b1; res = mr;
                     sr_out[1] = d_ovf; if (d_ovf) sr_out[6] = 1'b1;
-                    sr_out = euzn(sr_out, mr);
+                    use_e = 1'b1;
                 end
                 default: ;
             endcase
         end
+        // (euzn sets bits 5:2 only; no operation changes them after it)
+        e_sr = euzn(sr, is_cmp ? mr : res);
+        if (use_e) sr_out[5:2] = e_sr[5:2];
     end
 endmodule

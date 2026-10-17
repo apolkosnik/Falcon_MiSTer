@@ -124,7 +124,6 @@ bool Rtl::is_el() const {
            rp->falcon_dsp__DOT__u_core__DOT__cyc == (uint32_t)(rp->falcon_dsp__DOT__u_core__DOT__ncyc - 1);
 }
 
-static inline uint32_t bit128(const VlWide<4> &w, int b) { return (w[b >> 5] >> (b & 31)) & 1; }
 
 void Rtl::read_state(DspState &s) {
     memset(&s, 0, sizeof(s));
@@ -149,16 +148,21 @@ void Rtl::read_state(DspState &s) {
     s.hreq = top->hreq;
     s.ssi_tx = RP(ssi_tx); s.ssi_rx = RP(ssi_rx); s.ssi_tval = RP(ssi_tval); s.ssi_rval = RP(ssi_rval);
     s.wait_tx = RP(wait_tx); s.wait_rx = RP(wait_rx); s.hs_frame = RP(hs_frame);
-    const auto &pv = RP(pvalid);
+    // the backing store: an entry counts if written in this reset generation
+    const uint32_t gen = RP(pgen);
     const auto &ps = RP(u_pstore__DOT__mem);
     for (int i = 0; i < 64; i++) {
-        s.perx[i] = bit128(pv, i) ? ps[i] : 0;
-        s.pery[i] = bit128(pv, 64 + i) ? ps[64 + i] : 0;
+        s.perx[i] = ((uint32_t)(ps[i] >> 24) & 0xffff) == gen ? (uint32_t)(ps[i] & 0xffffff) : 0;
+        s.pery[i] = ((uint32_t)(ps[64 + i] >> 24) & 0xffff) == gen ? (uint32_t)(ps[64 + i] & 0xffffff) : 0;
     }
-    s.perx[0x23] = RP(pcddr); s.perx[0x25] = RP(pcd); s.perx[0x28] = RP(hcr); s.perx[0x29] = hsr;
+    // (PCDDR, PCD: the store; SCR, SSR, SCCR, BCR: the store once written since the reset)
+    s.perx[0x28] = RP(hcr); s.perx[0x29] = hsr;
     s.perx[0x2b] = 0; s.perx[0x2c] = RP(cra); s.perx[0x2d] = RP(crb); s.perx[0x2e] = RP(ssisr);
-    s.perx[0x2f] = 0; s.perx[0x30] = RP(scr); s.perx[0x31] = RP(ssr); s.perx[0x32] = RP(sccr);
-    s.perx[0x3e] = RP(bcr); s.perx[0x3f] = RP(ipr);
+    s.perx[0x2f] = 0; if (!RP(scr_w)) s.perx[0x30] = 0;
+    if (!RP(ssr_w)) s.perx[0x31] = RP(ssr_d3) ? 3 : 0;
+    if (!RP(sccr_w)) s.perx[0x32] = 0;
+    if (!RP(bcr_w)) s.perx[0x3e] = 0x00ffff;
+    s.perx[0x3f] = RP(ipr);
 }
 
 void Rtl::set_regs(const DspState &s) {

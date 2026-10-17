@@ -121,10 +121,17 @@ module dsp_periph (
     reg        hs_frame /*verilator public_flat_rw*/;
     reg        st_srcv /*verilator public_flat_rw*/, st_strx /*verilator public_flat_rw*/;
     // other registers with live behaviour
-    reg [23:0] ipr /*verilator public_flat_rw*/, bcr /*verilator public_flat_rw*/;
-    reg [23:0] pcddr /*verilator public_flat_rw*/, pcd /*verilator public_flat_rw*/;
-    reg [23:0] scr /*verilator public_flat_rw*/, ssr /*verilator public_flat_rw*/, sccr /*verilator public_flat_rw*/;
-    reg [127:0] pvalid /*verilator public_flat_rw*/;  // backing store entries written since reset
+    reg [23:0] ipr /*verilator public_flat_rw*/;
+    // PCDDR, PCD, SCR, SSR, SCCR and BCR are in the backing store; PCDDR's
+    // bits 5:4 (SC2, SC1 direction) also here.  BCR reads $00FFFF until written
+    // after a reset, SCR/SSR/SCCR their reset values until written after a
+    // hard or soft reset (SSR: 3 after the RESET instruction, else 0)
+    reg  [1:0] pcddr54 /*verilator public_flat_rw*/;
+    reg        bcr_w /*verilator public_flat_rw*/, scr_w /*verilator public_flat_rw*/;
+    reg        ssr_w /*verilator public_flat_rw*/, sccr_w /*verilator public_flat_rw*/;
+    reg        ssr_d3 /*verilator public_flat_rw*/;
+    reg [15:0] pgen /*verilator public_flat_rw*/ = 16'd0;   // reset generation (see u_pstore)
+    reg        rst_q = 1'b0;
 
     assign hreq   = isr[7];
     assign ivr    = ivr_r;
@@ -199,24 +206,27 @@ module dsp_periph (
     // ------------------------------------------------------------------
     function automatic x_special(input [5:0] a);
         case (a)
-            6'h23, 6'h25, 6'h28, 6'h29, 6'h2b, 6'h2c, 6'h2d, 6'h2e, 6'h2f,
-            6'h30, 6'h31, 6'h32, 6'h3e, 6'h3f: x_special = 1'b1;
+            6'h28, 6'h29, 6'h2b, 6'h2c, 6'h2d, 6'h2e, 6'h2f, 6'h3f: x_special = 1'b1;
             default: x_special = 1'b0;
         endcase
     endfunction
 
+    // Hatari zeroes the peripheral space at reset: each entry carries the
+    // reset generation it was written in (bits 39:24) and reads as zero in a
+    // later one; the store powers up as zeros, generation 0.  (An entry not
+    // written for 65536 resets would read back again.)
     wire        pst_we_a = perx_wr && !x_special(perx_addr);
     wire        pst_we_b = pery_wr;
-    wire [23:0] pst_q_a, pst_q_b;
-    dsp_ram_tdp #(.AW(7), .DW(24)) u_pstore (
+    wire [39:0] pst_q_a, pst_q_b;
+    dsp_ram_tdp #(.AW(7), .DW(40)) u_pstore (
         .clk(clk),
-        .we_a(pst_we_a), .addr_a({1'b0, perx_addr}), .d_a(perx_wdata), .q_a(pst_q_a),
-        .we_b(pst_we_b), .addr_b({1'b1, pery_addr}), .d_b(pery_wdata), .q_b(pst_q_b));
+        .we_a(pst_we_a), .addr_a({1'b0, perx_addr}), .d_a({pgen, perx_wdata}), .q_a(pst_q_a),
+        .we_b(pst_we_b), .addr_b({1'b1, pery_addr}), .d_b({pgen, pery_wdata}), .q_b(pst_q_b));
 
-    reg        rx_spec_q, rx_valid_q, ry_valid_q;
+    reg        rx_spec_q;
     reg [23:0] rx_val_q;
-    assign perx_rdata = rx_spec_q ? rx_val_q : (rx_valid_q ? pst_q_a : 24'd0);
-    assign pery_rdata = ry_valid_q ? pst_q_b : 24'd0;
+    assign perx_rdata = rx_spec_q ? rx_val_q : (pst_q_a[39:24] == pgen ? pst_q_a[23:0] : 24'd0);
+    assign pery_rdata = (pst_q_b[39:24] == pgen) ? pst_q_b[23:0] : 24'd0;
 
     // ------------------------------------------------------------------
     // 68030 bus
@@ -248,7 +258,9 @@ module dsp_periph (
     reg        v_boot_we;
     reg  [8:0] v_boot_addr;
     reg [23:0] v_boot_data;
-    reg [23:0] v_cra, v_crb, v_tx, v_rx, v_ipr, v_bcr, v_pcddr, v_pcd, v_scr, v_ssr, v_sccr;
+    reg [23:0] v_cra, v_crb, v_tx, v_rx, v_ipr;
+    reg  [1:0] v_pcddr54;
+    reg        v_bcr_w, v_scr_w, v_ssr_w, v_sccr_w, v_ssr_d3;
     reg  [7:0] v_ssisr;
     reg [24:0] v_tval;
     reg [23:0] v_rval;
@@ -350,7 +362,8 @@ module dsp_periph (
         v_tval = ssi_tval; v_rval = ssi_rval; v_wait_tx = wait_tx; v_wait_rx = wait_rx;
         v_hs_frame = hs_frame; v_srcv = st_srcv; v_strx = st_strx;
         v_txvalid = ssi_tx_valid; v_hsplay = 1'b0;
-        v_ipr = ipr; v_bcr = bcr; v_pcddr = pcddr; v_pcd = pcd; v_scr = scr; v_ssr = ssr; v_sccr = sccr;
+        v_ipr = ipr; v_pcddr54 = pcddr54;
+        v_bcr_w = bcr_w; v_scr_w = scr_w; v_ssr_w = ssr_w; v_sccr_w = sccr_w; v_ssr_d3 = ssr_d3;
         rdv = 24'd0; rspec = 1'b0; t25 = 25'd0;
 
         // ---------------- SSI slot (crossbar) ----------------
@@ -399,8 +412,11 @@ module dsp_periph (
         if (perx_rd) begin
             rspec = x_special(perx_addr);
             case (perx_addr)
-                6'h23: rdv = v_pcddr;
-                6'h25: rdv = v_pcd;
+                // not written since the reset: the reset value
+                6'h30: if (!v_scr_w)  begin rspec = 1'b1; rdv = 24'd0; end
+                6'h31: if (!v_ssr_w)  begin rspec = 1'b1; rdv = v_ssr_d3 ? 24'd3 : 24'd0; end
+                6'h32: if (!v_sccr_w) begin rspec = 1'b1; rdv = 24'd0; end
+                6'h3e: if (!v_bcr_w)  begin rspec = 1'b1; rdv = 24'h00ffff; end
                 6'h28: rdv = {19'd0, v_hcr};
                 6'h29: rdv = {16'd0, v_hsr};
                 6'h2b: begin                           // HRX: dsp_core_hostport_dspread
@@ -417,10 +433,6 @@ module dsp_periph (
                     v_ssisr[7] = 1'b0;
                     v_srcv = 1'b0;
                 end
-                6'h30: rdv = v_scr;
-                6'h31: rdv = v_ssr;
-                6'h32: rdv = v_sccr;
-                6'h3e: rdv = v_bcr;
                 6'h3f: rdv = v_ipr;
                 default: ;
             endcase
@@ -456,15 +468,14 @@ module dsp_periph (
                     if (v_hs_frame) v_txvalid = 1'b1;  // SC2(1) to the crossbar
                 end
                 6'h3f: v_ipr = perx_wdata;
-                6'h3e: v_bcr = perx_wdata;
-                6'h23: v_pcddr = perx_wdata;
+                6'h3e: v_bcr_w = 1'b1;
+                6'h23: v_pcddr54 = perx_wdata[5:4];
                 6'h25: begin                           // dsp_core_setPortCDataRegister
-                    v_pcd = perx_wdata;
-                    if (v_pcddr[4] && perx_wdata[4]) begin
+                    if (v_pcddr54[0] && perx_wdata[4]) begin
                         v_wait_rx = 1'b0;
                         v_hsplay = 1'b1;               // SC1 -> Crossbar_DmaPlayInHandShakeMode
                     end
-                    if (v_pcddr[5]) begin
+                    if (v_pcddr54[1]) begin
                         if (perx_wdata[5]) begin
                             v_hs_frame = 1'b1;
                             v_wait_tx = 1'b0;
@@ -474,10 +485,11 @@ module dsp_periph (
                         end
                     end
                 end
-                6'h30: v_scr = perx_wdata;
-                6'h31: v_ssr = perx_wdata;
-                6'h32: v_sccr = perx_wdata;
-                default: ;                             // backing store
+                6'h30: v_scr_w = 1'b1;
+                6'h31: v_ssr_w = 1'b1;
+                6'h32: v_sccr_w = 1'b1;
+                default: ;
+                // (all but the special registers above also go to the backing store)
             endcase
         end
 
@@ -492,7 +504,7 @@ module dsp_periph (
             v_cra = 24'd0;
             v_crb = 24'd0;
             v_ssisr[6] = 1'b0; v_strx = 1'b0;          // write to TSR
-            v_scr = 24'd0; v_ssr = 24'd3; v_sccr = 24'd0;
+            v_scr_w = 1'b0; v_ssr_w = 1'b0; v_sccr_w = 1'b0; v_ssr_d3 = 1'b1;   // SCR 0, SSR 3, SCCR 0
         end
 
         // ---------------- 68030 bus access ----------------
@@ -518,15 +530,14 @@ module dsp_periph (
         ssi_tval <= v_tval; ssi_rval <= v_rval; wait_tx <= v_wait_tx; wait_rx <= v_wait_rx;
         hs_frame <= v_hs_frame; st_srcv <= v_srcv; st_strx <= v_strx;
         ssi_tx_valid <= v_txvalid; ssi_hs_play_req <= v_hsplay;
-        ipr <= v_ipr; bcr <= v_bcr; pcddr <= v_pcddr; pcd <= v_pcd;
-        scr <= v_scr; ssr <= v_ssr; sccr <= v_sccr;
+        ipr <= v_ipr; pcddr54 <= v_pcddr54;
+        bcr_w <= v_bcr_w; scr_w <= v_scr_w; ssr_w <= v_ssr_w; sccr_w <= v_sccr_w; ssr_d3 <= v_ssr_d3;
 
         rx_spec_q <= rspec;
         rx_val_q  <= rdv;
-        rx_valid_q <= pvalid[{1'b0, perx_addr}];
-        ry_valid_q <= pvalid[{1'b1, pery_addr}];
-        if (pst_we_a) pvalid[{1'b0, perx_addr}] <= 1'b1;
-        if (pst_we_b) pvalid[{1'b1, pery_addr}] <= 1'b1;
+        // a new generation as a reset begins (a write in that clock is of the old one)
+        rst_q <= rst;
+        if (rst && !rst_q) pgen <= pgen + 16'd1;
 
         if (rst) begin
             icr <= 8'h00; cvr <= 8'h12; isr <= 8'h06; ivr_r <= 8'h0f;
@@ -537,9 +548,8 @@ module dsp_periph (
             wait_tx <= 1'b1; wait_rx <= 1'b1; hs_frame <= 1'b0;
             st_srcv <= 1'b0; st_strx <= 1'b0;
             ssi_tx_valid <= 1'b0; ssi_hs_play_req <= 1'b0;
-            ipr <= 24'd0; bcr <= 24'h00ffff; pcddr <= 24'd0; pcd <= 24'd0;
-            scr <= 24'd0; ssr <= 24'd0; sccr <= 24'd0;
-            pvalid <= 128'd0;
+            ipr <= 24'd0; pcddr54 <= 2'd0;
+            bcr_w <= 1'b0; scr_w <= 1'b0; ssr_w <= 1'b0; sccr_w <= 1'b0; ssr_d3 <= 1'b0;
         end
     end
 endmodule

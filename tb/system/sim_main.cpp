@@ -221,11 +221,31 @@ int main(int argc, char **argv) {
     uint32_t prev_pc = 0;
     bool prev_berr = false, rtc_toggle = false;
 
+#ifdef FALCON_CPU060
+    // one system clock (32 MHz, 31.25 ns) with the processor's 50 MHz
+    // (20 ns) edges where they fall, in picoseconds
+    uint64_t t_clk = 15625, t_cpu = 10000;
+    auto tick = [&]() {
+        for (int edges = 0; edges < 2; ) {
+            if (t_cpu < t_clk) {
+                t_cpu += 10000;
+                top->clk_cpu = !top->clk_cpu;
+            } else {
+                if (t_cpu == t_clk) { top->clk_cpu = !top->clk_cpu; t_cpu += 10000; }
+                t_clk += 15625;
+                top->clk = !top->clk; edges++;
+            }
+            top->eval();
+        }
+        cyc++;
+    };
+#else
     auto tick = [&]() {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
         cyc++;
     };
+#endif
 
     while (cyc < total && !Verilated::gotFinish()) {
         double now_ms = cyc / CLK_HZ * 1e3;

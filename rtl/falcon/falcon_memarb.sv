@@ -162,34 +162,49 @@ reg  [7:0] g_be;        // [7] = lowest address
 reg  [2:0] g_owner;
 reg  [1:0] g_sub;
 reg        g_any;
+reg [1:0]  g_dma_be;
 reg        g_ok;        // 0: a DMA access outside writable/readable memory, no DDR3 cycle
 
 wire [23:0] ram_top = {ram_mb, 20'd0};
 
 always @* begin : sel
 	reg [27:0] wa;
-	g_any = 1; g_we = 0; g_addr = 0; g_wdata = 0; g_be = 0; g_owner = M_CPU; g_sub = 0; g_ok = 1;
+	reg [23:3] dma_a;
+	reg [15:0] dma_w;
+	g_dma_be = 0; g_any = 1; g_we = 0; g_addr = 0; g_wdata = 0; g_be = 0; g_owner = M_CPU; g_sub = 0; g_ok = 1;
 	if (vid_req) begin
-		g_owner = M_VID; g_addr = vid_addr; g_be = 8'hFF;
+		g_owner = M_VID; g_be = 8'hFF;
 	end else if (ld_pend) begin
-		g_owner = M_LD; g_we = 1; g_addr = ld_a[23:3];
-		g_wdata = {8{ld_d}}; g_be = 8'h80 >> ld_a[2:0];
+		g_owner = M_LD; g_we = 1; g_be = 8'h80 >> ld_a[2:0];
 	end else if (d0_req && !(snoop_hold && d0_we)) begin
-		g_owner = M_D0; g_we = d0_we; g_addr = d0_addr[23:3]; g_sub = d0_addr[2:1];
-		g_wdata = {4{d0_wdata}}; g_be = {6'd0, d0_be} << (6 - 2 * d0_addr[2:1]);
+		g_owner = M_D0; g_we = d0_we; g_sub = d0_addr[2:1]; g_dma_be = d0_be;
 	end else if (d1_req && !(snoop_hold && d1_we)) begin
-		g_owner = M_D1; g_we = d1_we; g_addr = d1_addr[23:3]; g_sub = d1_addr[2:1];
-		g_wdata = {4{d1_wdata}}; g_be = {6'd0, d1_be} << (6 - 2 * d1_addr[2:1]);
+		g_owner = M_D1; g_we = d1_we; g_sub = d1_addr[2:1]; g_dma_be = d1_be;
 	end else if (d2_req && !(snoop_hold && d2_we)) begin
-		g_owner = M_D2; g_we = d2_we; g_addr = d2_addr[23:3]; g_sub = d2_addr[2:1];
-		g_wdata = {4{d2_wdata}}; g_be = {6'd0, d2_be} << (6 - 2 * d2_addr[2:1]);
+		g_owner = M_D2; g_we = d2_we; g_sub = d2_addr[2:1]; g_dma_be = d2_be;
 	end else if (d3_req && !(snoop_hold && d3_we)) begin
-		g_owner = M_D3; g_we = d3_we; g_addr = d3_addr[23:3]; g_sub = d3_addr[2:1];
-		g_wdata = {4{d3_wdata}}; g_be = {6'd0, d3_be} << (6 - 2 * d3_addr[2:1]);
+		g_owner = M_D3; g_we = d3_we; g_sub = d3_addr[2:1]; g_dma_be = d3_be;
 	end else if (cpu_req) begin
-		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_burst ? {cpu_addr[27:5], 2'b00} : cpu_addr[27:3]; g_sub = {cpu_addr[2], 1'b0};
-		g_wdata = {2{cpu_wdata}}; g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
+		g_owner = M_CPU; g_we = cpu_we; g_sub = {cpu_addr[2], 1'b0};
+		g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
 	end else g_any = 0;
+
+	// the address and data by owner (a DMA master's word sits on all four lanes)
+	case (g_owner)
+		M_D0:    begin dma_a = d0_addr[23:3]; dma_w = d0_wdata; end
+		M_D1:    begin dma_a = d1_addr[23:3]; dma_w = d1_wdata; end
+		M_D2:    begin dma_a = d2_addr[23:3]; dma_w = d2_wdata; end
+		default: begin dma_a = d3_addr[23:3]; dma_w = d3_wdata; end
+	endcase
+	case (g_owner)
+		M_VID:   begin g_addr = vid_addr;      g_wdata = 64'd0; end
+		M_LD:    begin g_addr = {4'd0, ld_a[23:3]}; g_wdata = {8{ld_d}}; end
+		M_CPU:   begin g_addr = cpu_burst ? {cpu_addr[27:5], 2'b00} : cpu_addr[27:3]; g_wdata = {2{cpu_wdata}}; end
+		default: begin g_addr = {4'd0, dma_a}; g_wdata = {4{dma_w}}; end
+	endcase
+
+    if (g_owner == M_D0 || g_owner == M_D1 || g_owner == M_D2 || g_owner == M_D3)
+        g_be = {g_dma_be, 6'd0} >> {g_sub, 1'b0};
 
 	// memory types for the DMA masters
 	wa = {g_addr, g_sub, 1'b0};

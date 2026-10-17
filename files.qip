@@ -17,7 +17,15 @@ if {[lsearch -exact $bringup CPU060] >= 0} {
 	set_global_assignment -name SEARCH_PATH rtl/AP68060/rtl
 	set_global_assignment -name SEARCH_PATH rtl/AP68060/rtl/fpu
 	set_global_assignment -name SEARCH_PATH rtl/AP68060/rtl/gen
+	# Fast RAM on the processor's own clock (CT60 mode) and the DDR3 port it shares
+	set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_async_fifo.v
+	set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_fastram_fe.v
+	set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_fastram_be.v
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap030_l2ram.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap060_fastram_bus.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap060_fastram.sv
 	set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus060.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ddr_arb.sv
 } else {
 	set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_top.v
 	set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_core.v
@@ -53,6 +61,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd_keymap.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_nvram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_blitter.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_crossbar.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_audio_adc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ide.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_fdc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_fdc_ncr5380.sv

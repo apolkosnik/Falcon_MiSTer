@@ -28,6 +28,7 @@ frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 | DSP56001 | `rtl/falcon/dsp` | 16 MIPS, 32K words, host port, SSI; matches Hatari instruction by instruction and cycle by cycle |
 | DMA sound, crossbar, codec | `falcon_crossbar` | play/record, multi-track, DSP links incl. handshake mode |
 | YM2149 | `falcon_psg` | Hatari's volume table |
+| Audio input | `falcon_audio_adc` | MiSTer ADC channels 0/1 to the Falcon microphone inputs |
 | MFP 68901 | `falcon_mfp*` | timers, interrupts, USART (MiSTer UART) |
 | ACIAs + IKBD | `falcon_acia`, `falcon_ikbd*` | PS/2 keyboard and mouse, joysticks, MIDI on the UART |
 | Blitter | `falcon_blitter` | matches Hatari's blitter.c |
@@ -132,6 +133,23 @@ Keyboard mappings are unchanged by the persistence update. See
 [the Atari ST comparison](docs/keymap-comparison.txt) for the special-key
 mapping differences and MiSTer interception behavior.
 
+### Audio input
+
+The MiSTer ADC input feeds the Falcon's left and right microphone channels
+(ADC channel 0 = left, channel 1 = right, as in the
+[MiSTer ADC test core](https://github.com/MiSTer-devel/ADCTest_MiSTer)). Stereo
+requires an adapter wired for both channels; a channel-0-only adapter supplies
+the left input. Falcon software selects microphone versus PSG through
+`$FF8938` and routes it to recording, the DSP, or audio output through the
+existing crossbar controls. There is no additional OSD switch.
+
+Capture uses 12-bit ADC samples at 96 kHz per channel, removes DC offset,
+and supplies signed 16-bit samples. Startup and reset reacquire the offset
+before enabling samples. The crossbar uses the latest sample at its selected
+rate; a rate-dependent recording anti-alias filter is not implemented.
+`tb/audio_in/run.sh` tests the serial ADC timing and the path into DMA, DSP
+receive and audio output. Physical audio input has not yet been tested.
+
 ## Building
 
 ```
@@ -152,19 +170,21 @@ Quartus rewrites the project file when it closes it, including the
 The ap060 variant puts the [AP68060](https://github.com/apolkosnik/AP68060)
 (a pipelined 68060) in place of the AP68030, on its own bus bridge
 (`rtl/falcon/falcon_cpubus060.sv`, the synchronous 68060 bus with
-invalidate-only snooping of the DMA writes).  The core runs at 32 MHz with
-its bus at 16 MHz (the 68060's half-speed bus mode, CLKEN) in every OSD
-CPU mode (no Falcon timing, no `$FFF000` counters), and it does not fit
-together with the DSP, so it is built without the DSP and the FPU service:
+invalidate-only snooping of the DMA writes).  The processor runs at 50 MHz
+with its bus at the same speed (BCLK = CLK) in every OSD CPU mode (no
+Falcon timing, no `$FFF000` counters); its transfers to the Falcon's memory
+and I/O cross to the 32 MHz system clock.  It does not fit together with
+the DSP, so it is built without the DSP and the FPU service:
 
 ```
 FALCON_BRINGUP="CPU060 NO_DSP NO_FPU" ./scripts/build.sh
 ```
 
 Its OSD has a Fast RAM option (CT60 mode, `docs/CT60_MODE.md`): 64, 128 or
-240 MB of TT-RAM at `$01000000` on a 32-bit address bus, as on a CT60, with
-the 060 bus at full speed and the Falcon's own memory and I/O at their
-16 MHz-bus speed; EmuTOS finds it and reports it as Alt-RAM.  A size change
+240 MB of TT-RAM at `$01000000` on a 32-bit address bus, as on a CT60,
+answered on the 060 bus at 50 MHz from its own line buffers and cache
+(`ap060_fastram`) in front of DDR3; EmuTOS finds it and reports it as
+Alt-RAM.  A size change
 takes effect after a cold reset.
 
 ## Simulation
@@ -186,4 +206,4 @@ takes effect after a cold reset.
   time on the board is not measured yet; 32 MHz turbo is the default
   (docs/CPU_TIMING.md).
 - SCC serial ports (registers only), Centronics printer,
-  microphone input, `.MSA`/`.STX` floppy images.
+  `.MSA`/`.STX` floppy images.

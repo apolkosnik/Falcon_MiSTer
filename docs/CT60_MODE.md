@@ -1,7 +1,8 @@
 # CT60 mode for the ap060 build - plan
 
-Status: milestones 0, 1 and 3 implemented (2026-10-13), milestone 2 (the
-board) open, 4 and 5 not started.  Applies to the ap060 variant
+Status: milestones 0, 1 and 3 implemented (2026-10-13; milestone 3 redone
+2026-10-16: the processor at 50 MHz, Fast RAM on its own bus), milestone 2
+(the board) open, 4 and 5 not started.  Applies to the ap060 variant
 (`FALCON_BRINGUP="CPU060 ..."`, the AP68060 on `falcon_cpubus060`).
 
 Results so far:
@@ -17,12 +18,16 @@ Results so far:
 - EmuTOS 1.3 in the full-system simulation with 64 MB Fast RAM: welcome
   screen "Alt-RAM: 64 MB"; `ramtop`/`ramvalid` (`$5A4`) = `$05000000`,
   `$1357BD13`, the same as Hatari (`--machine falcon --cpulevel 6 --addr24
-  off --ttram 64`) on the same image.
-- Bus speed (milestone 3, `tb/bridge060`, clocks from TS to the last TA,
-  16 transfers each, DDR3 model latencies): half-speed bus ST-RAM long
-  20.1, line 45.0; CT60 mode ST-RAM long 21.1, line 47.1 (`FALCON_WAIT` 4,
-  `FALCON_BEAT_WAIT` 2: never faster than today), Fast RAM long 16.4, line
-  35.1.  The bench checks both relations.
+  off --ttram 64`) on the same image.  Again with the processor at 50 MHz
+  and Fast RAM through `ap060_fastram` (2026-10-16): the same welcome
+  screen and `ramtop`; with Fast RAM off "ST-RAM: 14 MB", no Alt-RAM,
+  `ramtop` 0; the bus errors are EmuTOS's probes, as before.
+- Bus speed (milestone 3, `tb/bridge060`, 50 MHz clocks from TS to the last
+  TA, 16 transfers each, DDR3 model latencies): ST-RAM long 35.4, line
+  66.7 (0.71 and 1.33 us: the request crosses to the 32 MHz side and back);
+  Fast RAM cache hit long 5.0, line 8.0 (0.10 and 0.16 us), miss long 35.8,
+  line 36.7.  The bench checks that hits take under a quarter of an ST-RAM
+  read and that a missed line is faster than an ST-RAM line.
 - `releases/Falcon-060ct60_20261013.rbf` (060, no DSP, AP68060 `3a8b0e5`):
   34,933 ALMs (83 %), timing met (HDMI +0.149 ns, core +9.07 ns).
 
@@ -61,7 +66,7 @@ Not in this plan:
 | CT60: one PC133 SDRAM module, 64-512 MB, "accessed as FAST RAM (TT RAM) at full system speed"; the 060 bus runs at 80-100 MHz; 1 MB flash with boot, 060 init and patched TOS 4; a switch selects 060 or "100% Falcon 030 mode" | [AtariForumWiki: CT60](https://temlib.org/AtariForumWiki/index.php/CT60) |
 | Hatari runs a Falcon with a 68060 and TT-RAM (`--machine falcon --cpulevel 6 --addr24 off --ttram N`, N up to 1024 MB in steps of 4) | Hatari `src/options.c` |
 | The ap060 bridge decodes A23-A0 only: `$01000000+` mirrors `$000000+`, so EmuTOS sees a 24-bit bus | `rtl/falcon/falcon_cpubus060.sv` (`la <= a[23:0]`) |
-| Today every 060 transfer runs at BCLK = CLK/2 (16 MHz) | `rtl/falcon/falcon_system.sv` (`cpu060_bclk`) |
+| Before milestone 3 every 060 transfer ran at BCLK = CLK/2 (16 MHz); now the processor runs at 50 MHz with BCLK = CLK | `rtl/falcon/falcon_system.sv`, `rtl/pll/pll_0002.v` (`outclk_1`) |
 | The arbiter's CPU port takes `cpu_addr[23:2]`; guest memory is DDR3 byte `0x30000000 + address` (`DDR_BASE` = word `0x6000000`) | `rtl/falcon/falcon_memarb.sv` |
 | DDR3 use: the scaler at `0x20000000`; ST-RAM, ROM and cartridge at `0x30000000-0x30FFFFFF`; the FPU mailbox at `0x30E90000` (030 builds only); nothing in `tools/` uses DDR3 above `0x30FFFFFF` | `sys/sys_top.v` (`RAMBASE`), `falcon_memarb.sv`, `tools/falcon_fpu/falcon_fpu.c` |
 | OSD status bits 0-10 are in use; 11 and up are free | `Falcon.sv` `CONF_STR` |
@@ -111,18 +116,31 @@ same formula as ST-RAM (`0x30000000 + address`).  Sizes: 64, 128 or 240 MB
 at reset; changing it needs a cold reset (EmuTOS keeps its old detection
 across a warm one).
 
-### Bus speed (a later milestone)
+### Bus speed (milestone 3)
 
 On a CT60 the 060 bus runs at full speed, Fast RAM is answered at that
-speed and Falcon accesses go through the CPLD with wait states.  Today the
-ap060 bus runs at 16 MHz for everything, so Fast RAM would be more memory
-but no faster than ST-RAM (both are in the same DDR3 behind the same
-arbiter).  Milestone 3 runs the bus at 32 MHz (BCLK = CLK) and keeps
-Falcon-space transfers at their current length with a minimum-length
-counter in the bridge; Fast RAM transfers end as soon as the arbiter
-answers.  The bridge already latches every answer for the bus clock, so
-this is a wait-state count, not a redesign.  Measured before and after with
-the same program run from ST-RAM and from Fast RAM.
+speed and Falcon accesses go through the CPLD with wait states.  In the
+ap060 build the processor runs on its own 50 MHz clock (`clk_cpu`, PLL
+output 1, asynchronous to the 32 MHz system clock) with BCLK = CLK:
+
+- Fast RAM is the processor's own: `ap060_fastram` (the AP68060
+  repository's `rtl/fastram`, as on the Minimig) answers the Fast RAM
+  window on the 060 bus at 50 MHz, from two line buffers and an 8 KiB
+  cache, with posted writes; its DDR3 side runs on the system clock and
+  shares the one DDRAM port with the Falcon arbiter through
+  `falcon_ddr_arb` (Fast RAM first, a read's beats or a write burst never
+  split).  Its 64-bit words hold 16-bit big-endian words, the lowest
+  address in bits 15:0 (the Minimig layout); only the processor reads
+  them.
+- Everything else crosses to the system clock in `falcon_cpubus060`: one
+  request toggle and one answer toggle through three-flop synchronisers,
+  with the address, size, lanes and data held while they cross; the
+  Falcon side runs the transfer as before.  DMA snoops go the other way
+  through a 32-entry dual-clock FIFO; `snoop_hold` stops DMA writes at 28.
+- The Fast RAM front end's cache is written through by every processor
+  write and swept by a processor reset.  Nothing else writes Fast RAM
+  (the Falcon's DMA reaches ST-RAM only).
+- `Falcon.sdc` puts `clk_cpu` in its own asynchronous clock group.
 
 ## Area today
 
@@ -199,8 +217,9 @@ logic out first (milestone 4).
 2. **Board build and test.**  The 060 build without the DSP (the 060 + DSP
    build has no free LABs).  On the board: EmuTOS reports the Fast RAM; a
    memory test over all of it; MiNT boots and uses it.
-3. **Full-speed bus.**  BCLK = CLK, Falcon-space wait states as above;
-   timing measured from ST-RAM and Fast RAM; the regressions again.
+3. **Full-speed bus.**  The processor at 50 MHz, BCLK = CLK, Fast RAM on
+   its bus (above); timing measured from ST-RAM and Fast RAM; the
+   regressions again.
 4. **060 + DSP with CT60 mode.**  Needs logic out first: the DSP core
    decodes the same instruction-class field in four `case` blocks
    (`dsp56k_core.sv`), and the AP68060 fetch unit has two predecoders
@@ -215,8 +234,5 @@ logic out first (milestone 4).
   [CT60 TOS archive](https://atariuptodate.de/en/36/ct60-tos-archive) and
   the [CT60lib](https://atariuptodate.de/en/6152/ct60lib) are the places to
   look; the wiki pages found have no addresses.
-- Whether the arbiter should give the CPU a separate, faster path to Fast
-  RAM (the AP68060 repository's `rtl/fastram`, written for the Minimig,
-  streams a line at one beat per clock behind its own DDR3 port).  It needs
-  a second DDR3 arbiter and more area; decide after milestone 3's
-  measurements.
+- The area of the 50 MHz crossing and `ap060_fastram` in the 060 + DSP
+  build (milestone 4).

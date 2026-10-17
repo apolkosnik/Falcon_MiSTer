@@ -183,13 +183,14 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 ///////////////////////   CLOCKS   ///////////////////////////////
 
 wire clk_sys;   // 32 MHz: CPU, chipset, DSP, DDR3
+wire clk_cpu;   // 50 MHz: the ap060 build's processor (asynchronous to clk_sys, Falcon.sdc)
 wire pll_locked;
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),
-	.outclk_1(),
+	.outclk_1(clk_cpu),
 	.locked(pll_locked)
 );
 
@@ -240,12 +241,20 @@ falcon_nvram_store nvram_store
 wire [7:0] r, g, b;
 wire       hs, vs, hblank, vblank, ce_pix;
 wire signed [15:0] audio_l, audio_r;
+wire signed [15:0] mic_l, mic_r;
 wire       fdd_led, hdd_led;
 wire       midi_tx, ser_tx;
+
+falcon_audio_adc #(.CLK_HZ(32000000)) audio_adc
+(
+	.clk(clk_sys), .reset(reset), .ADC_BUS(ADC_BUS),
+	.mic_l(mic_l), .mic_r(mic_r), .sample_stb()
+);
 
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk_sys),
+	.clk_cpu(clk_cpu),
 	.reset(reset),
 	.cold_reset(cold_reset),
 	.por(por),
@@ -288,6 +297,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.r(r), .g(g), .b(b),
 	.hsync(hs), .vsync(vs), .hblank(hblank), .vblank(vblank), .ce_pix(ce_pix),
 
+	.mic_l(mic_l), .mic_r(mic_r),
 	.audio_l(audio_l),
 	.audio_r(audio_r),
 

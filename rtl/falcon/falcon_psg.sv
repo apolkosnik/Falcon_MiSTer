@@ -177,9 +177,20 @@ assign port_b_out = r7[7] ? regs[15] : 8'hff;
 // ---------------------------------------------------------------------------
 // 2 MHz clock enable and 250 kHz tick
 // ---------------------------------------------------------------------------
-localparam int ACC_W = $clog2(CLK_HZ + YM_HZ) + 1;
-localparam [ACC_W-1:0] ACC_INC = ACC_W'(YM_HZ);
-localparam [ACC_W-1:0] ACC_MOD = ACC_W'(CLK_HZ);
+// (the accumulator reduced by the gcd: the same ticks, 1 per 16 clocks at 32 MHz)
+function automatic int gcd_f(input int a, input int b);
+    int x, y, t;
+    begin
+        x = a; y = b;
+        for (int i = 0; i < 64; i++)
+            if (y != 0) begin t = x % y; x = y; y = t; end
+        gcd_f = x;
+    end
+endfunction
+localparam int ACC_G = gcd_f(CLK_HZ, YM_HZ);
+localparam int ACC_W = $clog2(CLK_HZ / ACC_G + YM_HZ / ACC_G) + 1;
+localparam [ACC_W-1:0] ACC_INC = ACC_W'(YM_HZ / ACC_G);
+localparam [ACC_W-1:0] ACC_MOD = ACC_W'(CLK_HZ / ACC_G);
 reg [ACC_W-1:0] acc;
 reg [2:0]       div8;
 reg             tick;

@@ -208,6 +208,10 @@ module falcon_blitter #(
     wire [22:0] dst_xinc_ext = {{8{dst_xinc[15]}}, dst_xinc[15:1]};
     wire [22:0] dst_yinc_ext = {{8{dst_yinc[15]}}, dst_yinc[15:1]};
 
+    wire [22:0] src_step = (fsm == F_WR && (line_end || nfsr_next)) ? src_yinc_ext : src_xinc_ext;
+    wire [22:0] src_next = src_addr + src_step;
+    wire [22:0] dst_next = dst_addr + (line_end ? dst_yinc_ext : dst_xinc_ext);
+
     // Blitter_SourceShift + Blitter_SourceFetch
     function [31:0] shift_fetch(input [31:0] b, input [15:0] w, input neg);
         shift_fetch = neg ? {w, b[31:16]} : {b[15:0], w};
@@ -231,30 +235,15 @@ module falcon_blitter #(
         endcase
     end
 
-    reg [15:0] lop_out;
-    always @(*) begin
-        case (lop)
-            4'h0: lop_out = 16'h0000;
-            4'h1: lop_out =  hop_out &  dst_word;
-            4'h2: lop_out =  hop_out & ~dst_word;
-            4'h3: lop_out =  hop_out;
-            4'h4: lop_out = ~hop_out &  dst_word;
-            4'h5: lop_out =  dst_word;
-            4'h6: lop_out =  hop_out ^  dst_word;
-            4'h7: lop_out =  hop_out |  dst_word;
-            4'h8: lop_out = ~hop_out & ~dst_word;
-            4'h9: lop_out = ~hop_out ^  dst_word;
-            4'hA: lop_out = ~dst_word;
-            4'hB: lop_out =  hop_out | ~dst_word;
-            4'hC: lop_out = ~hop_out;
-            4'hD: lop_out = ~hop_out |  dst_word;
-            4'hE: lop_out = ~hop_out | ~dst_word;
-            default: lop_out = 16'hFFFF;
-        endcase
-    end
+    wire [15:0] lop_out;
+    genvar lop_bit;
+    generate for (lop_bit = 0; lop_bit < 16; lop_bit = lop_bit + 1) begin : g_lop
+        assign lop_out[lop_bit] = hop_out[lop_bit] ?
+            (dst_word[lop_bit] ? lop[0] : lop[1]) :
+            (dst_word[lop_bit] ? lop[2] : lop[3]);
+    end endgenerate
 
-    wire [15:0] dst_data = (end_mask != 16'hFFFF) ?
-                           ((lop_out & end_mask) | (dst_word & ~end_mask)) : lop_out;
+    wire [15:0] dst_data = (lop_out & end_mask) | (dst_word & ~end_mask);
 
     // Blitter_LOP_Table
     wire lop_need_src = !(lop == 4'h0 || lop == 4'h5 || lop == 4'hA || lop == 4'hF);
@@ -403,7 +392,7 @@ module falcon_blitter #(
                     case (rd_kind)
                     RK_FXSR: begin
                         buffer    <= shift_fetch(buffer, dma_rdata, src_neg);
-                        src_addr  <= src_addr + src_xinc_ext;
+                        src_addr  <= src_next;
                         have_fxsr <= 1'b1;
                     end
                     RK_SRC: begin
@@ -461,17 +450,17 @@ module falcon_blitter #(
 
                     st_nfsr <= nfsr_next;
                     if (fetch_src)
-                        src_addr <= src_addr + ((line_end || nfsr_next) ? src_yinc_ext : src_xinc_ext);
+                        src_addr <= src_next;
 
                     if (line_end) begin
                         have_fxsr <= 1'b0;
                         y_count   <= y_count_nx;
                         x_count   <= x_count_reset;
-                        dst_addr  <= dst_addr + dst_yinc_ext;
+                        dst_addr  <= dst_next;
                         line_nr   <= dst_yinc[15] ? (line_nr - 4'd1) : (line_nr + 4'd1);
                     end else begin
                         x_count   <= x_count - 17'd1;
-                        dst_addr  <= dst_addr + dst_xinc_ext;
+                        dst_addr  <= dst_next;
                     end
                     have_src  <= 1'b0;
                     fetch_src <= 1'b0;

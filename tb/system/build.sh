@@ -15,11 +15,13 @@ SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_com
 # the processor: the AP68030 with its bus bridge and Falcon timing, or the AP68060 (CPU060)
 A60=$R/AP68060/rtl
 case " $BRINGUP " in
-*" CPU060 "*) DEFS="$DEFS +define+FALCON_CPU060"; CPUINC="-I$A60 -I$A60/fpu -I$A60/gen"
+*" CPU060 "*) DEFS="$DEFS +define+FALCON_CPU060"; CDEFS="-DFALCON_CPU060"; CPUINC="-I$A60 -I$A60/fpu -I$A60/gen -I$A60/fastram"
 	CPUSRC="$A60/ap68060_pkg.sv $A60/gen/ap68060_upkg.sv $A60/ap68060_alu.sv $A60/ap68060_alu_slow.sv $A60/ap68060_muldiv.sv $A60/ap68060_biu.sv
 	 $A60/ap68060_ram.sv $A60/ap68060_atc.sv $A60/ap68060_dmu.sv $A60/ap68060_predec.sv $A60/ap68060_fetch.sv $A60/ap68060_decode.sv
 	 $A60/ap68060_useq.sv $A60/fpu/ap040_fpu.v $A60/ap68060_fpif.sv $A60/ap68060_backend.sv $A60/ap68060_snoop.sv $A60/ap68060.sv
-	 $R/falcon/falcon_cpubus060.sv" ;;
+	 $A60/fastram/ap030_async_fifo.v $A60/fastram/ap030_fastram_fe.v $A60/fastram/ap030_fastram_be.v
+	 $A60/fastram/ap030_l2ram.sv $A60/fastram/ap060_fastram_bus.sv $A60/fastram/ap060_fastram.sv
+	 $R/falcon/falcon_cpubus060.sv $R/falcon/falcon_ddr_arb.sv" ;;
 *) CPUINC="-I$R/AP68030/rtl -I$R/AP68030/rtl/core"
 	CPUSRC="$R/AP68030/rtl/*.v $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/falcon_pipescan.sv $R/falcon/falcon_tstat.sv $R/falcon/falcon_l2.sv" ;;
 esac
@@ -37,5 +39,5 @@ verilator --cc --exe --build -j 16 -O3 --x-assign fast --x-initial fast \
 	-Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-PINMISSING -Wno-TIMESCALEMOD -Wno-MULTIDRIVEN -Wno-UNOPTFLAT \
 	--top-module tb_top -Mdir ${OBJ:-obj_dir} $DEFS \
 	$CPUINC -I$R/falcon -I$R/falcon/dsp \
-	-CFLAGS "-I$PWD/$FPE -I$PWD/$FPE/.." -LDFLAGS "$PWD/$FPE/build/host/libfpe.a -lm" \
+	-CFLAGS "-I$PWD/$FPE -I$PWD/$FPE/.. $CDEFS" -LDFLAGS "$PWD/$FPE/build/host/libfpe.a -lm" \
 	tb_top.sv ddr3_model.sv $CPUSRC $SRCS sim_main.cpp

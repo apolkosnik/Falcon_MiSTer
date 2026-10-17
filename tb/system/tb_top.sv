@@ -7,6 +7,7 @@
 module tb_top
 (
 	input             clk,
+	input             clk_cpu,      // ap060: the processor's 50 MHz, asynchronous to clk
 	input             reset,
 	input             cold_reset,
 	input             por,
@@ -126,7 +127,7 @@ assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_
 
 falcon_system #(.CLK_HZ(32000000)) system
 (
-	.clk(clk), .reset(reset), .cold_reset(cold_reset), .por(por),
+	.clk(clk), .clk_cpu(clk_cpu), .reset(reset), .cold_reset(cold_reset), .por(por),
 	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en), .fast_ram(fast_ram),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
@@ -136,6 +137,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack), .sd_blk_cnt(sd_blk_cnt),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
 	.r(r), .g(g), .b(b), .hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank), .ce_pix(ce_pix),
+	.mic_l(16'sd0), .mic_r(16'sd0),
 	.audio_l(audio_l), .audio_r(audio_r),
 	.midi_rx(1'b1), .midi_tx(midi_tx), .ser_rx(1'b1), .ser_tx(ser_tx),
 	.fdd_led(), .hdd_led(),
@@ -156,18 +158,18 @@ ddr3_model ddr
 final $display("CPU clock: turbo (AP68060)");
 // the snooper's data cache queue lost invalidations (sticky)
 reg ovf_seen = 0;
-always @(posedge clk) if (system.cpu.sn_ovf && !ovf_seen) begin
+always @(posedge clk_cpu) if (system.cpu.sn_ovf && !ovf_seen) begin
 	ovf_seen <= 1;
 	$display("[%9.3f ms] SNOOP QUEUE OVERFLOW: data cache invalidations lost", clk_n / 32000.0);
 end
 // the AP68060's fetch redirects into the vector area and the snoop
 // refetches, with their cause (bring-up debugging)
-integer clk_n = 0;
+integer clk_n = 0;              // system clocks (the time stamps)
+always @(posedge clk) clk_n <= clk_n + 1;
 reg        d_ref = 0, d_xgo = 0, d_redir = 0;
 reg  [7:0] d_xvec = 0, d_wbexc = 0;
 reg [31:0] d_wbpc = 0;
-always @(posedge clk) begin
-	clk_n   <= clk_n + 1;
+always @(posedge clk_cpu) begin
 	d_ref   <= system.cpu.be.wb_refetch;
 	d_xgo   <= system.cpu.be.x_go;
 	d_xvec  <= system.cpu.be.x_vec;

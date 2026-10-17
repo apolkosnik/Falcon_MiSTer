@@ -75,15 +75,32 @@ module falcon_acia #(
 // ---------------------------------------------------------------------------
 // 500 kHz ACIA clock enable
 // ---------------------------------------------------------------------------
-localparam [31:0] ACIA_CLK_HZ = 32'd500000;
-reg  [31:0] cacc = 32'd0;
+// (a fractional accumulator reduced by the gcd: the same enables, 1 per 64
+// clocks at 32 MHz)
+function automatic integer gcd_f(input integer m, input integer n);
+    integer x, y, t, i;
+    begin
+        x = m; y = n;
+        for (i = 0; i < 64; i = i + 1)
+            if (y != 0) begin t = x % y; x = y; y = t; end
+        gcd_f = x;
+    end
+endfunction
+localparam integer ACIA_CLK_HZ = 500000;
+localparam integer CA_G = gcd_f(CLK_HZ, ACIA_CLK_HZ);
+localparam integer CA_I = ACIA_CLK_HZ / CA_G;
+localparam integer CA_M = CLK_HZ / CA_G;
+localparam integer CA_W = $clog2(CA_M + CA_I) + 1;
+localparam [CA_W-1:0] CA_IW = CA_W'(CA_I);
+localparam [CA_W-1:0] CA_MW = CA_W'(CA_M);
+reg  [CA_W-1:0] cacc = {CA_W{1'b0}};
 reg         clk500 = 1'b0;
 always @(posedge clk) begin
-    if (cacc + ACIA_CLK_HZ >= CLK_HZ) begin
-        cacc   <= cacc + ACIA_CLK_HZ - CLK_HZ;
+    if (cacc + CA_IW >= CA_MW) begin
+        cacc   <= cacc + CA_IW - CA_MW;
         clk500 <= 1'b1;
     end else begin
-        cacc   <= cacc + ACIA_CLK_HZ;
+        cacc   <= cacc + CA_IW;
         clk500 <= 1'b0;
     end
 end
