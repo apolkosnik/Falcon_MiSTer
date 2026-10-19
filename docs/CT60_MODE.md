@@ -1,9 +1,12 @@
-# CT60 mode for the ap060 build - plan
+# CT60 mode for the ap060 (and ap040) builds
 
-Status: milestones 0, 1 and 3 implemented (2026-10-13; milestone 3 redone
-2026-10-16: the processor at 50 MHz, Fast RAM on its own bus), milestone 2
-(the board) open, 4 and 5 not started.  Applies to the ap060 variant
-(`FALCON_BRINGUP="CPU060 ..."`, the AP68060 on `falcon_cpubus060`).
+Status: milestones 0, 1, 3 and 4 implemented (2026-10-13; milestone 3 redone
+2026-10-16: the processor at 50 MHz, Fast RAM on its own bus; milestone 4,
+the 060 + DSP with CT60 mode, 2026-10-16), milestone 2 (the board) open, 5
+not started.  Applies to the ap060 variant (`FALCON_BRINGUP="CPU060 ..."`,
+the AP68060 on `falcon_cpubus060`) and to the ap040 variant (branch
+`ap040`, `FALCON_BRINGUP="CPU040 ..."`, the AP68040 on `falcon_cpubus040`
+with the same Fast RAM).
 
 Results so far:
 
@@ -30,6 +33,18 @@ Results so far:
   read and that a missed line is faster than an ST-RAM line.
 - `releases/Falcon-060ct60_20261013.rbf` (060, no DSP, AP68060 `3a8b0e5`):
   34,933 ALMs (83 %), timing met (HDMI +0.149 ns, core +9.07 ns).
+- `releases/Falcon-060all-50_20261016.rbf` (060 + FPU + DSP + CT60 Fast
+  RAM, the 50 MHz processor): 41,474 ALMs (99 %), timing met (50 MHz
+  +0.441 ns, 32 MHz +2.309 ns, HDMI +0.029 ns).  The repository's
+  `scripts/build.sh` reproduces it with HDMI at -0.181 ns (placement).
+- ap040 (2026-10-17): `tb/bridge040` (83 checks: `tb/bridge060`'s, plus
+  the 68040's snoop handshake, every DMA line snooped once as an SC = 10
+  write and acknowledged only with MI negated); EmuTOS in the full-system
+  simulation reports "CPU type: M68040" and, with Fast RAM on, "Alt-RAM:
+  64 MB", `ramtop` `$05000000`.  `releases/Falcon-040_20261016.rbf` (no
+  DSP): 35,847 ALMs (86 %), timing met; `releases/Falcon-040all_20261017.rbf`
+  (everything, AP68040 `ab4d83d`): 40,713 ALMs (97 %), 50 MHz +1.423 ns,
+  32 MHz +2.017 ns, HDMI -0.228 ns.
 
 The CT60 is a 68060 accelerator for the Falcon.  To software it is a Falcon
 whose CPU is a 68060 on a 32-bit bus, with Fast RAM (TT-RAM) on the 060's
@@ -70,7 +85,7 @@ Not in this plan:
 | The arbiter's CPU port takes `cpu_addr[23:2]`; guest memory is DDR3 byte `0x30000000 + address` (`DDR_BASE` = word `0x6000000`) | `rtl/falcon/falcon_memarb.sv` |
 | DDR3 use: the scaler at `0x20000000`; ST-RAM, ROM and cartridge at `0x30000000-0x30FFFFFF`; the FPU mailbox at `0x30E90000` (030 builds only); nothing in `tools/` uses DDR3 above `0x30FFFFFF` | `sys/sys_top.v` (`RAMBASE`), `falcon_memarb.sv`, `tools/falcon_fpu/falcon_fpu.c` |
 | OSD status bits 0-10 are in use; 11 and up are free | `Falcon.sv` `CONF_STR` |
-| Area: the 060 build without the DSP uses 39,127 of 41,910 ALMs; the 060 + DSP build uses 4,191 of 4,191 LABs (no room) | `releases/Falcon-060_20261012d.rbf`, `releases/Falcon-060dsp_20261013.rbf` fit reports |
+| Area before milestone 4: the 060 build without the DSP used 39,127 of 41,910 ALMs; the 060 + DSP build 4,191 of 4,191 LABs (no room) | `releases/Falcon-060_20261012d.rbf`, `releases/Falcon-060dsp_20261013.rbf` fit reports |
 | The simulator's DDR3 model holds 16 MB (`mem[0:(1<<21)-1]`, 64-bit words) | `tb/system/ddr3_model.sv` |
 
 ## Design
@@ -144,55 +159,69 @@ output 1, asynchronous to the 32 MHz system clock) with BCLK = CLK:
 
 ## Area today
 
-The 060 + DSP build (`releases/Falcon-060dsp_20261013.rbf`, AP68060
-`b3bc1ea`, synthesized for area) uses 41,474 of 41,910 ALMs (99 %) and all
-4,191 LABs.  From its fit report (ALMs needed, sub-blocks included):
+The 060 + DSP build with CT60 mode and the 50 MHz processor
+(`releases/Falcon-060all-50_20261016.rbf`, AP68060 `3a8b0e5`) uses 41,474
+of 41,910 ALMs (99 %).  From its fit report (ALMs needed, sub-blocks
+included):
 
 | Block | ALMs | % of device |
 |-------|-----:|------------:|
-| **Falcon system** | **34,170** | **81.5** |
-| AP68060 | 18,927 | 45.2 |
-| DSP56001 | 6,698 | 16.0 |
-| FDC (WD1772 + DMA) | 1,250 | 3.0 |
-| Crossbar (DMA sound, codec) | 1,238 | 3.0 |
-| Videl | 1,216 | 2.9 |
-| IDE | 1,010 | 2.4 |
-| SCSI | 863 | 2.1 |
-| ACIA + IKBD | 740 | 1.8 |
-| Blitter | 426 | 1.0 |
-| MFP | 392 | 0.9 |
-| PSG | 317 | 0.8 |
-| 060 bus bridge (`falcon_cpubus060`) | 299 | 0.7 |
-| NVRAM | 262 | 0.6 |
-| Arbiter, combel, glue | 234 | 0.6 |
-| **hps_io** (OSD, disks, ioctl) | 732 | 1.7 |
-| Other `emu` logic | 183 | 0.4 |
-| **MiSTer framework** | **6,389** | **15.2** |
-| Scaler (`ascal`) | 2,147 | 5.1 |
-| Audio output (IIR filter 443) | 925 | 2.2 |
-| HDMI PLL adjust | 494 | 1.2 |
-| HDMI OSD, VGA OSD | 480, 478 | 2.3 |
-| Rest of `sys_top` | 1,865 | 4.5 |
+| **Falcon system** | **33,888** | **80.9** |
+| AP68060 | 18,948 | 45.2 |
+| DSP56001 | 5,815 | 13.9 |
+| FDC (WD1772 + DMA) | 1,277 | 3.0 |
+| Videl | 1,204 | 2.9 |
+| IDE | 1,083 | 2.6 |
+| Crossbar (DMA sound, codec) | 1,074 | 2.6 |
+| 060 bus bridge with `ap060_fastram` (775) | 1,024 | 2.4 |
+| SCSI | 865 | 2.1 |
+| ACIA + IKBD | 715 | 1.7 |
+| Blitter | 414 | 1.0 |
+| MFP | 378 | 0.9 |
+| PSG | 291 | 0.7 |
+| NVRAM | 247 | 0.6 |
+| Arbiter | 206 | 0.5 |
+| Microphone ADC | 132 | 0.3 |
+| **hps_io** (OSD, disks, ioctl) | 735 | 1.8 |
+| **MiSTer framework** | | |
+| Scaler (`ascal`) | 2,201 | 5.3 |
+| Audio output | 961 | 2.3 |
+| HDMI PLL adjust | 489 | 1.2 |
+| HDMI OSD, VGA OSD | 510, 475 | 2.4 |
 
 Inside the AP68060:
 
 | Unit | ALMs |
 |------|-----:|
-| Back end (`be`) | 9,218 |
-| - FPU interface and FPU (`fpif`) | 4,028 |
-| - the back end's own logic | 3,494 |
-| - ALUs, multiply/divide, register files | about 1,660 |
-| Data cache / DMU | 3,725 |
-| Fetch unit (two predecoders, about 615) | 2,516 |
-| Decoder | 1,744 |
-| Microsequencer | 1,252 |
-| Snoop and bus interface | 463 |
+| Back end (`be`) | 9,237 |
+| - FPU interface and FPU (`fpif`) | 4,093 |
+| Data cache / DMU | 3,622 |
+| Fetch unit | 2,578 |
+| Decoder | 1,785 |
+| Microsequencer | 1,262 |
+| Snoop, bus interface | 225, 229 |
 
-The DSP is one block: `u_core` has 5,329 ALMs of its own, its ALU 680,
-its two decoders 120.  CT60 mode adds the 32-bit decode and a wider CPU
-port to the arbiter (expected well under 200 ALMs), so it fits the 060
-build without the DSP (39,127 ALMs) but not the 060 + DSP build without
-logic out first (milestone 4).
+What made it fit (milestone 4; each change checked against Hatari or the
+previous RTL by the existing benches):
+
+- DSP core: one accumulator write for the ALU, DIV, NORM and Tcc; two
+  data register write ports for the parallel moves; the first move's
+  data from the shared register read; the XY move's AGU for its four
+  modes; one adder for the second fetch address; the ALU's E/U/N/Z once
+  (-1,064 ALUTs; 5,000 random seeds against Hatari give the original
+  RTL's result).  The DSP peripherals' backing store tags its entries
+  with a reset generation instead of 128 valid bits, and holds PCDDR,
+  PCD, SCR, SSR, SCCR and BCR.  The DSP went from 6,698 to 5,815 ALMs.
+- Crossbar: the DMA record write queue in block RAM; the bridge's line
+  buffers in dual-clock block RAM; the clock enable accumulators of the
+  MFP, PSG, Videl and ACIA reduced by their gcd, the crossbar's to 26
+  bits; the arbiter's DMA word and address selected once.
+- `scripts/build.sh` for CPU060/CPU040: no physical synthesis in the
+  processor (its register duplication and retiming for 50 MHz cost about
+  1,400 ALMs, and 50 MHz is met without), the scaler optimized for speed
+  with physical synthesis, small RAMs kept out of MLABs, routability
+  optimization always, no redundant-cell removal (with it the scaler's
+  HDMI counter paths miss timing at this density).
 
 ## Milestones
 
@@ -214,16 +243,14 @@ logic out first (milestone 4).
      --ttram 64` on the same EmuTOS image.
    - The existing 060 regressions (EmuTOS boot from SCSI, 124 Beers) with
      Fast RAM off: unchanged frames.
-2. **Board build and test.**  The 060 build without the DSP (the 060 + DSP
-   build has no free LABs).  On the board: EmuTOS reports the Fast RAM; a
+2. **Board build and test.**  The 060 build with or without the DSP, and
+   the ap040's.  On the board: EmuTOS reports the Fast RAM; a
    memory test over all of it; MiNT boots and uses it.
 3. **Full-speed bus.**  The processor at 50 MHz, BCLK = CLK, Fast RAM on
    its bus (above); timing measured from ST-RAM and Fast RAM; the
    regressions again.
-4. **060 + DSP with CT60 mode.**  Needs logic out first: the DSP core
-   decodes the same instruction-class field in four `case` blocks
-   (`dsp56k_core.sv`), and the AP68060 fetch unit has two predecoders
-   (about 615 ALMs, in the AP68060 repository).
+4. **060 + DSP with CT60 mode.**  Done (2026-10-16): the area work and
+   build settings above; `releases/Falcon-060all-50_20261016.rbf`.
 5. **CT60 TOS (optional).**  Only with the CT60 CPLD register map and the
    CT60 TOS sources: the 1 MB flash image at its address, the registers
    the boot code programs, the cookie and XBIOS.
@@ -234,5 +261,6 @@ logic out first (milestone 4).
   [CT60 TOS archive](https://atariuptodate.de/en/36/ct60-tos-archive) and
   the [CT60lib](https://atariuptodate.de/en/6152/ct60lib) are the places to
   look; the wiki pages found have no addresses.
-- The area of the 50 MHz crossing and `ap060_fastram` in the 060 + DSP
-  build (milestone 4).
+- The 060 + DSP build has 436 ALMs to spare; anything added to it needs
+  area taken out first.  The ap040's has about 1,200 (the AP68040 `faster`
+  area round, `effec8b`, and `DC1_ATC` off).

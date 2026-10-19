@@ -9,7 +9,9 @@
 //============================================================================
 
 // The ap060 variant (FALCON_CPU060): the AP68060 on its own bus bridge
-// (falcon_cpubus060), turbo only; no coprocessor interface, so no FPU bridge
+// (falcon_cpubus060), turbo only; no coprocessor interface, so no FPU bridge.
+// The ap040 variant (FALCON_CPU040, with FALCON_CPU060 also defined: the same
+// clocks, Fast RAM and snooping): the AP68040 on falcon_cpubus040.
 `ifdef FALCON_CPU060
 `ifndef FALCON_NO_FPU
 `define FALCON_NO_FPU
@@ -214,6 +216,27 @@ assign cpu_inst = cpu060_retire;
 assign cpu_as_n = cpu060_ts_n, cpu_bus_oe = cpu060_a_oe, cpu_rw = cpu060_rw_n, cpu_siz = cpu060_siz;
 assign cpu_fc = (cpu060_tt == 2'b11) ? 3'd7 : cpu060_tm;
 assign berr_n = cpu060_tea_n;
+`ifdef FALCON_CPU040
+wire        cpu040_mi_n, cpu040_rw_n_i;
+wire  [1:0] cpu040_siz_i, cpu040_sc;
+assign cpu060_bs_n = 4'b0000;
+// (DC1_ATC off, the core's default: DC1's own ATC port is for 60 MHz)
+ap68040 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0), .DC1_ATC(0)) cpu
+(
+	.clk(clk_cpu), .bclk_en(1'b1), .rsti_n(~cpu060_rst),
+	.a_o(cpu_a), .a_oe(cpu060_a_oe), .a_i(cpu060_a_i), .ts_n_i(cpu060_ts_n_i), .rw_n_i(cpu040_rw_n_i),
+	.siz_i(cpu040_siz_i), .tt_i(cpu060_tt_i), .sc(cpu040_sc), .mi_n(cpu040_mi_n), .ta_n_o(), .ta_oe(),
+	.d_i(cpu_di), .d_o(cpu_do), .d_oe(cpu060_d_oe),
+	.rw_n(cpu060_rw_n), .siz(cpu060_siz), .tt(cpu060_tt), .tm(cpu060_tm), .tln(), .upa(),
+	.ciout_n(cpu060_ciout_n), .lock_n(), .locke_n(), .ts_n(cpu060_ts_n), .tip_n(),
+	.ta_n(cpu060_ta_n), .tea_n(cpu060_tea_n), .tci_n(cpu060_tci_n), .tbi_n(cpu060_tbi_n),
+	.ipl_n(cpu060_rst ? 3'b111 : ipl_n),   // the core synchronises IPL
+	.avec_n(cpu060_avec_n),
+	.br_n(), .bg_n(cpu060_bg_n), .bb_n_i(cpu060_bb_n_i), .bb_n_o(), .bb_oe(cpu060_bb_oe),
+	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(cpu_ipend_n), .pst(),
+	.dbg_pc(dbg_pc), .dbg_retire(cpu060_retire), .dbg_halted(cpu_halted)
+);
+`else
 ap68060 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0)) cpu
 (
 	.clk(clk_cpu), .bclk_en(1'b1), .rsti_n(~cpu060_rst),
@@ -229,6 +252,7 @@ ap68060 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0)) cpu
 	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(cpu_ipend_n), .pst(),
 	.dbg_pc(dbg_pc), .dbg_retire(cpu060_retire), .dbg_halted(cpu_halted)
 );
+`endif
 `endif
 
 //////////////////////////////////////////////////////////////////
@@ -307,6 +331,32 @@ falcon_cpubus cpubus
 
 `else
 assign cp_req = 1'b0, cp_we = 1'b0, cp_id = 3'd0, cp_off = 5'd0, cp_siz = 2'd0, cp_wdata = 32'd0;
+`ifdef FALCON_CPU040
+falcon_cpubus040 cpubus
+(
+	.clk(clk), .clk_cpu(clk_cpu), .reset(reset | sv_busy),
+	.cpu_rst(cpu060_rst), .rsto(~cpu060_rsto_n), .rsto_sys(cpu060_rsto_sys),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .fast_ram(fast_ram),
+	.a(cpu_a), .a_oe(cpu060_a_oe), .d_o(cpu_do), .d_oe(cpu060_d_oe), .rw_n(cpu060_rw_n), .siz(cpu060_siz),
+	.tt(cpu060_tt), .tm(cpu060_tm), .ts_n(cpu060_ts_n), .ciout_n(cpu060_ciout_n), .bb_oe(cpu060_bb_oe),
+	.avm_address(fr_address), .avm_burstcount(fr_burstcount), .avm_read(fr_read), .avm_write(fr_write),
+	.avm_writedata(fr_writedata), .avm_byteenable(fr_byteenable), .avm_waitrequest(fr_waitrequest),
+	.avm_readdata(fr_readdata), .avm_readdatavalid(fr_readdatavalid),
+	.d_i(cpu_di), .ta_n(cpu060_ta_n), .tea_n(cpu060_tea_n), .tci_n(cpu060_tci_n), .tbi_n(cpu060_tbi_n),
+	.avec_n(cpu060_avec_n), .bg_n(cpu060_bg_n), .bb_n_i(cpu060_bb_n_i),
+	.a_i(cpu060_a_i), .ts_n_i(cpu060_ts_n_i), .rw_n_i(cpu040_rw_n_i), .siz_i(cpu040_siz_i),
+	.tt_i(cpu060_tt_i), .sc(cpu040_sc), .mi_n(cpu040_mi_n),
+	.ram_req(cram_req), .ram_we(cram_we), .ram_addr(cram_addr), .ram_be(cram_be),
+	.ram_wdata(cram_wdata), .ram_rdata(cram_rdata), .ram_rdata64(cram_rdata64), .ram_ack(cram_ack),
+	.dev_cs(c_dev_cs), .dev_stb(c_dev_stb), .dev_we(c_dev_we), .dev_addr(c_dev_addr),
+	.dev_uds(c_dev_uds), .dev_lds(c_dev_lds), .dev_din(c_dev_din), .dev_dout(dev_dout),
+	.dev_ack(dev_ack), .dev_berr(dev_berr), .dev_super(dev_super),
+	.iack_req(iack_req), .iack_level(iack_level), .iack_done(iack_done), .iack_avec(iack_avec),
+	.iack_spur(iack_spur), .iack_vector(iack_vector),
+	.snoop_we(snoop_we), .snoop_addr(snoop_addr), .snoop_hold(snoop_hold), .blit_br(blit_br), .blit_bg(blit_bg),
+	.cycle_done(cpu_cycle_done)
+);
+`else
 falcon_cpubus060 cpubus
 (
 	.clk(clk), .clk_cpu(clk_cpu), .reset(reset | sv_busy),
@@ -330,6 +380,7 @@ falcon_cpubus060 cpubus
 	.snoop_we(snoop_we), .snoop_addr(snoop_addr), .snoop_hold(snoop_hold), .blit_br(blit_br), .blit_bg(blit_bg),
 	.cycle_done(cpu_cycle_done)
 );
+`endif
 `endif
 
 

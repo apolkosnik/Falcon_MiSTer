@@ -1,13 +1,36 @@
 # Bring-up builds without some devices (testing only):
 #   FALCON_BRINGUP="NO_IDE NO_FDC NO_DSP" quartus_sh --flow compile Falcon
-# FALCON_BRINGUP="CPU060 NO_DSP NO_FPU": the ap060 variant, the AP68060 in
-# place of the AP68030 (falcon_cpubus060 for its bus; it does not fit with the DSP)
+# FALCON_BRINGUP="CPU060 NO_FPU": the ap060 variant, the AP68060 in place of
+# the AP68030 (falcon_cpubus060 for its bus)
+# FALCON_BRINGUP="CPU040 NO_FPU": the ap040 variant, the AP68040
+# (falcon_cpubus040)
 set bringup {}
 if {[info exists ::env(FALCON_BRINGUP)]} {
 	set bringup $::env(FALCON_BRINGUP)
 	foreach d $bringup { set_global_assignment -name VERILOG_MACRO "FALCON_$d=1" }
 }
-if {[lsearch -exact $bringup CPU060] >= 0} {
+if {[lsearch -exact $bringup CPU040] >= 0} {
+	# the ap040 variant: the AP68040 on falcon_cpubus040, with the ap060's
+	# clocks, Fast RAM and snooping (FALCON_CPU060 as well)
+	set_global_assignment -name VERILOG_MACRO "FALCON_CPU060=1"
+	foreach f {ap68040_pkg.sv gen/ap68040_upkg.sv ap68040_alu.sv ap68040_alu_slow.sv ap68040_muldiv.sv ap68040_biu.sv
+	           ap68040_ram.sv ap68040_atc.sv ap68040_dmu.sv ap68040_predec.sv ap68040_fetch.sv ap68040_decode.sv
+	           ap68040_useq.sv ap68040_fpif.sv ap68040_backend.sv ap68040_snoop.sv ap68040.sv} {
+		set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68040/rtl/$f
+	}
+	set_global_assignment -name VERILOG_FILE rtl/AP68040/rtl/fpu/ap040_fpu.v
+	set_global_assignment -name SEARCH_PATH rtl/AP68040/rtl
+	set_global_assignment -name SEARCH_PATH rtl/AP68040/rtl/fpu
+	set_global_assignment -name SEARCH_PATH rtl/AP68040/rtl/gen
+	set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_async_fifo.v
+	set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_fastram_fe.v
+	set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_fastram_be.v
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap030_l2ram.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap060_fastram_bus.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap060_fastram.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus040.sv
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ddr_arb.sv
+} elseif {[lsearch -exact $bringup CPU060] >= 0} {
 	foreach f {ap68060_pkg.sv gen/ap68060_upkg.sv ap68060_alu.sv ap68060_alu_slow.sv ap68060_muldiv.sv ap68060_biu.sv
 	           ap68060_ram.sv ap68060_atc.sv ap68060_dmu.sv ap68060_predec.sv ap68060_fetch.sv ap68060_decode.sv
 	           ap68060_useq.sv ap68060_fpif.sv ap68060_backend.sv ap68060_snoop.sv ap68060.sv} {

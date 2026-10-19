@@ -155,13 +155,19 @@ ddr3_model ddr
 );
 
 `ifdef FALCON_CPU060
+`ifdef FALCON_CPU040
+final $display("CPU clock: turbo (AP68040)");
+`else
 final $display("CPU clock: turbo (AP68060)");
+`endif
 // the snooper's data cache queue lost invalidations (sticky)
 reg ovf_seen = 0;
+`ifndef FALCON_CPU040
 always @(posedge clk_cpu) if (system.cpu.sn_ovf && !ovf_seen) begin
 	ovf_seen <= 1;
 	$display("[%9.3f ms] SNOOP QUEUE OVERFLOW: data cache invalidations lost", clk_n / 32000.0);
 end
+`endif
 // the AP68060's fetch redirects into the vector area and the snoop
 // refetches, with their cause (bring-up debugging)
 integer clk_n = 0;              // system clocks (the time stamps)
@@ -223,5 +229,161 @@ always @(posedge clk) if (actlog) begin
 		a_clk <= 0; a_inst <= 0; a_cyc <= 0; a_blt <= 0; a_own <= 0;
 	end
 end
+
+// IKBD interrupt path (+ikbdmon): bytes the IKBD ACIA receives, overruns,
+// RDR reads by the CPU, MFP channel 6 (GPIP4) events and acknowledges; and
+// the stuck case: the ACIA requests for more than 20 ms without being read
+integer k_rx = 0, k_ovr = 0, k_rd = 0, k_ev = 0, k_ack = 0, k_stuck = 0;
+reg     k_rdrf_d = 0, k_ovr_d = 0, k_rd_d = 0, k_rep = 0;
+bit     ikbdmon = 0;
+initial ikbdmon = $test$plusargs("ikbdmon");
+integer k_clk = 0;
+always @(posedge clk) if (ikbdmon) begin
+	k_clk    <= k_clk + 1;
+	k_rdrf_d <= system.acia.u_acia_ikbd.rdrf;
+	k_ovr_d  <= system.acia.u_acia_ikbd.ovr_pend;
+	k_rd_d   <= system.acia.ik_rd_dr;
+	if (system.acia.u_acia_ikbd.rdrf && !k_rdrf_d) k_rx <= k_rx + 1;
+	if (system.acia.u_acia_ikbd.ovr_pend && !k_ovr_d) begin
+		k_ovr <= k_ovr + 1;
+		$display("[%9.3f ms] IKBD ACIA overrun", k_clk / 32000.0);
+	end
+	if (system.acia.ik_rd_dr && !k_rd_d) k_rd <= k_rd + 1;
+	if (system.mfp.gp_ev[4]) k_ev <= k_ev + 1;
+	if (system.mfp.ack_ch && system.mfp.pend_m[3:0] == 4'd6) k_ack <= k_ack + 1;
+	if (system.acia.irq_ikbd) k_stuck <= k_stuck + 1; else k_stuck <= 0;
+	if (k_stuck == 640000 && !k_rep) begin
+		k_rep <= 1;
+		$display("[%9.3f ms] IKBD STUCK: ACIA irq 20 ms; MFP ier %04x ipr %04x isr %04x imr %04x vr %02x aer %02x gpip4 %b mfp_irq %b ipl %0d pc %08x",
+		         k_clk / 32000.0, system.mfp.ier, system.mfp.ipr, system.mfp.isr, system.mfp.imr, {system.mfp.vr, 3'b0},
+		         system.mfp.aer, system.mfp.gpip_in[4], system.mfp_irq, system.ipl, system.dbg_pc);
+	end
+	if (k_rep && !system.acia.irq_ikbd) begin
+		k_rep <= 0;
+		$display("[%9.3f ms] IKBD unstuck", k_clk / 32000.0);
+	end
+	if (k_clk % 3200000 == 0)
+		$display("[%9.3f ms] IKBD rx %0d ovr %0d rdr reads %0d gpip4 events %0d ch6 acks %0d", k_clk / 32000.0, k_rx, k_ovr, k_rd, k_ev, k_ack);
+end
+final if (ikbdmon) $display("IKBD rx %0d ovr %0d rdr reads %0d gpip4 events %0d ch6 acks %0d", k_rx, k_ovr, k_rd, k_ev, k_ack);
+
+// IDE commands (+idemon): each command as it starts (code, sector count,
+// LBA), each disk image request (unit, LBA, blocks), and per 100 ms totals
+bit idemon = 0;
+initial idemon = $test$plusargs("idemon");
+integer i_clk = 0, i_cmd = 0, i_req = 0, i_blk = 0, i_sec = 0;
+reg [1:0] i_rd_d = 0;
+`ifndef FALCON_NO_IDE
+always @(posedge clk) if (idemon) begin
+	i_clk  <= i_clk + 1;
+	i_rd_d <= system.ide.sd_rd;
+	if (system.ide.cmd_req && ((system.ide.est == system.ide.E_IDLE && !system.ide.h_act) || system.ide.est == system.ide.E_RDRQ ||
+	    system.ide.est == system.ide.E_WDRQ || system.ide.est == system.ide.E_IDDRQ)) begin
+		i_cmd <= i_cmd + 1;
+		i_sec <= i_sec + (system.ide.r_nsec == 0 ? 256 : system.ide.r_nsec);
+		$display("[%9.3f ms] IDE cmd %02x unit %0d nsec %0d lba %0d pc %08x", i_clk / 32000.0, system.ide.cmd_val, system.ide.cmd_unit,
+		         system.ide.r_nsec, {system.ide.r_select[3:0], system.ide.r_hcyl, system.ide.r_lcyl, system.ide.r_sect}, system.dbg_pc);
+	end
+	if ((system.ide.sd_rd & ~i_rd_d) != 0) begin
+		i_req <= i_req + 1;
+		i_blk <= i_blk + system.ide.sd_blk_cnt + 1;
+	end
+	if (i_clk % 3200000 == 0)
+		$display("[%9.3f ms] IDE totals: %0d commands, %0d sectors asked, %0d image reads, %0d blocks", i_clk / 32000.0, i_cmd, i_sec, i_req, i_blk);
+end
+`endif
+
+// CPU bus transfers by region (+busmon, from +busfrom=<ms>): per 100 ms,
+// line and non-line, reads and writes, ST-RAM / ROM+I/O / Fast RAM, the
+// cache-inhibited ones, and the retired instructions; plus the most recent
+// non-line write and read addresses (where the uncached traffic goes)
+`ifdef FALCON_CPU060
+bit busmon = 0;
+integer busfrom = 0;
+initial begin busmon = $test$plusargs("busmon"); if (!$value$plusargs("busfrom=%d", busfrom)) busfrom = 0; end
+integer b_clk = 0, b_inst = 0;
+integer b_n[0:2][0:1][0:1];     // [region][line][write]
+integer b_ci = 0;
+reg [31:0] b_lastw = 0, b_lastr = 0;
+initial for (int r = 0; r < 3; r++) for (int l = 0; l < 2; l++) for (int w = 0; w < 2; w++) b_n[r][l][w] = 0;
+always @(posedge clk) if (busmon) b_clk <= b_clk + 1;
+integer b_per = 0;               // the 100 ms period last reported
+always @(posedge clk_cpu) if (busmon && b_clk >= busfrom * 32000) begin
+	automatic int r, l, w;
+	if (b_clk / 3200000 != b_per) begin
+		b_per <= b_clk / 3200000;
+		$display("[%9.3f ms] BUS inst %0d | ST line r %0d w %0d, single r %0d w %0d | ROM/IO single r %0d w %0d | FAST line r %0d w %0d, single r %0d w %0d | CI %0d | last single w %08x r %08x",
+		         b_clk / 32000.0, b_inst, b_n[0][1][0], b_n[0][1][1], b_n[0][0][0], b_n[0][0][1], b_n[1][0][0], b_n[1][0][1],
+		         b_n[2][1][0], b_n[2][1][1], b_n[2][0][0], b_n[2][0][1], b_ci, b_lastw, b_lastr);
+		b_inst <= 0; b_ci <= 0;
+		for (int i = 0; i < 3; i++) for (int j = 0; j < 2; j++) for (int k = 0; k < 2; k++) b_n[i][j][k] <= 0;
+	end
+	else begin
+		if (system.cpu_inst) b_inst <= b_inst + 1;
+		if (!system.cpu060_ts_n && system.cpu060_a_oe) begin
+			r = system.cpu_a >= 32'h01000000 ? 2 : (system.cpu_a >= 32'h00E00000 ? 1 : 0);
+			l = (system.cpu060_siz == 2'b11) ? 1 : 0;
+			w = !system.cpu060_rw_n ? 1 : 0;
+			b_n[r][l][w] <= b_n[r][l][w] + 1;
+			if (!system.cpu060_ciout_n) b_ci <= b_ci + 1;
+			if (l == 0 && w == 1) b_lastw <= system.cpu_a;
+			if (l == 0 && w == 0) b_lastr <= system.cpu_a;
+		end
+	end
+end
+`endif
+
+// the AP68040/AP68060 pipeline (+pipemon, from +busfrom=<ms>): per 100 ms,
+// CPU clocks, instructions retired, clocks WB is held by a store the DMU
+// has not accepted, clocks WB stalls for any reason, clocks the DMU engine
+// is busy, instruction fetch bus requests (line fetches: I-cache misses)
+// and the clocks they wait, DMU bus requests and the clocks they wait
+`ifdef FALCON_CPU040
+bit pipemon = 0;
+initial pipemon = $test$plusargs("pipemon");
+integer p_clk = 0, p_per = 0;
+integer p_cyc = 0, p_inst = 0, p_sthold = 0, p_wbst = 0, p_eng = 0, p_freq = 0, p_fwait = 0, p_dreq = 0, p_dwait = 0;
+reg     p_fb_d = 0, p_db_d = 0;
+always @(posedge clk) if (pipemon) p_clk <= p_clk + 1;
+always @(posedge clk_cpu) if (pipemon && p_clk >= busfrom * 32000) begin
+	p_fb_d <= system.cpu.fetch.b_req;
+	p_db_d <= system.cpu.dmu.e_breq;
+	if (p_clk / 3200000 != p_per) begin
+		p_per <= p_clk / 3200000;
+		$display("[%9.3f ms] PIPE clk %0d inst %0d | WB held by store %0d, WB stalled %0d | DMU engine busy %0d | fetch bus req %0d wait %0d | DMU bus req %0d wait %0d",
+		         p_clk / 32000.0, p_cyc, p_inst, p_sthold, p_wbst, p_eng, p_freq, p_fwait, p_dreq, p_dwait);
+		p_cyc <= 0; p_inst <= 0; p_sthold <= 0; p_wbst <= 0; p_eng <= 0; p_freq <= 0; p_fwait <= 0; p_dreq <= 0; p_dwait <= 0;
+	end
+	else begin
+		p_cyc <= p_cyc + 1;
+		if (system.cpu_inst) p_inst <= p_inst + 1;
+		if (system.cpu.be.stall_wb && system.cpu.be.wb_st && !system.cpu.be.dm_st_rdy) p_sthold <= p_sthold + 1;
+		if (system.cpu.be.stall_wb) p_wbst <= p_wbst + 1;
+		if (!system.cpu.dmu.sim_es_i) p_eng <= p_eng + 1;
+		if (system.cpu.fetch.b_req && !p_fb_d) p_freq <= p_freq + 1;
+		if (system.cpu.fetch.b_req) p_fwait <= p_fwait + 1;
+		if (system.cpu.dmu.e_breq && !p_db_d) p_dreq <= p_dreq + 1;
+		if (system.cpu.dmu.e_breq) p_dwait <= p_dwait + 1;
+	end
+end
+`endif
+
+// one access at a time (+lattrace, from +busfrom=<ms>, LATN CPU clocks): a
+// row per CPU clock with the uncached access path's handshakes
+`ifdef FALCON_CPU040
+bit lattrace = 0;
+initial lattrace = $test$plusargs("lattrace");
+integer l_clk = 0, l_n = 0;
+always @(posedge clk) if (lattrace) l_clk <= l_clk + 1;
+always @(posedge clk_cpu) if (lattrace && l_clk >= busfrom * 32000 && l_n < 600) begin
+	l_n <= l_n + 1;
+	$display("LAT %4d ret=%b pc=%08x | dmu: breq=%b gnt=%b done=%b rv=%b idle=%b | be: wbstall=%b | bus: ts=%b a=%08x rw=%b ta=%b tci=%b | fr: sel=%b nreq=%b nrdy=%b nval=%b ta=%b",
+	         l_n, system.cpu_inst, system.dbg_pc,
+	         system.cpu.dmu.e_breq, system.cpu.dmu.b_gnt, system.cpu.dmu.b_done, system.cpu.dmu.b_rvalid, system.cpu.dmu.sim_es_i,
+	         system.cpu.be.stall_wb,
+	         !system.cpu060_ts_n && system.cpu060_a_oe, system.cpu_a, system.cpu060_rw_n, !system.cpu060_ta_n, !system.cpu060_tci_n,
+	         system.cpubus.fr_sel, system.cpubus.fastram.n_req, system.cpubus.fastram.n_ready, system.cpubus.fastram.n_valid, !system.cpubus.fr_ta_n);
+end
+`endif
 
 endmodule

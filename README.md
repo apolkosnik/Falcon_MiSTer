@@ -173,11 +173,14 @@ The ap060 variant puts the [AP68060](https://github.com/apolkosnik/AP68060)
 invalidate-only snooping of the DMA writes).  The processor runs at 50 MHz
 with its bus at the same speed (BCLK = CLK) in every OSD CPU mode (no
 Falcon timing, no `$FFF000` counters); its transfers to the Falcon's memory
-and I/O cross to the 32 MHz system clock.  It does not fit together with
-the DSP, so it is built without the DSP and the FPU service:
+and I/O cross to the 32 MHz system clock.  It has the 060's own FPU, so it
+is built without the FPU service; with the DSP it fills 99 % of the
+device (`scripts/build.sh` applies the area settings it needs), without it
+86 %:
 
 ```
-FALCON_BRINGUP="CPU060 NO_DSP NO_FPU" ./scripts/build.sh
+FALCON_BRINGUP="CPU060 NO_FPU" ./scripts/build.sh          # everything
+FALCON_BRINGUP="CPU060 NO_DSP NO_FPU" ./scripts/build.sh   # without the DSP
 ```
 
 Its OSD has a Fast RAM option (CT60 mode, `docs/CT60_MODE.md`): 64, 128 or
@@ -187,6 +190,22 @@ answered on the 060 bus at 50 MHz from its own line buffers and cache
 Alt-RAM.  A size change
 takes effect after a cold reset.
 
+The ap040 variant (branch `ap040`) puts the
+[AP68040](https://github.com/apolkosnik/AP68040) (`faster` branch, a
+pipelined 68040) there instead, on `rtl/falcon/falcon_cpubus040.sv`: the
+ap060's bridge for the 68040's bus (byte lanes from SIZ and A1:A0, DMA
+writes snooped as SC = 10 long-word writes, each ended with TA once the
+processor negates MI, a tenure ended by negating BB).  Everything else is
+the ap060's: the 50 MHz processor clock, CT60 Fast RAM through
+`ap060_fastram` (from the AP68060 submodule), the DDR3 port and the OSD.
+The 68040's FPU is its hardware subset as well (unimplemented instructions
+trap for an FPSP).
+
+```
+FALCON_BRINGUP="CPU040 NO_FPU" ./scripts/build.sh          # everything
+FALCON_BRINGUP="CPU040 NO_DSP NO_FPU" ./scripts/build.sh   # without the DSP
+```
+
 ## Simulation
 
 - Unit benches: `tb/<module>/run.sh` (Verilator; most compare against Hatari's
@@ -194,8 +213,9 @@ takes effect after a cold reset.
 - Persistence: `MAIN=/path/to/Main_MiSTer_falcon tb/nvram_store/run.sh` links
   the production Main save/load implementation to the real `hps_io`, NVRAM
   and persistence-controller RTL, using temporary files for storage.
-- Full system: `tb/system/build.sh` (`BRINGUP="CPU060 NO_DSP NO_FPU" OBJ=obj_060`
-  for the ap060 variant), then
+- Full system: `tb/system/build.sh` (`BRINGUP="CPU060" OBJ=obj_060` for the
+  ap060 variant, `BRINGUP="CPU040" OBJ=obj_040` for the ap040; add `NO_DSP`
+  to leave the DSP out), then
   `tb/system/obj_dir/Vtb_top +rom=<emutos.hex> --ms 25000 --ide0 disk.img --frames out`
   (see the header of `tb/system/sim_main.cpp`; `rom2hex64.py` converts a ROM).
 

@@ -26,6 +26,7 @@
 //     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
+//     --mousestream T:P:DX:DY  from time T ms on, a mouse packet every P ms
 //     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC,
 //                       VERSION 4 and a heartbeat every 10 ms in the mailbox
 //                       at $E90000, and every request executed by the same
@@ -127,6 +128,7 @@ int main(int argc, char **argv) {
     uint32_t text_addr = 0, done_addr = 0;
     std::string dump_spec;      // --dump ADDR:LEN:FILE  guest memory written to FILE at the end
     double wrlat_ms = 0, rdlat_ms = 0;
+    double ms_t = 0, ms_p = 0; int ms_dx = 0, ms_dy = 0; long ms_sent = 0;   // --mousestream
     std::vector<Event> events;
 
     for (int i = 1; i < argc; i++) {
@@ -166,6 +168,7 @@ int main(int argc, char **argv) {
         else if (a == "--iofrom") io_from = atof(next().c_str());
         else if (a == "--key") { double t; unsigned c; sscanf(next().c_str(), "%lf:%x", &t, &c); events.push_back({t, 0, (int)c, 0, 0}); }
         else if (a == "--mouse") { double t; int dx, dy, b; sscanf(next().c_str(), "%lf:%d:%d:%d", &t, &dx, &dy, &b); events.push_back({t, 1, dx, dy, b}); }
+        else if (a == "--mousestream") sscanf(next().c_str(), "%lf:%lf:%d:%d", &ms_t, &ms_p, &ms_dx, &ms_dy);
         else if (a == "--fpu") fpu_service = true;
         else if (a == "--turbo") turbo = true;
         else if (a == "--fastram") fastram = atoi(next().c_str()) & 3;
@@ -271,6 +274,13 @@ int main(int argc, char **argv) {
         } else if (mount_step >= 7 && top->img_mounted) top->img_mounted = 0;
 
         // scripted input
+        if (ms_p > 0 && now_ms >= ms_t) {
+            mouse_toggle = !mouse_toggle;
+            int st = 8 | (ms_dx < 0 ? 0x10 : 0) | (ms_dy < 0 ? 0x20 : 0);
+            top->ps2_mouse = (mouse_toggle << 24) | ((ms_dy & 0xFF) << 16) | ((ms_dx & 0xFF) << 8) | st;
+            ms_t += ms_p;
+            ms_sent++;
+        }
         for (auto &e : events) {
             if (e.kind < 0) continue;
             if (now_ms >= e.t) {
@@ -491,6 +501,7 @@ int main(int argc, char **argv) {
             printf("  %s = %08x\n", n, val);
         }
     }
+    if (ms_p > 0) printf("mouse stream: %ld packets sent\n", ms_sent);
     top->final();
     delete top;
     return 0;

@@ -4,3 +4,7 @@
 [submodule "rtl/AP68060"]
 	path = rtl/AP68060
 	url = https://github.com/apolkosnik/AP68060
+[submodule "rtl/AP68040"]
+	path = rtl/AP68040
+	url = https://github.com/apolkosnik/AP68040
+	branch = faster

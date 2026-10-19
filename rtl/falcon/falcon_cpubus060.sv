@@ -419,10 +419,16 @@ assign blit_bg = bg_s[1];
 //----------------------------------------------------------------------------
 // clk_cpu: Fast RAM (CT60 mode), the processor's own port to DDR3
 //----------------------------------------------------------------------------
+// CIOUT is not passed on: the front end's cache and line buffers answer a
+// cache-inhibited access too.  Nothing but the processor writes the Fast
+// RAM (no DMA reaches it), so they always hold what memory holds; CIOUT
+// still keeps the processor's own caches out.  EmuTOS maps all supervisor
+// data noncachable on the 040/060 (bios/processor.S, DTT0 $00FFA040), and
+// a DDR3 round trip per access made supervisor code ten times slower.
 ap060_fastram fastram (
 	.clk(clk_cpu), .clk_mem(clk), .rst(cpu_rst), .bclk_en(1'b1),
 	.m_ign(1'b0), .m_cnt(16'd0), .m_hold(1'b0),
-	.a(a), .rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .bs_n(bs_n), .ts_n(ts_n), .ciout_n(ciout_n),
+	.a(a), .rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .bs_n(bs_n), .ts_n(ts_n), .ciout_n(1'b1),
 	.d_cpu(d_o), .sel(fr_sel),
 	// guest $01000000+ is DDR3 0x31000000+ (64-bit word 0x6000000 + A27..A3)
 	.ddr_addr(29'h6000000 | {4'd0, a[27:3]}),

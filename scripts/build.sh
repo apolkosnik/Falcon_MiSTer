@@ -47,18 +47,21 @@ trap 'exit 130' INT TERM
 #  - small RAMs stay in block RAM (no MLAB conversion: MLABs take logic LABs)
 #  - routability optimization always, and no redundant-cell removal (with it
 #    the scaler's HDMI paths miss timing at this density)
+# (the ap040 variant, CPU040, the same with the AP68040)
 AREA060=0
-case " ${FALCON_BRINGUP:-} " in *" CPU060 "*)
+CPUI=ap68060:cpu
+case " ${FALCON_BRINGUP:-} " in *" CPU040 "*) CPUI=ap68040:cpu ;; esac
+case " ${FALCON_BRINGUP:-} " in *" CPU060 "*|*" CPU040 "*)
 	AREA060=1
 	sed -i -e 's/^set_global_assignment -name OPTIMIZATION_MODE .*/set_global_assignment -name OPTIMIZATION_MODE BALANCED/' \
 	       -e 's/^set_global_assignment -name OPTIMIZATION_TECHNIQUE .*/set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA/' \
 	       -e 's/^set_global_assignment -name ALM_REGISTER_PACKING_EFFORT .*/set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH/' \
 	       -e '/^set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS /d' $P.qsf
 	[ -z "$(tail -c1 $P.qsf)" ] || echo >> $P.qsf
-	cat >> $P.qsf <<-'EOF'
+	cat >> $P.qsf <<-EOF
 	set_global_assignment -name BLOCK_RAM_TO_MLAB_CELL_CONVERSION OFF
 	set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
-	set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "NEVER ALLOW" -to "emu:emu|falcon_system:system|ap68060:cpu"
+	set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "NEVER ALLOW" -to "emu:emu|falcon_system:system|$CPUI"
 	set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "ALWAYS ALLOW" -to "ascal:ascal"
 	set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -to "ascal:ascal"
 	EOF
