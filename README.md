@@ -10,8 +10,8 @@ Atari Falcon030 core for MiSTer (DE10-Nano).
   follows and lists its deviations).
 - Platform: the MiSTer template (`sys/`).
 
-Status: untested on hardware. In full-system simulation (Verilator, the real
-RTL, EmuTOS 1.3) the machine boots to the GEM desktop from floppy, IDE and
+Status: tested on hardware. In full-system simulation (Verilator, the real
+RTL, EmuTOS 1.4) the machine boots to the GEM desktop from floppy, IDE and
 SCSI disks, with keyboard and mouse input, matching Hatari's boot frame by
 frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 
@@ -162,7 +162,6 @@ Quartus rewrites the project file when it closes it, including the
 
 ## Not yet done
 
-- Hardware testing.
 - The Falcon 16 MHz CPU setting keeps Hatari's Falcon time, but its real
   time on the board is not measured yet; 32 MHz turbo is the default
   (docs/CPU_TIMING.md).
