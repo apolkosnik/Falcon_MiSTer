@@ -1698,6 +1698,67 @@ static void sc_irq()
 	ddr_checks();
 }
 
+// A context switch inside a waiting instruction (t_ctxsw): the instruction is told to come again, the interrupt's
+// handler saves the FPU (FSAVE, FMOVEM), runs another process's FPU code and restores it (FMOVEM, FRESTORE); the
+// instruction executes after the RTE.  mode: 0 its command behind a background instruction, 1 waiting for its own
+// result, 2 a conditional behind a background instruction, 3 behind the reset of a null frame's FRESTORE.
+static void sc_ctxsw(int mode)
+{
+	static const char *names[4] = {"context switch in a waiting instruction: FMOVE.D FP0,(d16,A3) behind a background FADD",
+	                               "context switch in a waiting instruction: FMOVE.D FP0,(d16,A3) waiting for its result",
+	                               "context switch in a waiting instruction: FBLT behind a background FCMP",
+	                               "context switch in a waiting instruction: FMOVE.L (d16,A0),FP0 behind the reset of a null FRESTORE"};
+	static const char *lab[4] = {"pend0", "pend1", "pend2", "pend3"};
+	static const unsigned ccr[4] = {0x7400, 0x7400, 0x0014, 0x4000};
+	static const char *res[4] = {"401c000000000000", "4008000000000000", "", "4014000000000000"};
+	begin_test(names[mode], "t_ctxsw");
+	gw32(A_MODE, mode);
+	set_pacing(true);
+	child_start();
+	std::map<std::string, uint32_t> syms = load_syms("obj/t_ctxsw.lst");
+	release_reset();
+	run_until(present, 20 * POLL_CLKS);
+	wait_mark(A_MARK1, 800000);
+	steps(500);
+	child_signal(SIGSTOP);
+	steps(200);
+	gw32(A_GO, 1);
+	bool ca = run_until([] { return ca_run >= 6; }, 60000);
+	check_true("ctxsw", fmt("the instruction is in its come-again loop (%u consecutive come-again responses, ARM held)", ca_run), ca, "bridge header: Busy");
+	g_ipl = 3;
+	bool taken = run_until([] { return gr32(A_IRQCNT) != 0; }, 20000);
+	check_true("ctxsw", "the level 3 interrupt was taken with the instruction still waiting", taken && !is_done(),
+	           "MC68030 UM 10.4.8: interrupt on a come-again null primitive with IA");
+	steps(300);                                  // the handler's FSAVE is told to come again
+	child_signal(SIGCONT);
+	finish_program(600000, true);
+	collect();
+	expect("ctxsw", Tg("T_CS_CNT"), "interrupts taken (handler count)", 1, "test harness", 1);
+	expect("ctxsw", Tg("T_CS_VEC"), "the interrupt's frame: format $9 (coprocessor mid-instruction), vector 27", 0x906C, "MC68030 UM 10.4.8, 8.2", 4);
+	expect("ctxsw", Tg("T_CS_IA"), "... its instruction address: the waiting instruction", syms[lab[mode]], "MC68030 UM 10.4.8");
+	expect("ctxsw", Tg("T_CS_FMT"), "FSAVE in the handler: format word (idle)", 0x1F38, "MC68882 UM 6.4.2; bridge header: a pending instruction needs a frame", 4);
+	// (a conditional's word: the predicate is its low six bits, MC68030 UM 10.2.1)
+	uint32_t cc = recs.count(Tg("T_CS_CCR")) ? recs[Tg("T_CS_CCR")][0] : ~0u;
+	check_eq("ctxsw", "... the frame's command/condition register: the pending instruction's word", ccr[mode], mode == 2 ? cc & 0x3F : cc,
+	         "MC68882 UM 6.4.2 (idle frame, command/condition register); bridge header", 4);
+	check_true("ctxsw", fmt("the other process's 1000/7 as a double: expected 4061db6db6db6db7 got %s", ram_hex(0x8040, 8).c_str()),
+	           ram_hex(0x8040, 8) == "4061db6db6db6db7", "IEEE 754: 1000/7 rounded to nearest");
+	if (mode == 2)
+		expect("ctxsw", Tg("T_CS_BR"), "FBLT after the RTE: taken ($600D), on the restored condition codes (3 < 4)", 0x600D,
+		       "MC68882 UM 6.4.2: the conditional executes after FRESTORE", 4);
+	else
+		check_true("ctxsw", fmt("the interrupted instruction's result after the RTE: expected %s got %s", res[mode], ram_hex(0x8148, 8).c_str()),
+		           ram_hex(0x8148, 8) == res[mode], "MC68882 UM 6.4.2: the pending instruction executes after FRESTORE; IEEE 754 doubles of 7, 3, 5");
+	if (mode != 3)
+		check_true("ctxsw", fmt("FP1 after the switch back: expected 4010000000000000 got %s", ram_hex(0x8150, 8).c_str()),
+		           ram_hex(0x8150, 8) == "4010000000000000", "the handler's FMOVEM restored the registers (4)");
+	check_eq("ctxsw", "exceptions other than the interrupt (UNEXP flag)", 0, gr32(A_UNEXP), "test harness", 1);
+	if (gr32(A_UNEXP))
+		for (auto &e : exlog()) printf("        exception: vector %u fmt %u pc %08x ia %08x sr %04x\n", e.vec, e.fmt, e.pc, e.ia, e.sr);
+	bus_checks("ctxsw");
+	ddr_checks();
+}
+
 static void sc_fsdie()
 {
 	real_start("FSAVE whose service stops answering", "t_fsdie");
@@ -1883,6 +1944,10 @@ int main(int argc, char **argv)
 	    {"m4irq", sc_irq},
 	    {"m4irqk", sc_irqk},
 	    {"m4fsdie", sc_fsdie},
+	    {"ctxsw_cmd", [] { sc_ctxsw(0); }},
+	    {"ctxsw_wait", [] { sc_ctxsw(1); }},
+	    {"ctxsw_cond", [] { sc_ctxsw(2); }},
+	    {"ctxsw_null", [] { sc_ctxsw(3); }},
 	    {"m2wd_stop", [] { sc_wd(0); }},
 	    {"m2wd_nosvc", [] { sc_wd(1); }},
 	    {"m2wd_presence", [] { sc_wd(2); }},

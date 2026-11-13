@@ -74,6 +74,19 @@ Waiting is always "null, come again, IA=1": the 68030 re-reads the response
 CIR in short bus cycles, so interrupts are serviced and blitter/DMA keep the
 bus between reads (no microsecond-long held cycles).
 
+**A context switch in a waiting instruction.**  An interrupt taken there
+stacks a format $9 frame and the RTE reads the response CIR again, so the
+instruction must still be waiting in the FPU then -- also when the handler
+did FSAVE, let another process use the FPU and did FRESTORE in between, as
+every multitasking kernel does.  The frame carries it, as the 68882's does
+(UM 6.4.2: the idle frame's command/condition register): FSAVE gives the
+waiting command or condition word in the body's first word and a mark in the
+reserved word after it; FRESTORE of a frame so marked starts that dialog
+again.  (Without it the response read after the RTE found an idle FPU: the
+instruction was skipped and, if it had extension words, the 68030 went on
+executing those.  Found with Atari System V's X server, which died of SIGSEGV
+in its font code; `tb/fpu` `ctxsw_*`.)
+
 **Presence and failure.**  The ARM service writes a magic/heartbeat word into
 the mailbox.  Without it (old Main, service not started) the bridge answers
 the first CIR access with BERR: no FPU, as today, so TOS and programs behave
