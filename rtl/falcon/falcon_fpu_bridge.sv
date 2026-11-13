@@ -78,6 +78,19 @@
 // outstanding request.  The ARM's FPU is null after a reset or a null frame
 // until a request reaches it: the first conditional after it is asked of the
 // ARM (null -> idle), so FNOP; FSAVE reads an idle frame.
+// An instruction that was told to come again ($8900) can be interrupted (the
+// 68030 stacks a format $9 frame and reads the response CIR again after the
+// RTE), and the handler may FSAVE and FRESTORE in between: a context switch.
+// The frame carries the waiting instruction as the 68882's does (UM 6.4.2,
+// the idle frame's command/condition register): FSAVE gives its command or
+// condition word in the body's first word, with PEND_MARK (bit 0: a
+// condition) in the reserved word after it, and FRESTORE of a frame so marked
+// starts that dialog again from its command, so the response read after the
+// RTE finds it.  Nothing of the instruction had reached the 68030 when it
+// waited, and what it did on the ARM (a result or a register image to read)
+// is the same done again.  If the ARM's FPU is null (the instruction waits
+// behind a reset) FSAVE gives an idle frame of the bridge's own: zeroes, the
+// marked word and BIU flags without an exception.
 //
 // Conditionals: the predicate is evaluated from the FPSR condition codes of
 // the last reply (N, Z, I, NAN) with Hatari's 6888x table (COND_TAB) once no
@@ -266,6 +279,13 @@ reg           post_ia;              // the request carries the instruction addre
 reg  [31:0]   iaddr;
 reg           save_wait = 1'b0;     // FSAVE: the frame was requested
 reg           save_rdy;             // FSAVE: the frame is in the reply
+// an instruction waiting across FSAVE/FRESTORE
+localparam [15:0] PEND_MARK = 16'h3C5A;     // (opclass 001: no command the ARM is given)
+reg  [1:0]    sv_pend;              // FSAVE's frame carries one: 1 a command, 2 a condition
+reg  [15:0]   sv_word;
+reg           sv_synth;             // the frame is the bridge's (null FPU)
+reg  [1:0]    rs_pend;              // FRESTORE's frame carries one
+reg  [15:0]   rs_word;
 
 // transfers
 reg  [7:0]    in_len, in_pos;
@@ -334,6 +354,10 @@ wire [15:0] p_cmd    = post_kind == 3'd3 ? {10'd0, cond[5:0]} : cmd;
 // bytes of an operand CIR access (SIZ: 01 byte, 10 word, 11 three, 00 long)
 wire [2:0]  acc_n    = (cr_siz == 2'b01) ? 3'd1 : (cr_siz == 2'b10) ? 3'd2 :
                        (cr_siz == 2'b11) ? 3'd3 : 3'd4;
+wire        dst_pend = dst == D_CMD || dst == D_WAIT || dst == D_COND;  // told to come again
+// FRESTORE: the first long of the body names a waiting instruction
+wire        rest_mark = dst == D_REST && in_pos == 8'd0 && acc_n == 3'd4 &&
+                        cr_wdata[15:1] == PEND_MARK[15:1];
 
 // start one DMA word access; the controller continues in state n afterwards
 task automatic dma(input we, input [23:0] a, input [15:0] d, input [1:0] be, input [4:0] n);
@@ -525,6 +549,7 @@ always @(posedge clk) begin
                         dst      <= D_IDLE;
                         resp     <= R_IDLE;
                         save_wait <= 1'b0;
+                        rs_pend  <= 2'd0;
                         if (cr_word[15:8] == 8'h00) begin   // null frame: reset
                             fcc      <= 4'd0;
                             st_null  <= 1'b1;
@@ -560,11 +585,15 @@ always @(posedge clk) begin
                             ack(32'hFFFF_FFFF);
                         end else if ((dst == D_IN || dst == D_REST) && in_pos < in_len) begin
                             xn <= acc_n;
+                            if (rest_mark) begin        // (the ARM's frame has zero there)
+                                rs_pend <= cr_wdata[0] ? 2'd2 : 2'd1;
+                                rs_word <= cr_wdata[31:16];
+                            end
                             if (acc_n == 3'd1)
                                 dma(1'b1, A_RDATA + {16'd0, in_pos}, {2{cr_wdata[31:24]}},
                                     in_pos[0] ? 2'b01 : 2'b10, T_OSTD);
                             else
-                                dma(1'b1, A_RDATA + {16'd0, in_pos}, cr_wdata[31:16], 2'b11,
+                                dma(1'b1, A_RDATA + {16'd0, in_pos}, rest_mark ? 16'd0 : cr_wdata[31:16], 2'b11,
                                     acc_n == 3'd2 ? T_OSTD : T_OST1);
                         end else
                             ack(32'hFFFF_FFFF);
@@ -692,13 +721,27 @@ always @(posedge clk) begin
             end
 
         // ---- operand to the request: second word of a long, then done ----
-        T_OST1: dma(1'b1, A_RDATA + {16'd0, in_pos} + 24'd2, cr_wdata[15:0], 2'b11, T_OSTD);
+        T_OST1: dma(1'b1, A_RDATA + {16'd0, in_pos} + 24'd2, rest_mark ? 16'd0 : cr_wdata[15:0], 2'b11, T_OSTD);
         T_OSTD: begin
             in_pos <= in_pos + {5'd0, xn};
             if (dst == D_REST && in_pos + {5'd0, xn} >= in_len) begin
                 post_req  <= 1'b1;              // the whole frame is in: restore it
                 post_kind <= 3'd5;
                 dst       <= D_IDLE;
+                // the instruction that waited when the frame was saved: its dialog
+                // starts again, behind the restore
+                if (rs_pend[1]) begin
+                    cond     <= rs_word;
+                    cond_arm <= 1'b0;
+                    dead     <= 1'b0;
+                    dst      <= D_COND;
+                end else if (rs_pend[0]) begin
+                    cmd      <= rs_word;
+                    phase2   <= 1'b0;
+                    pc_done  <= 1'b0;
+                    dead     <= 1'b0;
+                    dst      <= D_CMD;
+                end
             end
             ack(32'hFFFF_FFFF);
         end
@@ -706,7 +749,9 @@ always @(posedge clk) begin
         // ---- FSAVE: the format word of the frame in the reply, then the body as
         // operand reads, last long first: the 68030 stores the body to
         // descending addresses (UM 10.2.3.3), the reply holds the frame image
-        // (format long, then the body ascending) ----
+        // (format long, then the body ascending).  An instruction that waits
+        // (told to come again, perhaps interrupted there) goes into the frame; a
+        // null FPU has no frame for it, so the bridge gives an idle one ----
         T_SFMT: begin
             out_base <= rd_q[7:0];          // offset of the last long
             out_off  <= 8'd0;
@@ -714,8 +759,21 @@ always @(posedge clk) begin
             nblk     <= 4'd1;
             out_pd   <= 1'b0;
             blk_size <= 8'd4;
-            dst      <= rd_q[15:8] == 8'h00 ? D_IDLE : D_SAVE;
-            ack({rd_q, rd_q});
+            sv_pend  <= !dst_pend ? 2'd0 : dst == D_COND ? 2'd2 : 2'd1;
+            sv_word  <= dst == D_COND ? cond : cmd;
+            if (rd_q[15:8] != 8'h00) begin
+                sv_synth <= 1'b0;
+                dst      <= D_SAVE;
+                ack({rd_q, rd_q});
+            end else if (dst_pend) begin
+                sv_synth <= 1'b1;
+                out_base <= 8'h38;
+                dst      <= D_SAVE;
+                ack({2{16'h1F38}});
+            end else begin
+                dst      <= D_IDLE;
+                ack({rd_q, rd_q});
+            end
         end
 
         // ---- result from the reply ----
@@ -724,7 +782,11 @@ always @(posedge clk) begin
             dma(1'b0, A_ADATA + {16'd0, oofs} + 24'd2, 16'd0, 2'b11, T_OLDD);
         end
         T_OLDD: begin
-            if (xn == 3'd4)      ack({ld_hi, rd_q});
+            if (dst == D_SAVE && sv_pend != 2'd0 && out_base == 8'd4)
+                ack({sv_word, PEND_MARK[15:1], sv_pend[1]});    // command/condition register
+            else if (dst == D_SAVE && sv_synth)
+                ack(out_base == 8'h38 ? 32'h5C0E_FFFF : 32'd0); // BIU flags: no exception
+            else if (xn == 3'd4) ack({ld_hi, rd_q});
             else if (xn == 3'd2) ack({rd_q, rd_q});
             else                 ack({4{oofs[0] ? rd_q[7:0] : rd_q[15:8]}});
             if (out_off + {5'd0, xn} >= blk_size) begin
@@ -836,6 +898,9 @@ always @(posedge clk) begin
         pc_pend  <= 1'b0;
         save_wait <= 1'b0;
         save_rdy <= 1'b0;
+        sv_pend  <= 2'd0;
+        sv_synth <= 1'b0;
+        rs_pend  <= 2'd0;
         dead     <= 1'b0;
         cond_arm <= 1'b0;
         rst_req  <= 1'b1;               // reset the FPU on the ARM too

@@ -96,3 +96,11 @@ T_FSD_DELTA	equ	$0840	; FSAVE whose service died: bytes pushed
 T_FSD_FMT	equ	$0841	; ... format word (null, $0000)
 T_FSD_DELTA2	equ	$0842	; FNOP; FSAVE after the service is back: bytes pushed
 T_FSD_FMT2	equ	$0843	; ... format word
+
+; t_ctxsw (a context switch inside a waiting instruction)
+T_CS_VEC	equ	$0850	; format/vector word of the interrupt's frame
+T_CS_IA		equ	$0851	; its instruction address
+T_CS_FMT	equ	$0852	; format word FSAVE gave the handler
+T_CS_CCR	equ	$0853	; the frame's command/condition register
+T_CS_CNT	equ	$0854	; interrupts taken
+T_CS_BR		equ	$0855	; mode 2: $600D branch taken, $0BAD not
