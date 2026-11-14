@@ -63,8 +63,37 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[8]    reset NVRAM to defaults for the selected monitor
 //   status[9]    CPU: 32 MHz turbo (default), Falcon 16 MHz (8 MHz by $FF8007)
 //   status[10]   timing counters at $FFF000 (falcon_tstat; off: bus error there)
+//
+// FALCON_TT (files.qip, FALCON_MACHINE=TT) builds the TT030 instead: its own
+// core name, so its own games/TT030 folder, config and NVRAM.  It changes:
+//   status[1]    monitor: mono (TT high, ST high), colour
+//   status[3]    ST-RAM: 10 MB, 4 MB
+//   status[9]    not used (a TT runs at 32 MHz)
+//   status[13:12] TT-RAM: 64 MB, 128 MB, 256 MB, none
+//   status[14]   network: a DaynaPORT at SCSI ID 4 (served by tools/falcon_net on the HPS)
+//   status[16:15] VME card: none, an ATW800/2 of 2 MB at $FEC00000, 2 MB at $FEA00000, 4 MB at $FEA00000
+//   status[17]   HDMI shows the card's picture while its timing generator is on, or the TT's always
 `include "build_id.v"
 localparam CONF_STR = {
+`ifdef FALCON_TT
+	"TT030;;",
+	"F1,IMGROM,Load TOS;",
+	"F2,STCIMGROM,Load Cartridge;",
+	"S0,ST ,Floppy A:;",
+	"S1,ST ,Floppy B:;",
+	"S4,VHDIMGHDF,SCSI 0;",
+	"S5,VHDIMGHDF,SCSI 1;",
+	"-;",
+	"O[1],Monitor,Mono,Colour;",
+	"O[3],ST-RAM,10 MB,4 MB;",
+	"O[13:12],TT-RAM,64 MB,128 MB,256 MB,None;",
+	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"O[6],UART,Serial,MIDI;",
+	"O[14],Network (SCSI 4),Off,DaynaPORT;",
+	"O[16:15],VME card,None,ATW800/2 2MB FEC00000,ATW800/2 2MB FEA00000,ATW800/2 4MB FEA00000;",
+	"O[17],HDMI shows,VME card when on,TT video;",
+	"O[10],Timing counters,Off,On;",
+`else
 	"Falcon;;",
 	"F1,IMGROM,Load TOS;",
 	"F2,STCIMGROM,Load Cartridge;",
@@ -82,6 +111,7 @@ localparam CONF_STR = {
 	"O[6],UART,Serial,MIDI;",
 	"O[9],CPU,32 MHz turbo,Falcon 16 MHz;",
 	"O[10],Timing counters,Off,On;",
+`endif
 	"-;",
 	"T[0],Reset;",
 	"T[7],Cold Reset;",
@@ -210,6 +240,18 @@ wire      por = ~&por_cnt;
 always @(posedge clk_sys) if (por && pll_locked) por_cnt <= por_cnt + 1'd1;
 
 wire cold_reset = por | status[7] | rom_download;
+
+// The machine is fixed by the build (falcon_system drops the other one's devices);
+// the TT-RAM size changes only at a cold reset
+`ifdef FALCON_TT
+wire      tt_mode = 1;
+reg [1:0] ttram_sel = 0;
+always @(posedge clk_sys) if (cold_reset)
+	ttram_sel <= status[13:12] == 2'd3 ? 2'd0 : status[13:12] + 2'd1;
+`else
+wire      tt_mode = 0;
+wire [1:0] ttram_sel = 0;
+`endif
 wire reset      = cold_reset | RESET | status[0] | status[8] | buttons[1] |
                   rom_download | cart_download | nv_busy | ~rom_loaded;
 
@@ -234,6 +276,28 @@ falcon_nvram_store nvram_store
 
 wire [7:0] r, g, b;
 wire       hs, vs, hblank, vblank, ce_pix;
+
+`ifdef MISTER_FB
+// TT: the VME card's picture is the scaler's, from the card's memory in DDR3
+wire        card_fb_en, card_pal_wr;
+wire  [4:0] card_fb_format;
+wire [11:0] card_fb_width, card_fb_height;
+wire [31:0] card_fb_base;
+wire [13:0] card_fb_stride;
+wire  [7:0] card_pal_addr;
+wire [23:0] card_pal_rgb;
+assign FB_EN          = card_fb_en & ~status[17];
+assign FB_FORMAT      = card_fb_format;
+assign FB_WIDTH       = card_fb_width;
+assign FB_HEIGHT      = card_fb_height;
+assign FB_BASE        = card_fb_base;
+assign FB_STRIDE      = card_fb_stride;
+assign FB_FORCE_BLANK = 0;
+assign FB_PAL_CLK     = clk_sys;
+assign FB_PAL_ADDR    = card_pal_addr;
+assign FB_PAL_DOUT    = card_pal_rgb;
+assign FB_PAL_WR      = card_pal_wr;
+`endif
 wire signed [15:0] audio_l, audio_r;
 wire       fdd_led, hdd_led;
 wire       midi_tx, ser_tx;
@@ -245,10 +309,25 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.cold_reset(cold_reset),
 	.por(por),
 
-	.ram_mb(status[3] ? 4'd4 : 4'd14),
+	.ram_mb(status[3] ? 4'd4 : tt_mode ? 4'd10 : 4'd14),   // a TT has 10 MB of ST-RAM at most
 	.ram_tos(ram_tos),
+`ifdef FALCON_TT
+	.monitor(status[1] ? 2'b10 : 2'b00),                     // mono or colour: the TT's GPIP7
+	.cpu_turbo(1'b1),
+	.net_on(status[14]),
+	.vme_sel(status[16:15]),
+`else
 	.monitor(status[2:1] == 2'd0 ? 2'b10 : status[2:1] == 2'd1 ? 2'b01 : status[2:1] == 2'd2 ? 2'b11 : 2'b00),
 	.cpu_turbo(~status[9]),
+	.net_on(1'b0),
+	.vme_sel(2'd0),
+`endif
+	.tt_mode(tt_mode), .ttram_sel(ttram_sel),
+`ifdef MISTER_FB
+	.fb_en(card_fb_en), .fb_format(card_fb_format), .fb_width(card_fb_width), .fb_height(card_fb_height),
+	.fb_base(card_fb_base), .fb_stride(card_fb_stride),
+	.fb_pal_wr(card_pal_wr), .fb_pal_addr(card_pal_addr), .fb_pal_rgb(card_pal_rgb),
+`endif
 	.tstat_en(status[10]),
 
 	.ld_wr(ioctl_wr & (rom_download | cart_download)),

@@ -154,6 +154,19 @@ module falcon_videl #(
 
 	input       [1:0] monitor_type,    // 00 mono, 01 RGB, 10 VGA, 11 TV
 
+	// TT build (falcon_ttshift): the TT shifter's modes as Videl register sets.  With tt
+	// set the picture always comes from the Falcon palette, which holds the TT's 256
+	// colours: modes of up to 16 colours take the 16 of the TT's colour bank, ST high
+	// takes entries 254/255 (Hatari's "duochrome").  tt = 0 changes nothing.
+	input             tt,
+	input             tt_set,          // load the register set of tt_res (one clock)
+	input       [2:0] tt_res,          // $FF8262 bits 10:8
+	input       [3:0] tt_bank,         // $FF8262 bits 3:0
+	input             tt_duo_inv,      // $FF8400 bit 1: ST high's colours swapped
+	input             tt_pal_we,       // a TT palette entry (4:4:4) into the Falcon palette
+	input       [7:0] tt_pal_wa,
+	input      [11:0] tt_pal_wd,
+
 	// video fetch port
 	output reg        vid_req,
 	output reg [23:3] vid_addr,
@@ -191,6 +204,7 @@ reg  [1:0] st_shift;
 reg  [7:0] hsc64, hsc65;
 reg [15:0] spshift;
 reg        st_mode;                 // Hatari videl.bUseSTShifter
+reg        tthi;                    // TT high: 1 bit per pixel, 0 white, 1 black (Hatari)
 reg [15:0] hht, hbb, hbe, hdb, hde, hss, hfs, hee;
 reg [15:0] vft, vbb, vbe, vdb, vde, vss;
 reg [15:0] vco, vmd;
@@ -235,12 +249,16 @@ reg  [7:0] fpal_wa;
 reg [17:0] fpal_wd;
 wire [7:0] fpal_ca = fpal_we ? fpal_wa : bus_addr[9:2];
 
+wire        fpal_w   = fpal_we | tt_pal_we;
+wire  [7:0] fpal_wa2 = tt_pal_we ? tt_pal_wa : fpal_wa;
+wire [17:0] fpal_wd2 = tt_pal_we ? {tt_pal_wd[11:8], tt_pal_wd[11:10], tt_pal_wd[7:4], tt_pal_wd[7:6],
+                                    tt_pal_wd[3:0], tt_pal_wd[3:2]} : fpal_wd;
 always @(posedge clk) begin
-	if (fpal_we) fpal_vid[fpal_wa] <= fpal_wd;
+	if (fpal_w) fpal_vid[fpal_wa2] <= fpal_wd2;
 	fpal_vq <= fpal_vid[fpal_vaddr];
 end
 always @(posedge clk) begin
-	if (fpal_we) fpal_cpu[fpal_ca] <= fpal_wd;
+	if (fpal_w) fpal_cpu[tt_pal_we ? tt_pal_wa : fpal_ca] <= fpal_wd2;
 	fpal_cq <= fpal_cpu[fpal_ca];
 end
 
@@ -328,7 +346,7 @@ always @(posedge clk) begin
 		base_hi <= 8'h00; base_mid <= 8'h00; base_lo <= 8'h00;
 		sync_mode <= 2'd0;
 		lof <= 9'd0;
-		st_shift <= 2'd0;
+		st_shift <= 2'd0; tthi <= 1'b0;
 		hsc64 <= 8'd0; hsc65 <= 8'd0;
 		spshift <= 16'd0;
 		hfs <= 16'd0; hee <= 16'd0;
@@ -392,6 +410,60 @@ always @(posedge clk) begin
 			end else begin
 				bus_dout <= rd_reg;
 			end
+		end
+
+		// ---- TT: a mode's register set (EmuTOS videl.c vga_init_table and
+		// set_videl_vga: modes $92, $99, $98, $1A, $13 on a VGA monitor) ----
+		if (tt_set) begin
+			lof <= 9'd0; hsc64 <= 8'd0; hsc65 <= 8'd0; vco <= 16'h0186; tthi <= 1'b0;
+			case (tt_res)
+			3'd0, 3'd1: begin   // ST low, ST mid: line doubled 320x200 / 640x200
+				st_mode <= 1'b1; st_shift <= tt_res[1:0]; spshift <= {12'd0, tt_bank};
+				lwd <= 16'h0050; vmd <= tt_res[0] ? 16'h0009 : 16'h0005;
+				hht <= 16'h0017; hbb <= 16'h0012; hbe <= 16'h0001;
+				hdb <= 16'h020E; hde <= 16'h000D; hss <= 16'h0011;
+				vft <= 16'h0419; vbb <= 16'h03AF; vbe <= 16'h008F;
+				vdb <= 16'h008F; vde <= 16'h03AF; vss <= 16'h0415;
+			end
+			3'd4: begin         // TT medium: 640x480, 16 colours
+				st_mode <= 1'b0; st_shift <= 2'd0; spshift <= {12'd0, tt_bank};
+				lwd <= 16'h00A0; vmd <= 16'h0008;
+				hht <= 16'h00C6; hbb <= 16'h008D; hbe <= 16'h0015;
+				hdb <= 16'h02A3; hde <= 16'h007C; hss <= 16'h0096;
+				vft <= 16'h0419; vbb <= 16'h03FF; vbe <= 16'h003F;
+				vdb <= 16'h003F; vde <= 16'h03FF; vss <= 16'h0415;
+			end
+			3'd7: begin         // TT low: 320x480, 256 colours
+				st_mode <= 1'b0; st_shift <= 2'd0; spshift <= 16'h0010;
+				lwd <= 16'h00A0; vmd <= 16'h0004;
+				hht <= 16'h00C6; hbb <= 16'h008D; hbe <= 16'h0015;
+				hdb <= 16'h029A; hde <= 16'h007B; hss <= 16'h0096;
+				vft <= 16'h0419; vbb <= 16'h03FF; vbe <= 16'h003F;
+				vdb <= 16'h003F; vde <= 16'h03FF; vss <= 16'h0415;
+			end
+			3'd6: begin         // TT high: 1280x960 mono, one pixel a clock (32 MHz, VCO bit 2
+				// clear): a 1440-clock line (22.2 kHz) and 1000 lines, 22.2 Hz; a real
+				// TT runs 95 MHz at 71 Hz, but the scaler keeps the frame
+				tthi <= 1'b1; vco <= 16'h0182;
+				st_mode <= 1'b0; st_shift <= 2'd0; spshift <= 16'h0400;
+				lwd <= 16'h0050; vmd <= 16'h0008;
+				// DE from clock 100 to 1380 (HDB in the line before, the DE start wraps);
+				// HDB in the second half line (odd VFC) shows its line from the next line
+				// start, so the blank window is the display window a line (2) later
+				hht <= 16'h0166; hbb <= 16'h014A; hbe <= 16'h0032;
+				hdb <= 16'h0330; hde <= 16'h0000; hss <= 16'h0154;
+				vft <= 16'h07CF; vbb <= 16'h07AA; vbe <= 16'h002A;
+				vdb <= 16'h0028; vde <= 16'h07A8; vss <= 16'h07C6;
+			end
+			default: begin      // ST high: 640x400
+				st_mode <= 1'b0; st_shift <= 2'd0; spshift <= 16'h0400;
+				lwd <= 16'h0028; vmd <= 16'h0008;
+				hht <= 16'h00C6; hbb <= 16'h008D; hbe <= 16'h0015;
+				hdb <= 16'h0273; hde <= 16'h0050; hss <= 16'h0096;
+				vft <= 16'h0419; vbb <= 16'h03AF; vbe <= 16'h008F;
+				vdb <= 16'h008F; vde <= 16'h03AF; vss <= 16'h0415;
+			end
+			endcase
 		end
 
 		// ---- register side effects on the strobe ----
@@ -1037,12 +1109,14 @@ assign vc_rd = de_s ? {cur_line_addr + {12'd0, consumed}, 1'b0} : {nxt_line_addr
 //----------------------------------------------------------------------------
 // true colour pixel: in TC mode the word is shown as it is popped
 wire [15:0] tc_word = wf_head;
-wire        use_spal = lt_st && (lt_bpl != 3'd4);
+wire        use_spal = lt_st && (lt_bpl != 3'd4) && !tt;
 wire  [7:0] pal_idx  = !de_s ? 8'd0 :
+                       (tt && ln_bpl == 3'd0) ? {7'h7F, pix_idx[0] ^ tt_duo_inv} :
+                       (tt && ln_bpl <= 3'd2) ? {lt_bank, pix_idx[3:0]} :
                        (ln_bpl == 3'd2 && !ln_st) ? {lt_bank, pix_idx[3:0]} : pix_idx;
 
 reg        s0_detb, s1_detb;
-reg        s1_tc, s1_de, s1_vis, s1_hs, s1_vs, s1_ce, s1_spal, s1_hb, s1_vb;
+reg        s1_tc, s1_de, s1_vis, s1_hs, s1_vs, s1_ce, s1_spal, s1_hb, s1_vb, s1_thi, s1_tpx;
 reg [15:0] s1_tcw;
 
 always @(posedge clk) begin
@@ -1055,7 +1129,7 @@ always @(posedge clk) begin
 end
 
 // stage 1 (aligned with the palette RAM address register)
-reg        s0_tc, s0_de, s0_vis, s0_hs, s0_vs, s0_ce, s0_spal, s0_hb, s0_vb;
+reg        s0_tc, s0_de, s0_vis, s0_hs, s0_vs, s0_ce, s0_spal, s0_hb, s0_vb, s0_thi, s0_tpx;
 reg [15:0] s0_tcw;
 always @(posedge clk) begin
 	s0_ce   <= ce_pix_t;
@@ -1071,11 +1145,14 @@ always @(posedge clk) begin
 	s0_hs   <= hsync_s ^ ~lt_hsync_pol;
 	s0_vs   <= vsync_s ^ ~lt_vsync_pol;
 	s0_spal <= use_spal;
+	s0_thi  <= tt && tthi;
+	s0_tpx  <= !de_s || pix_idx[0];     // border black
 	end
 
 	s1_tc <= s0_tc; s1_tcw <= s0_tcw; s1_de <= s0_de; s1_detb <= s0_detb; s1_vis <= s0_vis;
 	s1_hb <= s0_hb; s1_vb <= s0_vb; s1_hs <= s0_hs; s1_vs <= s0_vs;
 	s1_spal <= s0_spal;
+	s1_thi <= s0_thi; s1_tpx <= s0_tpx;
 end
 
 function [7:0] ste8(input [3:0] c);
@@ -1096,6 +1173,8 @@ always @(posedge clk) begin
 		de_tb  <= s1_detb;
 		if (!s1_vis) begin
 			r <= 8'd0; g <= 8'd0; b <= 8'd0;
+		end else if (s1_thi) begin
+			r <= {8{!s1_tpx}}; g <= {8{!s1_tpx}}; b <= {8{!s1_tpx}};
 		end else if (s1_tc && s1_de) begin
 			r <= {s1_tcw[15:11], s1_tcw[15:13]};
 			g <= {s1_tcw[10:5],  s1_tcw[10:9]};

@@ -25,12 +25,28 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_psg.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp_timer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp_usart.sv
+set_global_assignment -name VERILOG_FILE rtl/scc/scc.v
+set_global_assignment -name VERILOG_FILE rtl/scc/scc_chan.v
+set_global_assignment -name VERILOG_FILE rtl/scu/scu.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vme/vme_atw800.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_acia.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd_keymap.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_nvram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_blitter.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_crossbar.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ttdma.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ttshift.sv
+# The machine: FALCON_MACHINE=TT builds the TT030 core, which has no DSP or IDE:
+#   FALCON_MACHINE=TT quartus_sh --flow compile Falcon
+if {[info exists ::env(FALCON_MACHINE)] && $::env(FALCON_MACHINE) eq "TT"} {
+	set_global_assignment -name VERILOG_MACRO "FALCON_TT=1"
+	set_global_assignment -name VERILOG_MACRO "FALCON_NO_DSP=1"
+	set_global_assignment -name VERILOG_MACRO "FALCON_NO_IDE=1"
+	# the VME card's picture is the scaler's frame buffer mode (rtl/vme/vme_atw800.sv)
+	set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
+	set_global_assignment -name VERILOG_MACRO "MISTER_FB_PALETTE=1"
+}
 # Bring-up builds without some devices (testing only):
 #   FALCON_BRINGUP="NO_IDE NO_FDC NO_DSP" quartus_sh --flow compile Falcon
 if {[info exists ::env(FALCON_BRINGUP)]} {

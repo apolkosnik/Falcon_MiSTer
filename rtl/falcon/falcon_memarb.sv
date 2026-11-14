@@ -30,7 +30,8 @@
 //  line, so the buffer never holds stale data; it is emptied whenever the
 //  blitter does not own the bus (d2_hold low).  The blitter's writes are
 //  acknowledged when the command is issued (their data is in the buffer and
-//  the next command waits for this one).
+//  the next command waits for this one).  A VME card's 2D engine is on the
+//  same port in a TT and moves whole 64-bit words through it (d2_wide).
 //
 //  DMA accesses (d0..d2) follow Hatari's memory banks: ST-RAM is read and
 //  written directly (SysMem_wget reads the RAM, not the ROM vectors), ROM
@@ -52,6 +53,7 @@ module falcon_memarb
 	input             clk,
 	input             reset,       // power-on only: the loader runs while the machine is in reset
 	input       [3:0] ram_mb,      // ST-RAM size in MB: DMA writes stop at ram_mb * 1 MB
+	input      [28:0] tt_top,      // TT: the end of TT-RAM ($01000000 up), which d1 may reach; 0 = none
 
 	// video: 4 x 64-bit read bursts
 	input             vid_req,
@@ -77,11 +79,12 @@ module falcon_memarb
 
 	input             d1_req,
 	input             d1_we,
-	input      [23:1] d1_addr,
+	input      [28:1] d1_addr,      // TT-RAM too (the TT's SCSI DMA)
 	input       [1:0] d1_be,
 	input      [15:0] d1_wdata,
 	output reg [15:0] d1_rdata,
 	output reg        d1_ack,
+	output reg        d1_bad,      // with d1_ack: not memory, no access made
 
 	input             d2_req,
 	input             d2_we,
@@ -91,6 +94,11 @@ module falcon_memarb
 	output reg [15:0] d2_rdata,
 	output reg        d2_ack,
 	input             d2_hold,     // the blitter owns the bus: its read buffer may keep lines
+	input             d2_vme,      // d2 is a VME card's engine in its own memory: no ST-RAM limits
+	input             d2_wide,     // d2 moves whole 64-bit words: d2_addr[2:1] is not used, a read
+	input      [63:0] d2_wdata64,  //   gives d2_rdata64, a write takes d2_wdata64 by d2_be8
+	input       [7:0] d2_be8,      //   ([7] = lowest address)
+	output reg [63:0] d2_rdata64,
 
 	input             d3_req,
 	input             d3_we,
@@ -103,7 +111,7 @@ module falcon_memarb
 	// CPU: 32 bit, level request, one-clock acknowledge
 	input             cpu_req,
 	input             cpu_we,
-	input      [23:2] cpu_addr,
+	input      [28:2] cpu_addr,    // [28:24] non-zero: TT-RAM (TT mode), DDR3 0x31000000+ ($10000000+: 0x2F000000)
 	input       [3:0] cpu_be,      // [3] = lowest address (D31..D24)
 	input      [31:0] cpu_wdata,
 	output reg [31:0] cpu_rdata,
@@ -118,7 +126,7 @@ module falcon_memarb
 
 	// snoop: a non-CPU master wrote RAM
 	output reg        snoop_we,
-	output reg [23:0] snoop_addr,
+	output reg [28:0] snoop_addr,
 
 	// MiSTer DDRAM interface
 	input             DDRAM_BUSY,
@@ -152,6 +160,7 @@ function [63:0] merge64;
 endfunction
 
 localparam [28:0] DDR_BASE = 29'h6000000;    // byte 0x30000000 / 8
+localparam [28:0] DDR_TOP16 = 29'h5E00000;   // byte 0x2F000000 / 8
 
 // loader: one byte write is captured and held until the arbiter takes it
 reg        ld_pend = 0;
@@ -172,7 +181,7 @@ reg        cmd_burst;   // a CPU burst read
 
 // the selected master's request, in guest big-endian form
 reg        g_we;
-reg [23:3] g_addr;
+reg [28:3] g_addr;
 reg [63:0] g_wdata;
 reg  [7:0] g_be;        // [7] = lowest address
 reg  [2:0] g_owner;
@@ -183,7 +192,7 @@ reg        g_ok;        // 0: a DMA access outside writable/readable memory, no 
 wire [23:0] ram_top = {ram_mb, 20'd0};
 
 always @* begin : sel
-	reg [23:0] wa;
+	reg [28:0] wa;
 	g_any = 1; g_we = 0; g_addr = 0; g_wdata = 0; g_be = 0; g_owner = M_CPU; g_sub = 0; g_ok = 1;
 	if (vid_req) begin
 		g_owner = M_VID; g_addr = vid_addr; g_be = 8'hFF;
@@ -194,16 +203,17 @@ always @* begin : sel
 		g_owner = M_D0; g_we = d0_we; g_addr = d0_addr[23:3]; g_sub = d0_addr[2:1];
 		g_wdata = {4{d0_wdata}}; g_be = {6'd0, d0_be} << (6 - 2 * d0_addr[2:1]);
 	end else if (d1_req) begin
-		g_owner = M_D1; g_we = d1_we; g_addr = d1_addr[23:3]; g_sub = d1_addr[2:1];
+		g_owner = M_D1; g_we = d1_we; g_addr = d1_addr[28:3]; g_sub = d1_addr[2:1];
 		g_wdata = {4{d1_wdata}}; g_be = {6'd0, d1_be} << (6 - 2 * d1_addr[2:1]);
 	end else if (d2_req) begin
 		g_owner = M_D2; g_we = d2_we; g_addr = d2_addr[23:3]; g_sub = d2_addr[2:1];
 		g_wdata = {4{d2_wdata}}; g_be = {6'd0, d2_be} << (6 - 2 * d2_addr[2:1]);
+		if (d2_wide) begin g_wdata = d2_wdata64; g_be = d2_be8; end
 	end else if (d3_req) begin
 		g_owner = M_D3; g_we = d3_we; g_addr = d3_addr[23:3]; g_sub = d3_addr[2:1];
 		g_wdata = {4{d3_wdata}}; g_be = {6'd0, d3_be} << (6 - 2 * d3_addr[2:1]);
 	end else if (cpu_req) begin
-		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_burst ? {cpu_addr[23:5], 2'b00} : cpu_addr[23:3]; g_sub = {cpu_addr[2], 1'b0};
+		g_owner = M_CPU; g_we = cpu_we; g_addr = cpu_burst ? {cpu_addr[28:5], 2'b00} : cpu_addr[28:3]; g_sub = {cpu_addr[2], 1'b0};
 		g_wdata = {2{cpu_wdata}}; g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
 	end else g_any = 0;
 
@@ -213,7 +223,9 @@ always @* begin : sel
 		if (g_we)
 			g_ok = (wa < ram_top) && (wa[23:3] != 21'd0 || g_owner == M_D1);
 		else
-			g_ok = (wa < ram_top) || (wa[23:19] == 5'b11100) || (wa[23:17] == 7'b1111101);
+			g_ok = (wa < ram_top) || (wa[28:24] == 5'd0 && ((wa[23:19] == 5'b11100) || (wa[23:17] == 7'b1111101)));
+		if (g_owner == M_D1 && wa[28:24] != 5'd0 && wa < tt_top) g_ok = 1;
+		if (g_owner == M_D2 && d2_vme) g_ok = 1;
 	end
 end
 
@@ -236,7 +248,7 @@ wire        ack_blk = d0_ack | d1_ack | d2_ack | d3_ack | cpu_ack;
 
 always @(posedge clk) begin
 	vid_ack <= 0; vid_valid <= 0;
-	d0_ack <= 0; d1_ack <= 0; d2_ack <= 0; cpu_ack <= 0;
+	d0_ack <= 0; d1_ack <= 0; d2_ack <= 0; cpu_ack <= 0; d1_bad <= 0;
 	d3_ack <= 0;
 	snoop_we <= 0;
 	cpu_beat <= 0;
@@ -256,7 +268,7 @@ always @(posedge clk) begin
 			// (g_ok is checked for d0..d2 only; the d3 mailbox is always a DDR3 cycle)
 			case (g_owner)
 				M_D0:    begin d0_rdata <= 16'h0000; d0_ack <= 1; end
-				M_D1:    begin d1_rdata <= 16'h0000; d1_ack <= 1; end
+				M_D1:    begin d1_rdata <= 16'h0000; d1_ack <= 1; d1_bad <= 1; end
 				default: begin d2_rdata <= 16'h0000; d2_ack <= 1; end
 			endcase
 		end
@@ -264,7 +276,10 @@ always @(posedge clk) begin
 			owner      <= g_owner;
 			sub        <= g_sub;
 			cmd_we     <= g_we;
-			DDRAM_ADDR <= DDR_BASE | {8'd0, g_addr};
+			// guest $00000000-$0FFFFFFF at DDR3 0x30000000 (ST-RAM, ROM, TT-RAM to 240 MB); the
+			// last 16 MB of 256 MB TT-RAM ($10000000-$10FFFFFF) at 0x2F000000, unused by the
+			// framework (scaler 0x20000000, Main's framebuffer 0x22000000)
+			DDRAM_ADDR <= g_addr[28] ? (DDR_TOP16 | {8'd0, g_addr[23:3]}) : (DDR_BASE | {4'd0, g_addr[27:3]});
 			DDRAM_BURSTCNT <= (g_owner == M_VID || (g_owner == M_CPU && cpu_burst && !g_we)) ? 8'd4 : 8'd1;
 			cmd_burst  <= (g_owner == M_CPU && cpu_burst && !g_we);
 			DDRAM_DIN  <= swap64(g_wdata);
@@ -281,7 +296,7 @@ always @(posedge clk) begin
 			end
 			if (g_we && g_owner != M_CPU) begin
 				owr_we   <= 1;
-				owr_addr <= g_addr;
+				owr_addr <= g_addr[23:3];
 			end
 			if (g_we && g_owner == M_D2) d2_ack <= 1;
 			if (g_we && b_v[0] && b_tag0 == g_addr) b_dat0 <= merge64(b_dat0, g_wdata, g_be);
@@ -318,6 +333,7 @@ always @(posedge clk) begin
 				M_D1:  begin d1_rdata <= rd_be[63 - 16 * sub -: 16]; d1_ack <= 1; st <= S_IDLE; end
 				M_D2:  begin
 					d2_rdata <= rd_be[63 - 16 * sub -: 16]; d2_ack <= 1; st <= S_IDLE;
+					d2_rdata64 <= rd_be;
 					if (b_lru) begin b_dat1 <= rd_be; b_tag1 <= DDRAM_ADDR[20:0]; b_v[1] <= 1; end
 					else       begin b_dat0 <= rd_be; b_tag0 <= DDRAM_ADDR[20:0]; b_v[0] <= 1; end
 					b_lru <= !b_lru;
@@ -346,6 +362,7 @@ always @(posedge clk) begin
 
 	if (d2_hit) begin
 		d2_rdata <= b_line[63 - 16 * d2_addr[2:1] -: 16];
+		d2_rdata64 <= b_line;
 		d2_ack   <= 1;
 		b_lru    <= b_h0;
 	end
