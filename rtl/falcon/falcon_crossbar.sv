@@ -1113,7 +1113,10 @@ always @(posedge clk) begin
 		end
 
 		// ---------------- write back working copies ----------------
-		sndint_r <= v_snd; soundint_r <= v_scnt;
+		// STe/TT: the line is the mono monitor's detect too (GPIP 7), so it is low only
+		// while a frame plays, never from a register write with nothing playing
+		sndint_r   <= (tt_mode && !v_play_run) ? 1'b1 : v_snd;
+		soundint_r <= (tt_mode && !v_play_run) ? 1'b1 : v_scnt;
 		r_8900 <= v_8900; r_8901 <= v_8901;
 		play_run <= v_play_run; play_loop <= v_play_loop; play_prime <= v_play_prime;
 		play_fstart <= v_play_fstart; play_fend <= v_play_fend; play_pos <= v_play_pos;

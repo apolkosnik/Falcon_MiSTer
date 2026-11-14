@@ -27,6 +27,7 @@ start:	move.w	#$2700,sr
 	move.b	#$00,$e(a0)		; end $002040
 	move.b	#$20,$10(a0)
 	move.b	#$40,$12(a0)
+	move.b	(a6),d3			; GPIP 7 with nothing playing: 1 (a colour monitor)
 	clr.b	$18(a6)
 	move.b	#1,$1e(a6)
 	move.b	#8,$18(a6)		; Timer A: event count
@@ -42,6 +43,12 @@ w:	subq.l	#1,d2
 	lea	t_n(pc),a1
 	bsr.s	puts
 	move.l	d4,d0
+	bsr.s	hex8
+	move.b	#10,(a5)+
+	lea	t_g7(pc),a1
+	bsr.s	puts
+	moveq	#0,d0
+	move.b	d3,d0
 	bsr.s	hex8
 	move.b	#10,(a5)+
 	lea	t_be(pc),a1
@@ -83,3 +90,4 @@ h3:	move.b	d1,(a5)+
 	rts
 t_n:	dc.b	'Timer A interrupts ',0
 t_be:	dc.b	'bus errors ',0
+t_g7:	dc.b	'GPIP idle ',0
