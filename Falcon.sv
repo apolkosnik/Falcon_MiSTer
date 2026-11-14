@@ -252,8 +252,19 @@ always @(posedge clk_sys) if (cold_reset)
 wire      tt_mode = 0;
 wire [1:0] ttram_sel = 0;
 `endif
+// A TT has a 68882, and TOS 3.06 does not start right when it appears late: after power
+// on the machine waits for the HPS service (tools/falcon_fpu), four seconds at most, so
+// the service may be started as the core is.
+wire fpu_ok;
+`ifdef FALCON_TT
+reg [27:0] fpu_wait = 0;
+always @(posedge clk_sys) if (!fpu_wait[27]) fpu_wait <= fpu_ok ? 28'h8000000 : fpu_wait + 1'd1;
+wire fpu_hold = ~fpu_wait[27];
+`else
+wire fpu_hold = 0;
+`endif
 wire reset      = cold_reset | RESET | status[0] | status[8] | buttons[1] |
-                  rom_download | cart_download | nv_busy | ~rom_loaded;
+                  rom_download | cart_download | nv_busy | ~rom_loaded | fpu_hold;
 
 wire [23:0] ld_addr = rom_download ? {5'b11100, ioctl_addr[18:0]} : {7'b1111101, ioctl_addr[16:0]};
 wire        ld_busy;
@@ -307,6 +318,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.clk(clk_sys),
 	.reset(reset),
 	.cold_reset(cold_reset),
+	.fpu_ok(fpu_ok),
 	.por(por),
 
 	.ram_mb(status[3] ? 4'd4 : tt_mode ? 4'd10 : 4'd14),   // a TT has 10 MB of ST-RAM at most

@@ -23,6 +23,7 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 	input       [1:0] ttram_sel,    // TT-RAM: 0 none, 1 64 MB, 2 128 MB, 3 256 MB
 	input             tstat_en,     // OSD: the timing counters at $FFF000 (falcon_tstat); 0: bus error there
 	input             net_on,       // OSD: a DaynaPORT at SCSI ID 4 (falcon_scsi, tools/falcon_net)
+	output            fpu_ok,       // the HPS FPU service answers (falcon_fpu_bridge)
 	input       [1:0] vme_sel,      // OSD, TT: the VME card: 0 none, an ATW800/2: 1 2 MB at $FEC00000, 2 2 MB at $FEA00000, 3 4 MB at $FEA00000
 
 	// ROM/cartridge loader
@@ -410,6 +411,7 @@ wire [23:1] d3_addr;
 wire  [1:0] d3_be;
 wire [15:0] d3_wdata, d3_rdata;
 wire        fpu_present;
+assign      fpu_ok = fpu_present;
 // shared by two masters: p3 (the FPU bridge or the probe) and the SCSI DaynaPORT's rings
 wire        p3_req, p3_we, p3_ack;
 wire [23:1] p3_addr;
@@ -983,6 +985,7 @@ wire [15:0] ssi_rx_data, ssi_tx_data;
 falcon_crossbar #(.CLK_HZ(CLK_HZ)) crossbar
 (
 	.clk(clk), .reset(dev_reset),
+	.tt_mode(tt_mode),
 	`DEVBUS(sel_xbar), .bus_addr(dev_addr[6:1]), .bus_dout(xbar_dout), .bus_ack(xbar_ack), .bus_berr(xbar_berr),
 	.dma_req(snd_req), .dma_we(snd_we), .dma_addr(snd_addr), .dma_be(snd_be),
 	.dma_wdata(snd_wdata), .dma_rdata(snd_rdata), .dma_ack(snd_ack),

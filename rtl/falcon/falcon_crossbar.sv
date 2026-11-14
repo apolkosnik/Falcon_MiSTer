@@ -210,6 +210,7 @@ module falcon_crossbar #(
 )(
 	input                clk,
 	input                reset,
+	input                tt_mode,     // STe/TT DMA sound: a play frame's end always reaches the MFP
 
 	input                bus_cs,
 	input                bus_stb,
@@ -503,8 +504,10 @@ reg  [15:0] v_play_save, v_save;
 task line_upd(input is_play, input bitv);
 	reg en_g, en_t;
 	begin
-		en_g = is_play ? v_8900[0] : v_8900[1];
-		en_t = is_play ? v_8900[2] : v_8900[3];
+		// the Falcon's enables are $FF8900's high byte, which an STe or TT has not:
+		// there software writes the register as a word and the lines stay wired
+		en_g = tt_mode ? is_play : is_play ? v_8900[0] : v_8900[1];
+		en_t = tt_mode ? is_play : is_play ? v_8900[2] : v_8900[3];
 		v_snd  = en_g ? bitv : 1'b1;
 		v_scnt = en_t ? bitv : 1'b1;
 	end
