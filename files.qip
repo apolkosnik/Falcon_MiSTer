@@ -25,6 +25,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_psg.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp_timer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_mfp_usart.sv
+set_global_assignment -name VERILOG_FILE rtl/scc/scc.v
+set_global_assignment -name VERILOG_FILE rtl/scc/scc_chan.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_acia.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd_keymap.sv

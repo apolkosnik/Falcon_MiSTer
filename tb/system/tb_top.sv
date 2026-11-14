@@ -100,6 +100,10 @@ assign dbg_cp_berr  = system.cp_berr;
 assign dbg_cp_rdata = system.cp_rdata;
 assign dbg_fpu_present = system.fpu_present;
 
+// +serloop: the serial port's TxD wired to its RxD
+reg ser_loop;
+initial ser_loop = $test$plusargs("serloop") != 0;
+
 wire        DDRAM_BUSY, DDRAM_DOUT_READY, DDRAM_RD, DDRAM_WE;
 wire  [7:0] DDRAM_BURSTCNT, DDRAM_BE;
 wire [28:0] DDRAM_ADDR;
@@ -125,7 +129,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
 	.r(r), .g(g), .b(b), .hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank), .ce_pix(ce_pix),
 	.audio_l(audio_l), .audio_r(audio_r),
-	.midi_rx(1'b1), .midi_tx(midi_tx), .ser_rx(1'b1), .ser_tx(ser_tx),
+	.midi_rx(1'b1), .midi_tx(midi_tx), .ser_rx(ser_loop ? ser_tx : 1'b1), .ser_tx(ser_tx),
 	.fdd_led(), .hdd_led(),
 	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
