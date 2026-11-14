@@ -12,7 +12,7 @@ verilator --binary --timing --build -j 8 -O2 -Wno-fatal -Wno-WIDTH \
  --top-module tb_bus --Mdir $O \
  -I$R/AP68030/rtl -I$R/AP68030/rtl/core -I$R/falcon -I$R/falcon/dsp \
  $T/tb_bus.sv tb/system/tb_top.sv tb/system/ddr3_model.sv \
- $R/AP68030/rtl/*.v $R/falcon/*.sv $R/falcon/dsp/*.sv \
+ $R/AP68030/rtl/*.v $R/falcon/*.sv $R/falcon/dsp/*.sv $R/scc/*.v \
  > $O.build.log 2>&1 || { tail -30 $O.build.log; exit 1; }
 ./$O/Vtb_bus | tee $O.run.log
 ./$O/Vtb_bus +falcon | tee $O.falcon.log

@@ -492,7 +492,7 @@ wire [15:0] blit_dout, dsp_dout, mfp_dout, acia_dout, tstat_dout;
 wire        ide_ack, combel_ack, videl_ack, fdc_ack, psg_ack, xbar_ack, nvram_ack;
 wire        blit_ack, dsp_ack, mfp_ack, acia_ack, tstat_ack;
 wire        xbar_berr, fdc_berr;
-reg   [7:0] scc_ptr;
+wire  [7:0] scc_dout;
 
 always @* begin
 	dev_dout = 16'hFFFF;
@@ -507,7 +507,7 @@ always @* begin
 		else if (sel_xbar)   begin dev_dout = xbar_dout;   dev_ack = xbar_ack;   dev_berr = xbar_berr; end
 		else if (sel_nvram)  begin dev_dout = nvram_dout;  dev_ack = nvram_ack;  end
 		else if (sel_blit)   begin dev_dout = blit_dout;   dev_ack = blit_ack;   end
-		else if (sel_scc)    begin dev_dout = 16'h2C2C;    dev_ack = dev_stb;    end  // RR0: Tx empty, DCD, CTS
+		else if (sel_scc)    begin dev_dout = {scc_dout, scc_dout}; dev_ack = dev_stb; end   // both lanes, as Hatari
 		else if (sel_dsp)    begin dev_dout = dsp_dout;    dev_ack = dsp_ack;    end
 		else if (sel_mfp)    begin dev_dout = mfp_dout;    dev_ack = mfp_ack;    end
 		else if (sel_acia)   begin dev_dout = acia_dout;   dev_ack = acia_ack;   end
@@ -588,7 +588,7 @@ wire       mfp_irq, mfp_iack_ack, mfp_iack_spur;
 reg        mfp_iack;
 wire [7:0] mfp_vector;
 wire       acia_irq, fdc_irq, ide_irq, blit_busy, sndint, soundint;
-wire       mfp_tdo;
+wire       mfp_tdo, mfp_so;
 falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 (
 	.clk(clk), .reset(dev_reset),
@@ -598,7 +598,37 @@ falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 	.gpip_out(), .gpip_oe(),
 	.tai(soundint), .tbi(videl_de_tb),   // one event per source line (Hatari's ST line timing)
 	.tao(), .tbo(), .tco(), .tdo(mfp_tdo),
-	.si(ser_rx), .so(ser_tx)
+	.si(ser_rx), .so(mfp_so)
+);
+
+// ---- SCC 85C30 ($FF8C81-$FF8C87): channel B is the Falcon's serial port, A the LAN
+// port.  PCLK 8 MHz; RTxCA/B = PCLK4, a 3.672 MHz oscillator; TRxCB = BCLKA, the MFP's
+// 2.4576 MHz; TRxCA = SYNCA, not connected (Hatari's scc.c).  Channel B shares the
+// MiSTer UART with the MFP's USART: both idle high, so whichever is used is heard,
+// and both receive. ----
+wire [7:0] scc_vector;
+wire       scc_irq, scc_vector_en;
+wire [1:0] scc_txd;
+reg        scc_iack;
+assign ser_tx = mfp_so & scc_txd[1];
+
+reg  [25:0] scc_pclk_acc, scc_pclk4_acc, scc_bclk_acc;
+reg         scc_pclk_ce, scc_pclk4_ce, scc_bclk_ce;
+always @(posedge clk) begin
+	{scc_pclk_ce,  scc_pclk_acc}  <= scc_pclk_acc  + 26'd8021247 >= CLK_HZ ? {1'b1, scc_pclk_acc  + 26'd8021247 - CLK_HZ[25:0]} : {1'b0, scc_pclk_acc  + 26'd8021247};
+	{scc_pclk4_ce, scc_pclk4_acc} <= scc_pclk4_acc + 26'd3672000 >= CLK_HZ ? {1'b1, scc_pclk4_acc + 26'd3672000 - CLK_HZ[25:0]} : {1'b0, scc_pclk4_acc + 26'd3672000};
+	{scc_bclk_ce,  scc_bclk_acc}  <= scc_bclk_acc  + 26'd2457600 >= CLK_HZ ? {1'b1, scc_bclk_acc  + 26'd2457600 - CLK_HZ[25:0]} : {1'b0, scc_bclk_acc  + 26'd2457600};
+end
+
+scc scc
+(
+	.clk(clk), .reset(dev_reset),
+	.sel(dev_stb & sel_scc & (dev_uds | dev_lds)), .addr(dev_addr[2:1]), .we(dev_we),
+	.din(dev_lds ? dev_din[7:0] : dev_din[15:8]), .dout(scc_dout),
+	.irq(scc_irq), .iack(scc_iack), .vector(scc_vector), .vector_en(scc_vector_en),
+	.pclk_ce(scc_pclk_ce), .rtxc_ce({scc_pclk4_ce, scc_pclk4_ce}), .trxc_ce({scc_bclk_ce, 1'b0}),
+	.rxd({ser_rx, 1'b1}), .txd(scc_txd),
+	.dcd(2'b11), .cts(2'b11), .sync(2'b00), .rts(), .dtr()   // carrier and clear to send, as the stub read
 );
 
 // ---- ACIAs + IKBD ----
@@ -786,6 +816,7 @@ reg vbl_pend, hbl_pend;
 reg [2:0] ipl;
 always @* begin
 	if (mfp_irq | dsp_hreq) ipl = 3'd6;
+	else if (scc_irq)       ipl = 3'd5;
 	else if (vbl_pend)      ipl = 3'd4;
 	else if (hbl_pend)      ipl = 3'd2;
 	else                    ipl = 3'd0;
@@ -798,6 +829,7 @@ reg [1:0] ist;
 always @(posedge clk) begin
 	iack_done <= 0; iack_avec <= 0; iack_spur <= 0; iack_mfp <= 0;
 	mfp_iack  <= 0;
+	scc_iack  <= 0;
 
 	if (videl_vbl) vbl_pend <= 1;
 	if (videl_hbl) hbl_pend <= 1;
@@ -812,6 +844,12 @@ always @(posedge clk) begin
 				3'd6:
 					if (mfp_irq) begin mfp_iack <= 1; ist <= I_MFP; end
 					else if (dsp_hreq) begin iack_vector <= dsp_ivr; iack_done <= 1; end
+					else begin iack_spur <= 1; iack_done <= 1; end
+				3'd5:   // the SCC drives its vector, or with No Vector set the CPU autovectors
+					if (scc_irq) begin
+						scc_iack <= 1; iack_vector <= scc_vector; iack_done <= 1;
+						if (!scc_vector_en) iack_avec <= 1;
+					end
 					else begin iack_spur <= 1; iack_done <= 1; end
 				3'd4: begin vbl_pend <= videl_vbl; iack_avec <= 1; iack_done <= 1; end
 				3'd2: begin hbl_pend <= videl_hbl; iack_avec <= 1; iack_done <= 1; end
