@@ -14,7 +14,11 @@ module tb_top
 	input             ram_tos,
 	input       [1:0] monitor,
 	input             cpu_turbo,
+	input             tt_mode,
+	input       [1:0] ttram_sel,
 	input             tstat_en,
+	input             net_on,
+	input       [1:0] vme_sel,
 
 	input      [10:0] ps2_key,
 	input      [24:0] ps2_mouse,
@@ -55,6 +59,10 @@ module tb_top
 	output      [2:0] dbg_fc,
 	output            dbg_rw,
 	output            dbg_berr,
+	output     [15:0] dbg_sr,
+	output      [7:0] dbg_state,
+	output      [3:0] dbg_owner,     // {own_ifetch, i_fc!=d_fc, owner}
+	output      [5:0] dbg_cfc,       // {core i_fc, core d_fc}
 	output            dbg_dev_stb,
 	output     [23:0] dbg_dev_addr,
 	output            dbg_dev_we,
@@ -82,6 +90,10 @@ assign dbg_a      = system.cpu_a;
 assign dbg_fc     = system.cpu_fc;
 assign dbg_rw     = system.cpu_rw;
 assign dbg_berr   = ~system.berr_n;
+assign dbg_sr     = system.cpu.dbg_sr;
+assign dbg_state  = system.cpu.dbg_state;
+assign dbg_owner  = {system.cpu.memsys.own_ifetch, 1'b0, system.cpu.memsys.owner};
+assign dbg_cfc    = {system.cpu.core.i_fc, system.cpu.core.d_fc};
 assign dbg_dev_stb  = system.dev_stb;
 assign dbg_dev_addr = {system.dev_addr, 1'b0};
 assign dbg_dev_we   = system.dev_we;
@@ -100,6 +112,48 @@ assign dbg_cp_berr  = system.cp_berr;
 assign dbg_cp_rdata = system.cp_rdata;
 assign dbg_fpu_present = system.fpu_present;
 
+// bus fault frames stacked and rerun, for the ASV user-mode fault hunt
+reg [63:0] tr_clk = 0;
+reg  [7:0] tr_prev = 0;
+integer    tr_n = 0;
+always @(posedge clk) begin
+	tr_clk <= tr_clk + 1;
+	tr_prev <= system.cpu.core.state;
+	if (system.cpu.core.state != tr_prev && tr_n < 4000) begin
+		if (system.cpu.core.state == 8'd75 && (system.cpu.core.exc_vec == 8'd2 || system.cpu.core.exc_vec == 8'd3) && !system.cpu.core.exc_throw) begin
+			tr_n = tr_n + 1;
+			$display("[%0d.%03d ms] FRAME vec=%0d fmt=%h ssw=%04h fa=%08h sr=%04h pc=%08h pci=%08h rk=%0d sp=%08h",
+				tr_clk / 32000, (tr_clk % 32000) / 32, system.cpu.core.exc_vec, system.cpu.core.exc_fmt, system.cpu.core.exc_ssw,
+				system.cpu.core.exc_fa, system.cpu.core.exc_sr, system.cpu.core.exc_pc, system.cpu.core.pc_i,
+				system.cpu.core.exc_rk, system.cpu.core.exc_sp);
+		end
+		if (tr_clk > 64'd2336000000 && tr_n < 20000) begin
+			if (system.cpu.core.state == 8'd80) begin
+				tr_n = tr_n + 1;
+				$display("[%0d.%03d ms] RTE0 a7=%08x sr=%04h pci=%08h", tr_clk / 32000, (tr_clk % 32000) / 32,
+					system.cpu.core.rf_c, system.cpu.core.sr, system.cpu.core.pc_i);
+			end
+			if (system.cpu.core.state == 8'd82) begin
+				tr_n = tr_n + 1;
+				$display("[%0d.%03d ms] RTE2 w0=%08x w1=%08x a7=%08x sr=%04h", tr_clk / 32000, (tr_clk % 32000) / 32,
+					system.cpu.core.tmp, system.cpu.core.tmp2, system.cpu.core.rf_c, system.cpu.core.sr);
+			end
+			if (system.cpu.core.state == 8'd74) begin
+				tr_n = tr_n + 1;
+				$display("[%0d.%03d ms] EXC vec=%0d fmt=%h sr=%04h pc=%08h pci=%08h irq=%0d thr=%0d", tr_clk / 32000, (tr_clk % 32000) / 32,
+					system.cpu.core.exc_vec, system.cpu.core.exc_fmt, system.cpu.core.exc_sr, system.cpu.core.exc_pc,
+					system.cpu.core.pc_i, system.cpu.core.exc_is_irq, system.cpu.core.exc_throw);
+			end
+		end
+		if (system.cpu.core.state == 8'd84 && (system.cpu.core.exc_fmt == 4'hA || system.cpu.core.exc_fmt == 4'hB)) begin
+			tr_n = tr_n + 1;
+			$display("[%0d.%03d ms] RTEBUS fmt=%h ssw=%04h fa=%08h sr=%04h pc=%08h rk=%0d",
+				tr_clk / 32000, (tr_clk % 32000) / 32, system.cpu.core.exc_fmt, system.cpu.core.exc_ssw,
+				system.cpu.core.exc_fa, system.cpu.core.exc_sr, system.cpu.core.exc_pc, system.cpu.core.exc_rk);
+		end
+	end
+end
+
 wire        DDRAM_BUSY, DDRAM_DOUT_READY, DDRAM_RD, DDRAM_WE;
 wire  [7:0] DDRAM_BURSTCNT, DDRAM_BE;
 wire [28:0] DDRAM_ADDR;
@@ -112,10 +166,26 @@ assign sd_blk_cnt_f = {sd_blk_cnt[6], sd_blk_cnt[5], sd_blk_cnt[4], sd_blk_cnt[3
 assign sd_lba_f      = {sd_lba[6], sd_lba[5], sd_lba[4], sd_lba[3], sd_lba[2], sd_lba[1], sd_lba[0]};
 assign sd_buff_din_f = {sd_buff_din[6], sd_buff_din[5], sd_buff_din[4], sd_buff_din[3], sd_buff_din[2], sd_buff_din[1], sd_buff_din[0]};
 
+// the VME card's picture, as the scaler is told it: logged
+wire        fb_en, fb_pal_wr;
+wire  [4:0] fb_format;
+wire [11:0] fb_width, fb_height;
+wire [31:0] fb_base;
+wire [13:0] fb_stride;
+wire  [7:0] fb_pal_addr;
+wire [23:0] fb_pal_rgb;
+reg  [75:0] fb_was = 0;
+always @(posedge clk) begin
+	fb_was <= {fb_en, fb_format, fb_width, fb_height, fb_base, fb_stride};
+	if (fb_was != {fb_en, fb_format, fb_width, fb_height, fb_base, fb_stride})
+		$display("fb: en %0d format %02x %0dx%0d base %08x stride %0d", fb_en, fb_format, fb_width, fb_height, fb_base, fb_stride);
+	if (fb_pal_wr) $display("fb: pal %02x = %06x", fb_pal_addr, fb_pal_rgb);
+end
+
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk), .reset(reset), .cold_reset(cold_reset), .por(por),
-	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en),
+	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en), .net_on(net_on), .vme_sel(vme_sel), .tt_mode(tt_mode), .ttram_sel(ttram_sel),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
 	.nv_init(1'b0), .nv_addr(6'd0), .nv_din(8'd0), .nv_wr(1'b0),
@@ -124,6 +194,9 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack), .sd_blk_cnt(sd_blk_cnt),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
 	.r(r), .g(g), .b(b), .hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank), .ce_pix(ce_pix),
+	.fb_en(fb_en), .fb_format(fb_format), .fb_width(fb_width), .fb_height(fb_height),
+	.fb_base(fb_base), .fb_stride(fb_stride),
+	.fb_pal_wr(fb_pal_wr), .fb_pal_addr(fb_pal_addr), .fb_pal_rgb(fb_pal_rgb),
 	.audio_l(audio_l), .audio_r(audio_r),
 	.midi_rx(1'b1), .midi_tx(midi_tx), .ser_rx(1'b1), .ser_tx(ser_tx),
 	.fdd_led(), .hdd_led(),
