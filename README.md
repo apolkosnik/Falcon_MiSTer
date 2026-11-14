@@ -29,6 +29,7 @@ frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 | DMA sound, crossbar, codec | `falcon_crossbar` | play/record, multi-track, DSP links incl. handshake mode |
 | YM2149 | `falcon_psg` | Hatari's volume table |
 | MFP 68901 | `falcon_mfp*` | timers, interrupts, USART (MiSTer UART) |
+| SCC 85C30 | `rtl/scc/*` | asynchronous modes, interrupts; channel B (the serial port) on the MiSTer UART |
 | ACIAs + IKBD | `falcon_acia`, `falcon_ikbd*` | PS/2 keyboard and mouse, joysticks, MIDI on the UART |
 | Blitter | `falcon_blitter` | matches Hatari's blitter.c |
 | NVRAM/RTC | `falcon_nvram`, `falcon_nvram_store` | MiSTer clock and automatic NVRAM persistence with Falcon Main |
@@ -165,5 +166,5 @@ Quartus rewrites the project file when it closes it, including the
 - The Falcon 16 MHz CPU setting keeps Hatari's Falcon time, but its real
   time on the board is not measured yet; 32 MHz turbo is the default
   (docs/CPU_TIMING.md).
-- SCC serial ports (registers only), Centronics printer,
-  microphone input, `.MSA`/`.STX` floppy images.
+- SCC: synchronous modes and the LAN port (channel A has no line);
+  Centronics printer, microphone input, `.MSA`/`.STX` floppy images.
