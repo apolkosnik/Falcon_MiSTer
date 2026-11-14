@@ -356,6 +356,13 @@ assign dev_din  = bd_cs ? blt_wdata : c_dev_din;
 //  with a RAM TOS loaded, write them as Hatari does for a Falcon: the
 //  memvalid magics, no TT-RAM, phystop = end of ST-RAM and memtop 32 KB
 //  below it.  The CPU stays in reset until the 28 bytes are written.
+//
+//  A TT's ROM TOS does the opposite: it sizes memory unless the magics
+//  say it already has, and the Falcon's warm start bit ($FF8007) is not
+//  there to overrule them.  The RAM is DDR3 and keeps what the core loaded
+//  before left in it -- TOS 4.04's magics after the Falcon core, and TOS
+//  3.06 then stops at its logo -- so a cold reset of the TT clears the
+//  magics and the reset vector's (resvalid), as power on does.
 //////////////////////////////////////////////////////////////////
 
 reg        sv_busy = 0;
@@ -366,6 +373,7 @@ reg        cold_d;
 wire [23:0] phys_top = {ram_mb, 20'd0};
 wire [23:0] mem_top  = phys_top - 24'h8000;
 
+wire       sv_clear = tt_mode && !ram_tos;
 reg [23:0] sv_addr;
 reg  [7:0] sv_data;
 always @* begin : sv_table
@@ -377,16 +385,17 @@ always @* begin : sv_table
 		3'd3: begin a = 12'h5A4; v = 32'h00000000; end   // ramtop: no TT-RAM
 		3'd4: begin a = 12'h5A8; v = 32'h1357BD13; end   // ramvalid
 		3'd5: begin a = 12'h42E; v = {8'd0, phys_top}; end // phystop
-		default: begin a = 12'h436; v = {8'd0, mem_top}; end // memtop
+		3'd6: begin a = 12'h436; v = {8'd0, mem_top}; end // memtop
+		default: begin a = 12'h426; v = 32'h00000000; end  // resvalid (the TT's clearing only)
 	endcase
 	sv_addr = {12'd0, a} + sv_idx[1:0];
-	sv_data = v[31 - 8 * sv_idx[1:0] -: 8];
+	sv_data = sv_clear ? 8'h00 : v[31 - 8 * sv_idx[1:0] -: 8];
 end
 
 always @(posedge clk) begin
 	cold_d <= cold_reset;
 	sv_wr  <= 0;
-	if (cold_d && !cold_reset && ram_tos) begin
+	if (cold_d && !cold_reset && (ram_tos || tt_mode)) begin
 		sv_busy <= 1; sv_idx <= 0; sv_wait <= 0;
 	end
 	else if (sv_busy) begin
@@ -394,7 +403,7 @@ always @(posedge clk) begin
 		else if (!ld_busy_arb && !sv_wr) begin
 			sv_wr   <= 1;
 			sv_wait <= 1;
-			if (sv_idx == 5'd27) sv_busy <= 0;
+			if (sv_idx == (sv_clear ? 5'd31 : 5'd27)) sv_busy <= 0;
 			else sv_idx <= sv_idx + 1'd1;
 		end
 	end
