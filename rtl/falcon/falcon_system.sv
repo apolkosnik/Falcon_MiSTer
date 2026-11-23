@@ -109,6 +109,10 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 	output            midi_tx,
 	input             ser_rx,
 	output            ser_tx,
+	input             ser_hs,       // RTS/CTS to the UART, and the UART is ser_port's alone (off: both ports share it, no handshake)
+	input             ser_port,     // with ser_hs: 0 Modem 1 (MFP, RTS = PSG port A bit 3), 1 Modem 2 (SCC B)
+	input             ser_cts,      // asserted = high
+	output            ser_rts,      // asserted = high
 
 	output            fdd_led,
 	output            hdd_led,
@@ -896,6 +900,8 @@ falcon_videl #(.CLK_HZ(CLK_HZ)) videl
 
 // ---- PSG ----
 wire  [7:0] porta, portb;
+// serial: with the handshake on, the UART belongs to one port (see ser_tx below)
+wire       ser_m1 = ser_hs & ~ser_port, ser_m2 = ser_hs & ser_port;
 wire signed [15:0] psg_audio;
 wire        [15:0] psg_raw;
 wire               psg_stb;
@@ -936,11 +942,11 @@ falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 	.irq(mfp_irq), .iack(mfp_iack), .iack_vector(mfp_vector), .iack_ack(mfp_iack_ack), .iack_spurious(mfp_iack_spur),
 	// GPIP3 high while the blitter runs (blitter.c); in TT mode /CTS (2) and /DCD (1) are low: the
 	// MiSTer UART is a terminal that is always there (ASV's ttymon waits for carrier on open)
-	.gpip_in({sndint ^ tt_mono, 1'b1, ~(fdc_irq | ide_irq), ~acia_irq, blit_busy, ~tt_mode, ~tt_mode, 1'b1}),
+	.gpip_in({sndint ^ tt_mono, 1'b1, ~(fdc_irq | ide_irq), ~acia_irq, blit_busy, ser_m1 ? ~ser_cts : ~tt_mode, ~tt_mode, 1'b1}),
 	.gpip_out(), .gpip_oe(),
 	.tai(soundint), .tbi(videl_de_tb),   // one event per source line (Hatari's ST line timing)
 	.tao(), .tbo(), .tco(), .tdo(mfp_tdo),
-	.si(ser_rx), .so(mfp_so)
+	.si(ser_m2 | ser_rx), .so(mfp_so)
 );
 
 // ---- TT-MFP ($FFFA81-$FFFAAF), TT mode only: GPIP7 = NCR 5380 (high), 6 = MC146818 IRQ, 5 = SCSI
@@ -978,7 +984,11 @@ wire [7:0] scc_vector;
 wire       scc_irq, scc_vector_en;
 wire [1:0] scc_txd;
 reg        scc_iack;
-assign ser_tx = mfp_so & scc_txd[1];
+// With the handshake on, the UART belongs to one port (a shared receive line would fill the
+// idle port's buffer, and that port would then hold RTS off for good); the other sees an idle line.
+assign ser_tx = (mfp_so | ser_m2) & (scc_txd[1] | ser_m1);
+wire [1:0] scc_rts;
+assign ser_rts = ser_port ? scc_rts[1] : ~porta[3];
 
 reg  [25:0] scc_pclk_acc, scc_pclk4_acc, scc_bclk_acc;
 reg         scc_pclk_ce, scc_pclk4_ce, scc_bclk_ce;
@@ -995,8 +1005,8 @@ scc scc
 	.din(dev_lds ? dev_din[7:0] : dev_din[15:8]), .dout(scc_dout),
 	.irq(scc_irq), .iack(scc_iack), .vector(scc_vector), .vector_en(scc_vector_en),
 	.pclk_ce(scc_pclk_ce), .rtxc_ce({tt_mode ? tcclk_ce : scc_pclk4_ce, scc_pclk4_ce}), .trxc_ce({scc_bclk_ce, 1'b0}),
-	.rxd({ser_rx, 1'b1}), .txd(scc_txd),
-	.dcd(tt_mode ? 2'b00 : 2'b11), .cts(tt_mode ? 2'b00 : 2'b11), .sync(2'b00), .rts(), .dtr()   // TT: no carrier, Modem 1 (the MFP) has the UART's logins; Falcon: as the stub read
+	.rxd({ser_m1 | ser_rx, 1'b1}), .txd(scc_txd),
+	.dcd(tt_mode ? 2'b00 : 2'b11), .cts(tt_mode ? {ser_m2 & ser_cts, 1'b0} : 2'b11), .sync(2'b00), .rts(scc_rts), .dtr()   // TT: no carrier, Modem 1 (the MFP) has the UART's logins; Falcon: as the stub read
 );
 
 // ---- ACIAs + IKBD ----
