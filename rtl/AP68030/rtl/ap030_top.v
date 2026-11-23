@@ -101,6 +101,7 @@ module ap030_top
 	// 3 DIVS.W), each for one processor clock
 	output      [1:0] tm_pop,
 	output      [1:0] tm_md,
+	output     [15:0] tm_ir,
 	// the prefetch queue, for an external pipeline model, and that model's
 	// limits on the next fetches (ap030_core; used with fetch_lazy only, tie
 	// the inputs to 0 without a model): tm_q holds tm_qn queued words, word
@@ -216,7 +217,7 @@ ap030_core #(.PCREL_PROGRAM_SPACE(PCREL_PROGRAM_SPACE)) core (
 	.tt0(tt0), .tt1(tt1), .mmusr(mmusr), .bus_quiet(bus_quiet),
 	.cacr(cacr), .cacr_ci(cacr_ci), .cacr_cei(cacr_cei), .cacr_cd(cacr_cd), .cacr_ced(cacr_ced), .caar_idx(caar_idx),
 	.ipl_n(ipl_n), .ipend_n(ipend_n), .reset_drive(reset_drive), .status_n(status_n), .refill_n(refill_n),
-	.halted(halted), .dbg_pc(dbg_pc), .dbg_sr(dbg_sr), .dbg_state(dbg_state), .dbg_inst(dbg_inst), .tm_pop(tm_pop), .tm_md(tm_md),
+	.halted(halted), .dbg_pc(dbg_pc), .dbg_sr(dbg_sr), .dbg_state(dbg_state), .dbg_inst(dbg_inst), .tm_pop(tm_pop), .tm_md(tm_md), .tm_ir(tm_ir),
 	.tm_q(tm_q), .tm_qn(tm_qn), .tm_scan(tm_scan), .tm_flush(tm_flush),
 	.fetch_stop_v(fetch_stop_v), .fetch_stop(fetch_stop),
 	.fetch_scan_v(fetch_scan_v), .fetch_scan_to(fetch_scan_to),

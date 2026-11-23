@@ -44,6 +44,7 @@ module falcon_cpuclk #(parameter DEBT_MAX = 4095)
 	input             turbo,       // the bridge's mode: 1 = every clock
 	input             cpu_16mhz,   // $FF8007 bit 0
 	input             hold,        // falcon_cpubus: no processor clock now
+	input             pause,       // turbo: no processor clock now (tt030_pace)
 	input       [3:0] credit,      // processor clocks to give back (one clock pulse)
 	input             idle,        // falcon_cpubus: an idle clock instead of a processor clock
 	input       [7:0] back,        // falcon_cpubus: processor clocks to give back (one clock pulse, < 32)
@@ -63,7 +64,7 @@ module falcon_cpuclk #(parameter DEBT_MAX = 4095)
 wire [2:0] period = cpu_16mhz ? 3'd2 : 3'd4;
 
 wire   due    = debt >= {13'd0, period};     // one processor clock behind
-assign cpu_ce    = turbo || (due && !hold && !idle);
+assign cpu_ce    = turbo ? !pause : (due && !hold && !idle);
 assign idle_tick = !turbo && due && idle;
 wire   tick      = cpu_ce || idle_tick;
 

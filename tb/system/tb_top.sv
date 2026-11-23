@@ -213,7 +213,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk), .clk_cpu(clk_cpu), .reset(reset), .cold_reset(cold_reset), .por(por),
 	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en), .fast_ram(fast_ram),
-	.net_on(net_on), .vme_sel(vme_sel), .tt_mode(tt_mode), .ttram_sel(ttram_sel),
+	.net_on(net_on), .vme_sel(vme_sel), .tt_mode(tt_mode), .tt_timing(1'b0), .ttram_sel(ttram_sel),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse), .joy0(joy0), .joy1(32'd0), .ana0(16'd0), .ana1(16'd0), .rtc(rtc),
 	.nv_init(1'b0), .nv_addr(6'd0), .nv_din(8'd0), .nv_wr(1'b0),

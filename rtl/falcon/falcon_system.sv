@@ -32,6 +32,7 @@ module falcon_system #(parameter CLK_HZ = 32000000)
 	input       [1:0] monitor,
 	input             cpu_turbo,    // 1: CPU on every clock (32 MHz); 0: Falcon, 16/8 MHz ($FF8007 bit 0)
 	input             tt_mode,      // TT030 (work in progress): 32-bit decode, TT-RAM, turbo timing
+	input             tt_timing,    // TT030: idle clocks per instruction, a real 68030's time (tt030_pace)
 	input       [1:0] ttram_sel,    // TT-RAM: 0 none, 1 64 MB, 2 128 MB, 3 256 MB
 	input             tstat_en,     // OSD: the timing counters at $FFF000 (falcon_tstat); 0: bus error there
 	input             net_on,       // OSD: a DaynaPORT at SCSI ID 4 (falcon_scsi, tools/falcon_net)
@@ -179,11 +180,19 @@ falcon_pipescan pipescan
 wire  [4:0] cpu_tpos;
 wire  [3:0] cpu_credit;
 wire [15:0] cpu_debt;
+wire        cpu_pause;
+wire [15:0] cpu_tm_ir;
+tt030_pace pace
+(
+	.clk(clk), .reset(reset), .enable(tt_mode & tt_timing),
+	.cpu_ce(cpu_ce), .dispatch(cpu_inst), .ir(cpu_tm_ir),
+	.bus_act(~cpu_as_n & cpu_bus_oe), .pause(cpu_pause)
+);
 falcon_cpuclk cpuclk
 (
 	.clk(clk), .reset(reset),
 	.turbo(!cpu_fmode), .cpu_16mhz(cpu_16mhz),
-	.hold(cpu_hold), .credit(cpu_credit), .idle(cpu_idle), .back(cpu_back),
+	.hold(cpu_hold), .pause(cpu_pause), .credit(cpu_credit), .idle(cpu_idle), .back(cpu_back),
 	.cpu_ce(cpu_ce), .idle_tick(cpu_idle_tick), .tpos(cpu_tpos),
 	.debt(cpu_debt), .debt_peak(), .forgiven(), .held(), .idled()
 );
@@ -201,7 +210,7 @@ ap030_top #(.USE_CE(1)) cpu
 	.ipl_n(ipl_n), .ipend_n(cpu_ipend_n),
 	.reset_n_i(~(reset | sv_busy)), .reset_n_oe(cpu_reset_oe),
 	.cdis_n(1'b1), .mmudis_n(1'b1), .refill_n(cpu_refill_n), .status_n(cpu_status_n),
-	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .dbg_halted(cpu_halted),
+	.dbg_pc(dbg_pc), .dbg_sr(), .dbg_state(), .dbg_inst(cpu_inst), .tm_pop(cpu_tm_pop), .tm_md(cpu_tm_md), .tm_ir(cpu_tm_ir), .dbg_halted(cpu_halted),
 	.tm_q(cpu_tm_q), .tm_qn(cpu_tm_qn), .tm_scan(cpu_tm_scan), .tm_flush(cpu_tm_flush),
 	.fetch_stop_v(cpu_fetch_stop_v), .fetch_stop(cpu_fetch_stop),
 	.fetch_scan_v(cpu_scan_v), .fetch_scan_to(cpu_scan_to),

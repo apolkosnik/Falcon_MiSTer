@@ -32,7 +32,7 @@ case " $BRINGUP " in
 	 $A60/fastram/ap030_l2ram.sv $A60/fastram/ap060_fastram_bus.sv $A60/fastram/ap060_fastram.sv
 	 $R/falcon/falcon_cpubus060.sv $R/falcon/falcon_ddr_arb.sv" ;;
 *) CPUINC="-I$R/AP68030/rtl -I$R/AP68030/rtl/core"
-	CPUSRC="$R/AP68030/rtl/*.v $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/falcon_pipescan.sv $R/falcon/falcon_tstat.sv $R/falcon/falcon_l2.sv" ;;
+	CPUSRC="$R/AP68030/rtl/*.v $R/falcon/falcon_cpubus.sv $R/falcon/falcon_cpuclk.sv $R/falcon/tt030_pace.sv $R/falcon/falcon_pipescan.sv $R/falcon/falcon_tstat.sv $R/falcon/falcon_l2.sv" ;;
 esac
 case " $BRINGUP " in *" NO_IDE "*) DEFS="$DEFS +define+FALCON_NO_IDE" ;; *) SRCS="$SRCS $(ls $R/falcon/falcon_ide*.sv)" ;; esac
 case " $BRINGUP " in *" NO_FDC "*) DEFS="$DEFS +define+FALCON_NO_FDC" ;; *) SRCS="$SRCS $(ls $R/falcon/falcon_fdc*.sv)" ;; esac
