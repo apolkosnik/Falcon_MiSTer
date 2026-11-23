@@ -63,6 +63,8 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[8]    reset NVRAM to defaults for the selected monitor
 //   status[9]    CPU: 32 MHz turbo (default), Falcon 16 MHz (8 MHz by $FF8007)
 //   status[10]   timing counters at $FFF000 (falcon_tstat; off: bus error there)
+//   status[12:11] ap060 builds only: Fast RAM off, 64, 128, 240 MB (CT60 mode,
+//                docs/CT60_MODE.md; taken at reset, a size change needs a cold reset)
 `include "build_id.v"
 localparam CONF_STR = {
 	"Falcon;;",
@@ -82,6 +84,9 @@ localparam CONF_STR = {
 	"O[6],UART,Serial,MIDI;",
 	"O[9],CPU,32 MHz turbo,Falcon 16 MHz;",
 	"O[10],Timing counters,Off,On;",
+`ifdef FALCON_CPU060
+	"O[12:11],Fast RAM,Off,64 MB,128 MB,240 MB;",
+`endif
 	"-;",
 	"T[0],Reset;",
 	"T[7],Cold Reset;",
@@ -178,13 +183,14 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
 ///////////////////////   CLOCKS   ///////////////////////////////
 
 wire clk_sys;   // 32 MHz: CPU, chipset, DSP, DDR3
+wire clk_cpu;   // 50 MHz: the ap060 build's processor (asynchronous to clk_sys, Falcon.sdc)
 wire pll_locked;
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),
-	.outclk_1(),
+	.outclk_1(clk_cpu),
 	.locked(pll_locked)
 );
 
@@ -235,12 +241,20 @@ falcon_nvram_store nvram_store
 wire [7:0] r, g, b;
 wire       hs, vs, hblank, vblank, ce_pix;
 wire signed [15:0] audio_l, audio_r;
+wire signed [15:0] mic_l, mic_r;
 wire       fdd_led, hdd_led;
 wire       midi_tx, ser_tx;
+
+falcon_audio_adc #(.CLK_HZ(32000000)) audio_adc
+(
+	.clk(clk_sys), .reset(reset), .ADC_BUS(ADC_BUS),
+	.mic_l(mic_l), .mic_r(mic_r), .sample_stb()
+);
 
 falcon_system #(.CLK_HZ(32000000)) system
 (
 	.clk(clk_sys),
+	.clk_cpu(clk_cpu),
 	.reset(reset),
 	.cold_reset(cold_reset),
 	.por(por),
@@ -250,6 +264,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.monitor(status[2:1] == 2'd0 ? 2'b10 : status[2:1] == 2'd1 ? 2'b01 : status[2:1] == 2'd2 ? 2'b11 : 2'b00),
 	.cpu_turbo(~status[9]),
 	.tstat_en(status[10]),
+	.fast_ram(status[12:11]),
 
 	.ld_wr(ioctl_wr & (rom_download | cart_download)),
 	.ld_addr(ld_addr),
@@ -282,6 +297,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.r(r), .g(g), .b(b),
 	.hsync(hs), .vsync(vs), .hblank(hblank), .vblank(vblank), .ce_pix(ce_pix),
 
+	.mic_l(mic_l), .mic_r(mic_r),
 	.audio_l(audio_l),
 	.audio_r(audio_r),
 

@@ -50,6 +50,8 @@ struct Lockstep {
     bool verbose = true;
     int max_report = 10;
     int reported = 0;
+    uint64_t mem_every = 1;     // compare all memories every N instructions (1: every one)
+    uint64_t nstep = 0;
     Lockstep(Rtl &r, Stats &s) : rtl(r), st(s) {}
 
     // reset both models, load memories, start (HF0) and set registers

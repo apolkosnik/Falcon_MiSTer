@@ -238,6 +238,7 @@ always @(posedge clk)
     end
 falcon_memarb memarb
 (
+	.snoop_hold(1'b0),
     .clk(clk), .reset(por), .ram_mb(4'd4),
     .vid_req(1'b0), .vid_addr(21'd0), .vid_ack(), .vid_data(), .vid_valid(),
     .ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),

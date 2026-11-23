@@ -336,16 +336,18 @@ module dsp56k_core (
     wire [15:0] n2_s = (agu_reg == {3'b011, d1_ea2_rn}) ? agu_val : nn[d1_ea2_rn];
     wire [15:0] m2_s = (agu_reg == {3'b100, d1_ea2_rn}) ? agu_val : mm[d1_ea2_rn];
     wire [32:0] agu1 = calc_ea(d1_ea1_mode, rr[d1_ea1_rn], r1_s, n1_s, m1_s, ew1[15:0]);
-    wire [32:0] agu2 = calc_ea(d1_ea2_mode, rr[d1_ea2_rn], r2_s, n2_s, m2_s, ew1[15:0]);
+    // the Y address of an XY move: (Rn)+Nn, (Rn)-, (Rn)+ or (Rn) (modes 1, 2,
+    // 3, 4), always at Rn
+    wire [16:0] agu2_u = agu_upd(r2_s, (d1_ea2_mode == 3'd1) ? n2_s : (d1_ea2_mode == 3'd3) ? 16'h0001 : 16'hffff, m2_s);
     wire [15:0] agu1_addr = agu1[15:0];
     wire [15:0] agu1_newr = agu1[31:16];
     wire        agu1_commit = agu1[32] && d1_ea1_used && (d1_cls != C_LUA);
     // address for an access issued in E1 (modes 0-4 use Rn, mode 6 the next
     // word); modes 5 and 7 are issued one clock later from agu1_addr
     wire [15:0] agu1_fast = (d1_ea1_mode == 3'd6) ? ew1[15:0] : r1_s;
-    wire [15:0] agu2_addr = agu2[15:0];
-    wire [15:0] agu2_newr = agu2[31:16];
-    wire        agu2_commit = agu2[32] && d1_ea2_used;
+    wire [15:0] agu2_addr = r2_s;
+    wire [15:0] agu2_newr = agu2_u[15:0];
+    wire        agu2_commit = agu2_u[16] && d1_ea2_used && d1_ea2_mode != 3'd4;
 
     // ------------------------------------------------------------------
     // limiter (dsp_pm_read_accu24)
@@ -376,6 +378,22 @@ module dsp56k_core (
     // (registers[A]).  R registers see this instruction's AGU update
     // (Hatari reads them after dsp_calc_ea).
     // ------------------------------------------------------------------
+    // X0, X1, A, B (Y0, Y1, A, B for Y: moves) by a 2-bit field
+    function automatic [5:0] xab_reg(input y, input [1:0] f);
+        case (f)
+            2'd0: xab_reg = y ? RG_Y0 : RG_X0;
+            2'd1: xab_reg = y ? RG_Y1 : RG_X1;
+            2'd2: xab_reg = RG_A;
+            default: xab_reg = RG_B;
+        endcase
+    endfunction
+    // the register of an L: move's X word (A1, B1, X1, Y1, A, B, A, B)
+    function automatic [5:0] l_reg(input h, input [1:0] f);
+        if (h) l_reg = f[0] ? RG_B : RG_A;
+        else case (f)
+            2'd0: l_reg = RG_A1; 2'd1: l_reg = RG_B1; 2'd2: l_reg = RG_X1; default: l_reg = RG_Y1;
+        endcase
+    endfunction
     reg  [5:0] sreg;
     reg        sreg_lim;
     reg [23:0] sval;
@@ -383,8 +401,17 @@ module dsp56k_core (
     always @* begin
         sreg = ir1[13:8]; sreg_lim = 1'b1;
         if (d1_ispm) begin
-            if (d1_pk == PK_RR) sreg = {1'b0, ir1[17:13]};
-            else sreg = {1'b0, ir1[21:20], ir1[18:16]};          // pm_5 numreg
+            // the register of a register-to-register move, of an X: or Y:
+            // move (pm_5 numreg), or the source of the first memory write
+            // (sval_q is used in the last clock by PK_RR only)
+            case (d1_pk)
+                PK_RR:   sreg = {1'b0, ir1[17:13]};
+                PK_0:    sreg = ir1[16] ? RG_B : RG_A;
+                PK_1:    sreg = ir1[14] ? xab_reg(1'b1, ir1[17:16]) : xab_reg(1'b0, ir1[19:18]);
+                PK_L:    sreg = l_reg(ir1[19], ir1[17:16]);
+                PK_XYXY: sreg = xab_reg(1'b0, ir1[19:18]);
+                default: sreg = {1'b0, ir1[21:20], ir1[18:16]};   // pm_5 numreg
+            endcase
         end else case (d1_cls)
             C_MOVEC_REG: begin sreg = ir1[15] ? ir1[13:8] : ir1[5:0]; sreg_lim = ir1[15]; end
             C_MOVEC_AA, C_MOVEC_EA: begin sreg = ir1[5:0]; sreg_lim = 1'b0; end
@@ -442,13 +469,13 @@ module dsp56k_core (
     reg        lhit;              // dsp_pm_read_accu24 limited (sets SR.L)
     reg        ew_rd;             // instruction reads P:pc+1
     always @* begin
-        reg [24:0] t1, t2;
+        reg [24:0] t2;
         a1_en = 1'b0; a1_we = 1'b0; a1_sp = 2'd0; a1_ao = 16'd0; a1_wd = 24'd0;
         a2_en = 1'b0; a2_we = 1'b0; a2_ao = 16'd0; a2_wd = 24'd0;
         aw_en = 1'b0; aw_sp = 2'd0; aw_ao = 16'd0;
         a1_agu = 1'b0; aw_agu = 1'b0;
         lhit = 1'b0; ew_rd = d1_ea_m6 | d1_jb | d1_do;
-        t1 = 25'd0; t2 = 25'd0;
+        t2 = 25'd0;
         if (d1_ispm) begin
             case (d1_pk)
                 PK_RR: lhit = sval_l;
@@ -461,21 +488,18 @@ module dsp56k_core (
                     if (!ir1[15]) lhit = sval_l;
                 end
                 PK_0: begin
-                    t1 = ir1[16] ? lim_b : lim_a;
                     a1_en = 1'b1; a1_we = 1'b1; a1_sp = {1'b0, ir1[15]};
-                    a1_ao = 16'd0; a1_agu = 1'b1; a1_wd = t1[23:0];
-                    lhit = t1[24];
+                    a1_ao = 16'd0; a1_agu = 1'b1; a1_wd = sval;
+                    lhit = sval_l;
                 end
                 PK_1: begin
                     a1_sp = {1'b0, ir1[14]};
                     a1_ao = 16'd0; a1_agu = 1'b1;
                     a1_we = !ir1[15];
                     a1_en = !(ir1[15] && d1_ea_imm);
-                    t1 = ir1[14] ? src_xab(ir1[17:16], y0, y1, lim_a, lim_b)
-                                 : src_xab(ir1[19:18], x0, x1, lim_a, lim_b);
-                    a1_wd = t1[23:0];
+                    a1_wd = sval;
                     t2 = (ir1[14] ? ir1[19] : ir1[17]) ? lim_b : lim_a;
-                    lhit = (!ir1[15] && t1[24]) || t2[24];
+                    lhit = (!ir1[15] && sval_l) || t2[24];
                 end
                 PK_L: begin
                     a1_en = 1'b1; a2_en = 1'b1;
@@ -483,29 +507,27 @@ module dsp56k_core (
                     a1_sp = 2'd0;
                     a1_ao = {10'd0, ir1[13:8]}; a1_agu = ir1[14];
                     a2_ao = a1_ao;
+                    a1_wd = sval;   // (l_reg)
                     case ({ir1[19], ir1[17:16]})
-                        3'd0: begin a1_wd = a1; a2_wd = a0; end
-                        3'd1: begin a1_wd = b1; a2_wd = b0; end
-                        3'd2: begin a1_wd = x1; a2_wd = x0; end
-                        3'd3: begin a1_wd = y1; a2_wd = y0; end
-                        3'd4: begin a1_wd = lim_a[23:0];
-                                    a2_wd = lim_a[24] ? (lim_a[23] ? 24'd0 : 24'hffffff) : a0;
+                        3'd0: a2_wd = a0;
+                        3'd1: a2_wd = b0;
+                        3'd2: a2_wd = x0;
+                        3'd3: a2_wd = y0;
+                        3'd4: begin a2_wd = lim_a[24] ? (lim_a[23] ? 24'd0 : 24'hffffff) : a0;
                                     if (!ir1[15]) lhit = lim_a[24]; end
-                        3'd5: begin a1_wd = lim_b[23:0];
-                                    a2_wd = lim_b[24] ? (lim_b[23] ? 24'd0 : 24'hffffff) : b0;
+                        3'd5: begin a2_wd = lim_b[24] ? (lim_b[23] ? 24'd0 : 24'hffffff) : b0;
                                     if (!ir1[15]) lhit = lim_b[24]; end
-                        3'd6: begin a1_wd = lim_a[23:0]; a2_wd = lim_b[23:0];
+                        3'd6: begin a2_wd = lim_b[23:0];
                                     if (!ir1[15]) lhit = lim_a[24] | lim_b[24]; end
-                        default: begin a1_wd = lim_b[23:0]; a2_wd = lim_a[23:0];
+                        default: begin a2_wd = lim_a[23:0];
                                     if (!ir1[15]) lhit = lim_a[24] | lim_b[24]; end
                     endcase
                 end
                 PK_XYXY: begin
-                    t1 = src_xab(ir1[19:18], x0, x1, lim_a, lim_b);
                     t2 = src_xab(ir1[17:16], y0, y1, lim_a, lim_b);
-                    a1_en = 1'b1; a1_we = !ir1[15]; a1_sp = 2'd0; a1_ao = 16'd0; a1_agu = 1'b1; a1_wd = t1[23:0];
+                    a1_en = 1'b1; a1_we = !ir1[15]; a1_sp = 2'd0; a1_ao = 16'd0; a1_agu = 1'b1; a1_wd = sval;
                     a2_en = 1'b1; a2_we = !ir1[22]; a2_ao = 16'd0; a2_wd = t2[23:0];
-                    lhit = (!ir1[15] && t1[24]) || (!ir1[22] && t2[24]);
+                    lhit = (!ir1[15] && sval_l) || (!ir1[22] && t2[24]);
                 end
                 default: ;
             endcase
@@ -886,7 +908,7 @@ module dsp56k_core (
     reg  [5:0] n_sp;
     reg [15:0] n_la;
     reg [23:0] n_lc, n_lcsave;
-    reg [15:0] n_pc, n_pc1;          // next pc and next pc + 1 (fetch words)
+    reg [15:0] n_pc;                 // next pc (the fetch words: n_pc, n_pc + 1)
     reg        n_loop_rep, n_pc_on_rep;
     reg  [1:0] n_int_state;
     reg  [2:0] n_int_cnt;
@@ -905,32 +927,76 @@ module dsp56k_core (
 
     wire [15:0] pc_p1 = pc + 16'd1;
     wire [15:0] pc_p2 = pc + 16'd2;
-    wire [15:0] pc_p3 = pc + 16'd3;
     wire [16:0] if_p1 = {1'b0, int_fetch} + 17'd1;
     wire [16:0] if_p2 = {1'b0, int_fetch} + 17'd2;
-    wire [15:0] isp_p1 = int_save_pc + 16'd1;
     wire  [6:0] sp_push_sp = sp_push(sp);
     wire [31:0] sval_q32 = {8'd0, sval_q};
     wire        sval_q_bit = sval_q32[ir_q[4:0]];
     wire  [3:0] sp_m1 = sp[3:0] - 4'd1;
+
+    // the last clock's accumulator write: the data ALU's result, or that of
+    // DIV, NORM or Tcc (one write of A or B; their SR effects stay below)
+    reg        acw_we, acw_b;
+    reg [55:0] acw_v;
+    reg [55:0] dn_s, dv_r;             // DIV, NORM: the accumulator; DIV: the result
+    reg [23:0] dv_v;                   // DIV: the divisor
+    reg        nm_lft, nm_rgt;         // NORM: shift left, right
+    reg        tc_t;                   // Tcc: the condition holds
+    always @* begin
+        dn_s = ir_q[3] ? acc_b : acc_a;
+        case (ir_q[5:4])
+            2'd0: dv_v = x0; 2'd1: dv_v = y0; 2'd2: dv_v = x1; default: dv_v = y1;
+        endcase
+        dv_r = {dn_s[54:0], 1'b0};
+        if (dn_s[55] ^ dv_v[23]) dv_r = dv_r + {{8{dv_v[23]}}, dv_v, 24'd0};
+        else                     dv_r = dv_r - {{8{dv_v[23]}}, dv_v, 24'd0};
+        dv_r[0] = dv_r[0] | sr_l[0];
+        nm_lft = !sr_l[5] && sr_l[4] && !sr_l[2];
+        nm_rgt = sr_l[5];
+        tc_t = cc_true(ir_q[15:12], sr_l);
+        acw_we = 1'b0; acw_b = ir_q[3]; acw_v = dv_r;
+        if (dq_ispm) begin
+            acw_we = alu_wr; acw_b = alu_dst_b; acw_v = alu_res;
+        end else case (dq_cls)
+            C_DIV:  acw_we = 1'b1;
+            C_NORM: begin
+                acw_we = 1'b1;
+                acw_v = nm_lft ? {dn_s[54:0], 1'b0} : nm_rgt ? {dn_s[55], dn_s[55:1]} : dn_s;
+            end
+            C_TCC: begin
+                acw_we = tc_t;
+                case (ir_q[6:3])
+                    4'd0:  begin acw_v = acc_b; acw_b = 1'b0; end
+                    4'd1:  begin acw_v = acc_a; acw_b = 1'b1; end
+                    4'd8,  4'd9:  begin acw_v = {{8{x0[23]}}, x0, 24'd0}; acw_b = ir_q[3]; end
+                    4'd10, 4'd11: begin acw_v = {{8{y0[23]}}, y0, 24'd0}; acw_b = ir_q[3]; end
+                    4'd12, 4'd13: begin acw_v = {{8{x1[23]}}, x1, 24'd0}; acw_b = ir_q[3]; end
+                    4'd14, 4'd15: begin acw_v = {{8{y1[23]}}, y1, 24'd0}; acw_b = ir_q[3]; end
+                    default: begin acw_v = 56'd0; acw_b = 1'b1; end  // NULL source/dest
+                endcase
+            end
+            default: ;
+        endcase
+    end
 
     integer i;
     always @* begin
         reg        w_en, w_agu;          // the dsp_write_reg port
         reg  [5:0] w_num;
         reg [23:0] w_val;
+        reg        w2_en;                // a second write, data registers only, after w
+        reg  [5:0] w2_num;
+        reg [23:0] w2_val;
         reg  [1:0] npop;                 // pops before the register write
         reg        push_j, push_do;      // pushes after the register write
         reg        jt;                   // jump taken (cur_inst_len = 0, pc = jtgt)
-        reg [15:0] jtgt, len, hd, seq_pc, seq_pc1;
+        reg [15:0] jtgt, len, hd, seq_pc;
         reg [23:0] lc_i;
         reg        rep_dec, lc_eq1, do_hit, do_back, eq_f1, eq_f2;
         reg  [6:0] t7;
         reg        bitv, skip, found, stay;
         reg [31:0] bv, bm, rdv;
-        reg [23:0] v24, xy0;
-        reg [55:0] d56, s56, r56;
-        reg  [5:0] nr;
+        reg [23:0] v24;
         reg  [4:0] vec;
         reg  [1:0] ipl, lvl;
         reg        hst_on, ssi_on, p_hc, p_hr, p_ht, p_sr, p_st;
@@ -950,27 +1016,27 @@ module dsp56k_core (
         wa_i = 4'd0; wb_i = 4'd0; wc_i = 4'd0;
         wa_hv = 16'd0; wa_lv = 16'd0; wb_hv = 16'd0; wb_lv = 16'd0; wc_hv = 16'd0; wc_lv = 16'd0;
         w_en = 1'b0; w_agu = 1'b0; w_num = 6'd0; w_val = 24'd0;
+        w2_en = 1'b0; w2_num = 6'd0; w2_val = 24'd0;
         npop = 2'd0; push_j = 1'b0; push_do = 1'b0;
         jt = 1'b0; jtgt = 16'd0; hd = 16'd0;
         t7 = 7'd0; bitv = 1'b0; skip = 1'b0; found = 1'b0; stay = 1'b0;
-        bv = 32'd0; bm = 32'd0; rdv = 32'd0; v24 = 24'd0; xy0 = 24'd0;
-        d56 = 56'd0; s56 = 56'd0; r56 = 56'd0;
-        nr = 6'd0; vec = 5'd0; ipl = 2'd0; lvl = 2'd0;
+        bv = 32'd0; bm = 32'd0; rdv = 32'd0; v24 = 24'd0;
+        vec = 5'd0; ipl = 2'd0; lvl = 2'd0;
         hst_on = 1'b0; ssi_on = 1'b0; p_hc = 1'b0; p_hr = 1'b0; p_ht = 1'b0; p_sr = 1'b0; p_st = 1'b0;
         ki = 4'd0;
         len = (dq_ea_m6 || dq_do) ? 16'd2 : 16'd1;
-        n_pc = pc; n_pc1 = pc_p1;
-        seq_pc = pc; seq_pc1 = pc_p1; lc_i = lc; rep_dec = 1'b0; lc_eq1 = 1'b0;
+        if (acw_we) begin
+            if (acw_b) begin n_b2 = acw_v[55:48]; n_b1 = acw_v[47:24]; n_b0 = acw_v[23:0]; end
+            else       begin n_a2 = acw_v[55:48]; n_a1 = acw_v[47:24]; n_a0 = acw_v[23:0]; end
+        end
+        n_pc = pc;
+        seq_pc = pc; lc_i = lc; rep_dec = 1'b0; lc_eq1 = 1'b0;
         do_hit = 1'b0; do_back = 1'b0; eq_f1 = 1'b0; eq_f2 = 1'b0;
 
         // ================= instruction (Hatari handler) =================
         if (dq_ispm) begin
             // data ALU first, then the parallel move writes
             n_sr = alu_sr;
-            if (alu_wr) begin
-                if (alu_dst_b) begin n_b2 = alu_res[55:48]; n_b1 = alu_res[47:24]; n_b0 = alu_res[23:0]; end
-                else           begin n_a2 = alu_res[55:48]; n_a1 = alu_res[47:24]; n_a0 = alu_res[23:0]; end
-            end
             if (dq_alu_und) len = 16'd0;
             case (dq_pk)
                 PK_RR: begin w_en = 1'b1; w_num = {1'b0, ir_q[12:8]}; w_val = sval_q; w_agu = 1'b1; end
@@ -983,15 +1049,14 @@ module dsp56k_core (
                         w_val = {ir_q[15:8], 16'd0};
                 end
                 PK_0: begin
-                    xy0 = ir_q[15] ? y0 : x0;
-                    if (ir_q[16]) begin n_b0 = 24'd0; n_b1 = xy0; n_b2 = {8{xy0[23]}}; end
-                    else          begin n_a0 = 24'd0; n_a1 = xy0; n_a2 = {8{xy0[23]}}; end
+                    w_en = 1'b1; w_num = ir_q[16] ? RG_B : RG_A; w_val = ir_q[15] ? y0 : x0;
                 end
                 PK_1: begin
-                    // S2 (A/B limited) -> D2 (Y0/Y1 for X: moves, X0/X1 for Y:)
-                    v24 = (ir_q[14] ? ir_q[19] : ir_q[17]) ? lim_b[23:0] : lim_a[23:0];
-                    if (ir_q[14]) begin if (ir_q[18]) n_x1 = v24; else n_x0 = v24; end
-                    else          begin if (ir_q[16]) n_y1 = v24; else n_y0 = v24; end
+                    // S2 (A/B limited) -> D2 (Y0/Y1 for X: moves, X0/X1 for Y:);
+                    // never the register of the move itself
+                    w2_en = 1'b1;
+                    w2_val = (ir_q[14] ? ir_q[19] : ir_q[17]) ? lim_b[23:0] : lim_a[23:0];
+                    w2_num = ir_q[14] ? (ir_q[18] ? RG_X1 : RG_X0) : (ir_q[16] ? RG_Y1 : RG_Y0);
                   if (ir_q[15]) begin
                     w_en = 1'b1;
                     w_val = dq_ea_imm ? ew_q : rd1;
@@ -1002,17 +1067,19 @@ module dsp56k_core (
                   end
                 end
                 PK_L: if (ir_q[15]) begin
+                    // the X word to A1, B1, X1, Y1 or (extended) A, B, A, B; the
+                    // Y word to A0, B0, X0, Y0, then A0, B0 (after A, B), B, A
+                    w_en = 1'b1; w_num = l_reg(ir_q[19], ir_q[17:16]); w_val = rd1;
+                    w2_en = 1'b1; w2_val = rd2;
                     case ({ir_q[19], ir_q[17:16]})
-                        3'd0: begin n_a1 = rd1; n_a0 = rd2; end
-                        3'd1: begin n_b1 = rd1; n_b0 = rd2; end
-                        3'd2: begin n_x1 = rd1; n_x0 = rd2; end
-                        3'd3: begin n_y1 = rd1; n_y0 = rd2; end
-                        3'd4: begin n_a0 = rd2; n_a1 = rd1; n_a2 = {8{rd1[23]}}; end
-                        3'd5: begin n_b0 = rd2; n_b1 = rd1; n_b2 = {8{rd1[23]}}; end
-                        3'd6: begin n_a0 = 24'd0; n_a1 = rd1; n_a2 = {8{rd1[23]}};
-                                    n_b0 = 24'd0; n_b1 = rd2; n_b2 = {8{rd2[23]}}; end
-                        default: begin n_b0 = 24'd0; n_b1 = rd1; n_b2 = {8{rd1[23]}};
-                                       n_a0 = 24'd0; n_a1 = rd2; n_a2 = {8{rd2[23]}}; end
+                        3'd0: w2_num = RG_A0;
+                        3'd1: w2_num = RG_B0;
+                        3'd2: w2_num = RG_X0;
+                        3'd3: w2_num = RG_Y0;
+                        3'd4: w2_num = RG_A0;
+                        3'd5: w2_num = RG_B0;
+                        3'd6: w2_num = RG_B;
+                        default: w2_num = RG_A;
                     endcase
                 end
                 PK_XY: if (ir_q[15]) begin
@@ -1021,18 +1088,9 @@ module dsp56k_core (
                     w_val = dq_ea_imm ? ew_q : rd1;
                 end
                 PK_XYXY: begin
-                    if (ir_q[15]) case (ir_q[19:18])
-                        2'd0: n_x0 = rd1;
-                        2'd1: n_x1 = rd1;
-                        2'd2: begin n_a0 = 24'd0; n_a1 = rd1; n_a2 = {8{rd1[23]}}; end
-                        default: begin n_b0 = 24'd0; n_b1 = rd1; n_b2 = {8{rd1[23]}}; end
-                    endcase
-                    if (ir_q[22]) case (ir_q[17:16])
-                        2'd0: n_y0 = rd2;
-                        2'd1: n_y1 = rd2;
-                        2'd2: begin n_a0 = 24'd0; n_a1 = rd2; n_a2 = {8{rd2[23]}}; end
-                        default: begin n_b0 = 24'd0; n_b1 = rd2; n_b2 = {8{rd2[23]}}; end
-                    endcase
+                    // the Y word after the X word (both may be A or B)
+                    w_en = ir_q[15]; w_num = xab_reg(1'b0, ir_q[19:18]); w_val = rd1;
+                    w2_en = ir_q[22]; w2_num = xab_reg(1'b1, ir_q[17:16]); w2_val = rd2;
                 end
                 default: ;
             endcase
@@ -1065,59 +1123,27 @@ module dsp56k_core (
                     2'd2: n_omr = n_omr | ir_q[15:8];
                     default: ;
                 endcase
-                C_DIV: begin
-                    case (ir_q[5:4])
-                        2'd0: v24 = x0; 2'd1: v24 = y0; 2'd2: v24 = x1; default: v24 = y1;
-                    endcase
-                    s56 = {{8{v24[23]}}, v24, 24'd0};
-                    d56 = ir_q[3] ? acc_b : acc_a;
-                    r56 = {d56[54:0], 1'b0};
-                    if (d56[55] ^ v24[23]) r56 = r56 + s56;
-                    else                   r56 = r56 - s56;
-                    r56[0] = r56[0] | n_sr[0];
-                    if (ir_q[3]) begin n_b2 = r56[55:48]; n_b1 = r56[47:24]; n_b0 = r56[23:0]; end
-                    else         begin n_a2 = r56[55:48]; n_a1 = r56[47:24]; n_a0 = r56[23:0]; end
-                    n_sr[0] = ~r56[55];
-                    n_sr[1] = d56[55] ^ d56[54];
-                    if (d56[55] ^ d56[54]) n_sr[6] = 1'b1;
+                C_DIV: begin   // (the accumulator: acw_v)
+                    n_sr[0] = ~dv_r[55];
+                    n_sr[1] = dn_s[55] ^ dn_s[54];
+                    if (dn_s[55] ^ dn_s[54]) n_sr[6] = 1'b1;
                 end
-                C_NORM: begin
-                    d56 = ir_q[3] ? acc_b : acc_a;
-                    r56 = d56;
+                C_NORM: begin  // (the accumulator: acw_v)
                     hd = 16'd0;   // newsr
-                    if (!n_sr[5] && n_sr[4] && !n_sr[2]) begin
-                        r56 = {d56[54:0], 1'b0};
-                        hd[0] = d56[55];
-                        hd[1] = d56[55] ^ d56[54];
-                        hd[6] = d56[55] ^ d56[54];
-                        n_rr[ir_q[10:8]] = rr[ir_q[10:8]] - 16'd1;
-                    end else if (n_sr[5]) begin
-                        r56 = {d56[55], d56[55:1]};
-                        hd[0] = d56[0];
-                        n_rr[ir_q[10:8]] = rr[ir_q[10:8]] + 16'd1;
+                    if (nm_lft) begin
+                        hd[0] = dn_s[55];
+                        hd[1] = dn_s[55] ^ dn_s[54];
+                        hd[6] = dn_s[55] ^ dn_s[54];
+                        w_en = 1'b1; w_num = {3'b010, ir_q[10:8]}; w_val = {8'd0, rr[ir_q[10:8]] - 16'd1};
+                    end else if (nm_rgt) begin
+                        hd[0] = dn_s[0];
+                        w_en = 1'b1; w_num = {3'b010, ir_q[10:8]}; w_val = {8'd0, rr[ir_q[10:8]] + 16'd1};
                     end
-                    if (ir_q[3]) begin n_b2 = r56[55:48]; n_b1 = r56[47:24]; n_b0 = r56[23:0]; end
-                    else         begin n_a2 = r56[55:48]; n_a1 = r56[47:24]; n_a0 = r56[23:0]; end
-                    n_sr = euzn_c(n_sr, r56);
+                    n_sr = euzn_c(n_sr, acw_v);
                     n_sr = (n_sr & ~16'h0003) | hd;
                 end
-                C_TCC: begin
-                    if (cc_true(ir_q[15:12], n_sr)) begin
-                        case (ir_q[6:3])
-                            4'd0:  begin d56 = acc_b; nr = RG_A; end
-                            4'd1:  begin d56 = acc_a; nr = RG_B; end
-                            4'd8:  begin d56 = {{8{x0[23]}}, x0, 24'd0}; nr = RG_A; end
-                            4'd9:  begin d56 = {{8{x0[23]}}, x0, 24'd0}; nr = RG_B; end
-                            4'd10: begin d56 = {{8{y0[23]}}, y0, 24'd0}; nr = RG_A; end
-                            4'd11: begin d56 = {{8{y0[23]}}, y0, 24'd0}; nr = RG_B; end
-                            4'd12: begin d56 = {{8{x1[23]}}, x1, 24'd0}; nr = RG_A; end
-                            4'd13: begin d56 = {{8{x1[23]}}, x1, 24'd0}; nr = RG_B; end
-                            4'd14: begin d56 = {{8{y1[23]}}, y1, 24'd0}; nr = RG_A; end
-                            4'd15: begin d56 = {{8{y1[23]}}, y1, 24'd0}; nr = RG_B; end
-                            default: begin d56 = 56'd0; nr = RG_B; end  // NULL source/dest
-                        endcase
-                        if (nr == RG_A) begin n_a2 = d56[55:48]; n_a1 = d56[47:24]; n_a0 = d56[23:0]; end
-                        else            begin n_b2 = d56[55:48]; n_b1 = d56[47:24]; n_b0 = d56[23:0]; end
+                C_TCC: begin   // (the accumulator: acw_v)
+                    if (tc_t) begin
                         if (ir_q[16]) begin
                             w_en = 1'b1; w_agu = 1'b1;
                             w_num = {3'b010, ir_q[2:0]}; w_val = {8'd0, rr[ir_q[10:8]]};
@@ -1230,7 +1256,8 @@ module dsp56k_core (
                 n_la = stk_h[sp_m1]; n_lc = {8'd0, stk_l[sp_m1]};
             end
         end
-        // dsp_write_reg
+        // dsp_write_reg (also NORM's Rn update, w_agu = 0); n_rr, n_nn and
+        // n_mm are still the registers here: the delay slot takes their value
         if (w_en) begin
             case (w_num)
                 RG_A: begin n_a0 = 24'd0; n_a1 = w_val; n_a2 = {8{w_val[23]}}; end
@@ -1239,15 +1266,15 @@ module dsp56k_core (
                 RG_A0: n_a0 = w_val;  RG_B0: n_b0 = w_val;  RG_A1: n_a1 = w_val;  RG_B1: n_b1 = w_val;
                 RG_A2: n_a2 = w_val[7:0];  RG_B2: n_b2 = w_val[7:0];
                 6'h10, 6'h11, 6'h12, 6'h13, 6'h14, 6'h15, 6'h16, 6'h17: begin
-                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = n_rr[w_num[2:0]]; end
+                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = rr[w_num[2:0]]; end
                     n_rr[w_num[2:0]] = w_val[15:0];
                 end
                 6'h18, 6'h19, 6'h1a, 6'h1b, 6'h1c, 6'h1d, 6'h1e, 6'h1f: begin
-                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = n_nn[w_num[2:0]]; end
+                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = nn[w_num[2:0]]; end
                     n_nn[w_num[2:0]] = w_val[15:0];
                 end
                 6'h20, 6'h21, 6'h22, 6'h23, 6'h24, 6'h25, 6'h26, 6'h27: begin
-                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = n_mm[w_num[2:0]]; end
+                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = mm[w_num[2:0]]; end
                     n_mm[w_num[2:0]] = w_val[15:0];
                 end
                 RG_LCSAVE: n_lcsave = 24'd0;
@@ -1272,13 +1299,24 @@ module dsp56k_core (
                 default: ;
             endcase
         end
+        // the second write (data registers, dsp_write_reg's rules)
+        if (w2_en) begin
+            case (w2_num)
+                RG_A: begin n_a0 = 24'd0; n_a1 = w2_val; n_a2 = {8{w2_val[23]}}; end
+                RG_B: begin n_b0 = 24'd0; n_b1 = w2_val; n_b2 = {8{w2_val[23]}}; end
+                RG_X0: n_x0 = w2_val;  RG_X1: n_x1 = w2_val;  RG_Y0: n_y0 = w2_val;  RG_Y1: n_y1 = w2_val;
+                RG_A0: n_a0 = w2_val;  RG_B0: n_b0 = w2_val;
+                default: ;
+            endcase
+        end
         // bit operations on registers set C after the register write
         if (!dq_ispm && dq_bitrg) n_sr[0] = sval_q_bit;
         // pushes: JSR, JScc, JSCLR, JSSET
         if (push_j) begin
             t7 = sp_push(n_sp); n_sp = t7[5:0]; if (t7[6]) n_st_stkerr = 1'b1;
             wa_i = n_sp[3:0]; wa_h = (n_sp[3:0] != 4'd0); wa_l = wa_h;
-            wa_hv = dq_jb ? (pc + 16'd2) : (pc + len); wa_lv = n_sr;
+            wa_hv = (dq_jb || len == 16'd2) ? pc_p2 : (len == 16'd1) ? pc_p1 : pc;   // (len: 0, 1, 2)
+            wa_lv = n_sr;
         end
         // DO: push (LA, LC), LA = P:pc+1, [DO reg: LC], push (pc+2, SR), LF
         if (push_do) begin
@@ -1321,12 +1359,12 @@ module dsp56k_core (
             end
         end
         lc_eq1 = rep_dec ? (stay ? (lc_i[15:0] == 16'd2) : (n_lcsave == 24'd1)) : (lc_i == 24'd1);
-        if (jt)        begin seq_pc = jtgt;  seq_pc1 = jtgt + 16'd1; end
-        else if (stay) begin seq_pc = pc;    seq_pc1 = pc_p1; end
-        else if (len == 16'd2) begin seq_pc = pc_p2; seq_pc1 = pc_p3; end
-        else if (len == 16'd1) begin seq_pc = pc_p1; seq_pc1 = pc_p2; end
-        else           begin seq_pc = pc;    seq_pc1 = pc_p1; end
-        n_pc = seq_pc; n_pc1 = seq_pc1;
+        if (jt)        seq_pc = jtgt;
+        else if (stay) seq_pc = pc;
+        else if (len == 16'd2) seq_pc = pc_p2;
+        else if (len == 16'd1) seq_pc = pc_p1;
+        else           seq_pc = pc;
+        n_pc = seq_pc;
         // DO loop end
         ki = n_sp[3:0];
         rdv = stk_rd(ki, wa_h, wa_l, wa_i, wa_hv, wa_lv, wb_h, wb_i, wb_hv, wb_lv,
@@ -1344,12 +1382,13 @@ module dsp56k_core (
                 n_la = rdv[31:16]; n_lc = {8'd0, rdv[15:0]};
             end else begin
                 n_lc = {8'd0, n_lc[15:0] - 16'd1};
-                n_pc = rdv[31:16]; n_pc1 = rdv[31:16] + 16'd1;
+                n_pc = rdv[31:16];
                 do_back = 1'b1;
             end
         end
-        eq_f1 = do_back ? ({1'b0, rdv[31:16]} == if_p1) : ({1'b0, seq_pc} == if_p1);
-        eq_f2 = do_back ? ({1'b0, rdv[31:16]} == if_p2) : ({1'b0, seq_pc} == if_p2);
+        // (n_pc: the loop start for a jump back, else seq_pc)
+        eq_f1 = ({1'b0, n_pc} == if_p1);
+        eq_f2 = ({1'b0, n_pc} == if_p2);
 
         // ================= dsp_postexecute_interrupts =================
         if (!n_loop_rep) begin
@@ -1359,7 +1398,7 @@ module dsp56k_core (
                     3'd5: n_int_cnt = 3'd4;
                     3'd4: begin
                         n_int_save_pc = n_pc;
-                        n_pc = int_fetch; n_pc1 = if_p1[15:0];
+                        n_pc = int_fetch;
                         if (is_long_insn(vec_word)) begin
                             n_int_state = IS_LONG;
                             t7 = sp_push(n_sp); n_sp = t7[5:0]; if (t7[6]) n_st_stkerr = 1'b1;
@@ -1380,12 +1419,12 @@ module dsp56k_core (
                             end
                             n_int_cnt = 3'd2;
                         end else begin
-                            if (eq_f2) begin n_pc = int_save_pc; n_pc1 = isp_p1; end
+                            if (eq_f2) n_pc = int_save_pc;
                             n_int_cnt = 3'd1;
                         end
                     end
                     3'd2: begin
-                        if (eq_f2) begin n_pc = int_save_pc; n_pc1 = isp_p1; end
+                        if (eq_f2) n_pc = int_save_pc;
                         n_int_cnt = 3'd1;
                     end
                     3'd1: n_int_cnt = 3'd0;
@@ -1454,21 +1493,21 @@ module dsp56k_core (
     // ------------------------------------------------------------------
     wire        fetch_now = el || (state == ST_FETCH);
     wire [15:0] fetch_pc  = (state == ST_FETCH) ? pc : n_pc;
-    wire [15:0] fetch_pc1 = (state == ST_FETCH) ? pc_p1 : n_pc1;
+    wire [15:0] fetch_pc1 = ((state == ST_FETCH) ? pc : n_pc) + 16'd1;
     wire        do1 = t_iss && p_a1_en;
     wire        do2 = t_iss && p_a2_en;
     wire        dow = t_wr2 && aw_en_q;
 
     always @* begin
-        pint_we_a = 1'b0; pint_addr_a = 9'd0; pint_d_a = 24'd0;
-        pint_we_b = 1'b0; pint_addr_b = 9'd0; pint_d_b = 24'd0;
-        ext_we_a = 1'b0; ext_addr_a = 15'd0; ext_d_a = 24'd0;
-        ext_we_b = 1'b0; ext_addr_b = 15'd0; ext_d_b = 24'd0;
-        xint_we = 1'b0; xint_addr = 8'd0; xint_d = 24'd0;
-        yint_we = 1'b0; yint_addr = 8'd0; yint_d = 24'd0;
+        pint_we_a = 1'b0; pint_addr_a = 9'd0;
+        pint_we_b = 1'b0; pint_addr_b = 9'd0;
+        ext_we_a = 1'b0; ext_addr_a = 15'd0;
+        ext_we_b = 1'b0; ext_addr_b = 15'd0;
+        xint_we = 1'b0; xint_addr = 8'd0;
+        yint_we = 1'b0; yint_addr = 8'd0;
         xrom_en = 1'b0; xrom_addr = 8'd0; yrom_en = 1'b0; yrom_addr = 8'd0;
-        perx_rd = 1'b0; perx_wr = 1'b0; perx_addr = 6'd0; perx_wdata = 24'd0;
-        pery_rd = 1'b0; pery_wr = 1'b0; pery_addr = 6'd0; pery_wdata = 24'd0;
+        perx_rd = 1'b0; perx_wr = 1'b0; perx_addr = 6'd0;
+        pery_rd = 1'b0; pery_wr = 1'b0; pery_addr = 6'd0;
 
         if (fetch_now) begin
             pint_addr_a = fetch_pc[8:0];
@@ -1479,43 +1518,56 @@ module dsp56k_core (
             if (vec_rd) pint_addr_b = vec_ad[8:0];
             if (do1) begin
                 case (p_r1)
-                    RG_INT: if (p_a1_sp == 2'd1) begin yint_addr = p_a1_ad[7:0]; yint_we = p_a1_we; yint_d = p_a1_wd; end
-                            else begin xint_addr = p_a1_ad[7:0]; xint_we = p_a1_we; xint_d = p_a1_wd; end
+                    RG_INT: if (p_a1_sp == 2'd1) begin yint_addr = p_a1_ad[7:0]; yint_we = p_a1_we; end
+                            else begin xint_addr = p_a1_ad[7:0]; xint_we = p_a1_we; end
                     RG_ROM: if (p_a1_sp == 2'd1) begin yrom_en = 1'b1; yrom_addr = p_a1_ad[7:0]; end
                             else begin xrom_en = 1'b1; xrom_addr = p_a1_ad[7:0]; end
-                    RG_PER: if (p_a1_sp == 2'd1) begin pery_addr = p_a1_ad[5:0]; pery_rd = !p_a1_we; pery_wr = p_a1_we; pery_wdata = p_a1_wd; end
-                            else begin perx_addr = p_a1_ad[5:0]; perx_rd = !p_a1_we; perx_wr = p_a1_we; perx_wdata = p_a1_wd; end
-                    RG_PINT: begin pint_addr_a = p_a1_ad[8:0]; pint_we_a = p_a1_we; pint_d_a = p_a1_wd; end
-                    RG_EXT: if (p_a1_sp == 2'd1) begin ext_addr_b = ext_addr(2'd1, p_a1_ad); ext_we_b = p_a1_we; ext_d_b = p_a1_wd; end
-                            else begin ext_addr_a = ext_addr(p_a1_sp, p_a1_ad); ext_we_a = p_a1_we; ext_d_a = p_a1_wd; end
+                    RG_PER: if (p_a1_sp == 2'd1) begin pery_addr = p_a1_ad[5:0]; pery_rd = !p_a1_we; pery_wr = p_a1_we; end
+                            else begin perx_addr = p_a1_ad[5:0]; perx_rd = !p_a1_we; perx_wr = p_a1_we; end
+                    RG_PINT: begin pint_addr_a = p_a1_ad[8:0]; pint_we_a = p_a1_we; end
+                    RG_EXT: if (p_a1_sp == 2'd1) begin ext_addr_b = ext_addr(2'd1, p_a1_ad); ext_we_b = p_a1_we; end
+                            else begin ext_addr_a = ext_addr(p_a1_sp, p_a1_ad); ext_we_a = p_a1_we; end
                     default: ;
                 endcase
             end
             if (do2) begin
                 case (p_r2)
-                    RG_INT: begin yint_addr = p_a2_ad[7:0]; yint_we = p_a2_we; yint_d = p_a2_wd; end
+                    RG_INT: begin yint_addr = p_a2_ad[7:0]; yint_we = p_a2_we; end
                     RG_ROM: begin yrom_en = 1'b1; yrom_addr = p_a2_ad[7:0]; end
-                    RG_PER: begin pery_addr = p_a2_ad[5:0]; pery_rd = !p_a2_we; pery_wr = p_a2_we; pery_wdata = p_a2_wd; end
-                    RG_EXT: begin ext_addr_b = ext_addr(2'd1, p_a2_ad); ext_we_b = p_a2_we; ext_d_b = p_a2_wd; end
+                    RG_PER: begin pery_addr = p_a2_ad[5:0]; pery_rd = !p_a2_we; pery_wr = p_a2_we; end
+                    RG_EXT: begin ext_addr_b = ext_addr(2'd1, p_a2_ad); ext_we_b = p_a2_we; end
                     default: ;
                 endcase
             end
             if (dow) begin
                 case (rw_q)
-                    RG_INT: if (aw_sp_q == 2'd1) begin yint_addr = aw_ad_q[7:0]; yint_we = 1'b1; yint_d = aw_wd; end
-                            else begin xint_addr = aw_ad_q[7:0]; xint_we = 1'b1; xint_d = aw_wd; end
-                    RG_PER: if (aw_sp_q == 2'd1) begin pery_addr = aw_ad_q[5:0]; pery_wr = 1'b1; pery_wdata = aw_wd; end
-                            else begin perx_addr = aw_ad_q[5:0]; perx_wr = 1'b1; perx_wdata = aw_wd; end
-                    RG_PINT: begin pint_addr_a = aw_ad_q[8:0]; pint_we_a = 1'b1; pint_d_a = aw_wd; end
-                    RG_EXT: if (aw_sp_q == 2'd1) begin ext_addr_b = ext_addr(2'd1, aw_ad_q); ext_we_b = 1'b1; ext_d_b = aw_wd; end
-                            else begin ext_addr_a = ext_addr(aw_sp_q, aw_ad_q); ext_we_a = 1'b1; ext_d_a = aw_wd; end
+                    RG_INT: if (aw_sp_q == 2'd1) begin yint_addr = aw_ad_q[7:0]; yint_we = 1'b1; end
+                            else begin xint_addr = aw_ad_q[7:0]; xint_we = 1'b1; end
+                    RG_PER: if (aw_sp_q == 2'd1) begin pery_addr = aw_ad_q[5:0]; pery_wr = 1'b1; end
+                            else begin perx_addr = aw_ad_q[5:0]; perx_wr = 1'b1; end
+                    RG_PINT: begin pint_addr_a = aw_ad_q[8:0]; pint_we_a = 1'b1; end
+                    RG_EXT: if (aw_sp_q == 2'd1) begin ext_addr_b = ext_addr(2'd1, aw_ad_q); ext_we_b = 1'b1; end
+                            else begin ext_addr_a = ext_addr(aw_sp_q, aw_ad_q); ext_we_a = 1'b1; end
                     default: ;
                 endcase
             end
         end
         if (boot_we) begin
-            pint_we_b = 1'b1; pint_addr_b = boot_addr; pint_d_b = boot_data;
+            pint_we_b = 1'b1; pint_addr_b = boot_addr;
         end
+        // write data: used with the write enable only; the writer of each
+        // port by the priority above (aw, then a2, then a1)
+        pint_d_a   = (dow && rw_q == RG_PINT) ? aw_wd : p_a1_wd;
+        pint_d_b   = boot_data;
+        ext_d_a    = (dow && rw_q == RG_EXT && aw_sp_q != 2'd1) ? aw_wd : p_a1_wd;
+        ext_d_b    = (dow && rw_q == RG_EXT && aw_sp_q == 2'd1) ? aw_wd :
+                     (do2 && p_r2 == RG_EXT) ? p_a2_wd : p_a1_wd;
+        xint_d     = (dow && rw_q == RG_INT && aw_sp_q != 2'd1) ? aw_wd : p_a1_wd;
+        yint_d     = (dow && rw_q == RG_INT && aw_sp_q == 2'd1) ? aw_wd :
+                     (do2 && p_r2 == RG_INT) ? p_a2_wd : p_a1_wd;
+        perx_wdata = (dow && rw_q == RG_PER && aw_sp_q != 2'd1) ? aw_wd : p_a1_wd;
+        pery_wdata = (dow && rw_q == RG_PER && aw_sp_q == 2'd1) ? aw_wd :
+                     (do2 && p_r2 == RG_PER) ? p_a2_wd : p_a1_wd;
     end
 
     // ------------------------------------------------------------------

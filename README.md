@@ -28,6 +28,7 @@ frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 | DSP56001 | `rtl/falcon/dsp` | 16 MIPS, 32K words, host port, SSI; matches Hatari instruction by instruction and cycle by cycle |
 | DMA sound, crossbar, codec | `falcon_crossbar` | play/record, multi-track, DSP links incl. handshake mode |
 | YM2149 | `falcon_psg` | Hatari's volume table |
+| Audio input | `falcon_audio_adc` | MiSTer ADC channels 0/1 to the Falcon microphone inputs |
 | MFP 68901 | `falcon_mfp*` | timers, interrupts, USART (MiSTer UART) |
 | SCC 85C30 | `rtl/scc/*` | asynchronous modes, interrupts; channel B (the serial port) on the MiSTer UART |
 | ACIAs + IKBD | `falcon_acia`, `falcon_ikbd*` | PS/2 keyboard and mouse, joysticks, MIDI on the UART |
@@ -133,6 +134,23 @@ Keyboard mappings are unchanged by the persistence update. See
 [the Atari ST comparison](docs/keymap-comparison.txt) for the special-key
 mapping differences and MiSTer interception behavior.
 
+### Audio input
+
+The MiSTer ADC input feeds the Falcon's left and right microphone channels
+(ADC channel 0 = left, channel 1 = right, as in the
+[MiSTer ADC test core](https://github.com/MiSTer-devel/ADCTest_MiSTer)). Stereo
+requires an adapter wired for both channels; a channel-0-only adapter supplies
+the left input. Falcon software selects microphone versus PSG through
+`$FF8938` and routes it to recording, the DSP, or audio output through the
+existing crossbar controls. There is no additional OSD switch.
+
+Capture uses 12-bit ADC samples at 96 kHz per channel, removes DC offset,
+and supplies signed 16-bit samples. Startup and reset reacquire the offset
+before enabling samples. The crossbar uses the latest sample at its selected
+rate; a rate-dependent recording anti-alias filter is not implemented.
+`tb/audio_in/run.sh` tests the serial ADC timing and the path into DMA, DSP
+receive and audio output. Physical audio input has not yet been tested.
+
 ## Building
 
 ```
@@ -150,6 +168,45 @@ edition (which Quartus refuses to open), and leaves `Falcon.qsf` as it was:
 Quartus rewrites the project file when it closes it, including the
 `FALCON_BRINGUP` macros `files.qip` adds.
 
+The ap060 variant puts the [AP68060](https://github.com/apolkosnik/AP68060)
+(a pipelined 68060) in place of the AP68030, on its own bus bridge
+(`rtl/falcon/falcon_cpubus060.sv`, the synchronous 68060 bus with
+invalidate-only snooping of the DMA writes).  The processor runs at 50 MHz
+with its bus at the same speed (BCLK = CLK) in every OSD CPU mode (no
+Falcon timing, no `$FFF000` counters); its transfers to the Falcon's memory
+and I/O cross to the 32 MHz system clock.  It has the 060's own FPU, so it
+is built without the FPU service; with the DSP it fills 99 % of the
+device (`scripts/build.sh` applies the area settings it needs), without it
+86 %:
+
+```
+FALCON_BRINGUP="CPU060 NO_FPU" ./scripts/build.sh          # everything
+FALCON_BRINGUP="CPU060 NO_DSP NO_FPU" ./scripts/build.sh   # without the DSP
+```
+
+Its OSD has a Fast RAM option (CT60 mode, `docs/CT60_MODE.md`): 64, 128 or
+240 MB of TT-RAM at `$01000000` on a 32-bit address bus, as on a CT60,
+answered on the 060 bus at 50 MHz from its own line buffers and cache
+(`ap060_fastram`) in front of DDR3; EmuTOS finds it and reports it as
+Alt-RAM.  A size change
+takes effect after a cold reset.
+
+The ap040 variant (branch `ap040`) puts the
+[AP68040](https://github.com/apolkosnik/AP68040) (`faster` branch, a
+pipelined 68040) there instead, on `rtl/falcon/falcon_cpubus040.sv`: the
+ap060's bridge for the 68040's bus (byte lanes from SIZ and A1:A0, DMA
+writes snooped as SC = 10 long-word writes, each ended with TA once the
+processor negates MI, a tenure ended by negating BB).  Everything else is
+the ap060's: the 50 MHz processor clock, CT60 Fast RAM through
+`ap060_fastram` (from the AP68060 submodule), the DDR3 port and the OSD.
+The 68040's FPU is its hardware subset as well (unimplemented instructions
+trap for an FPSP).
+
+```
+FALCON_BRINGUP="CPU040 NO_FPU" ./scripts/build.sh          # everything
+FALCON_BRINGUP="CPU040 NO_DSP NO_FPU" ./scripts/build.sh   # without the DSP
+```
+
 ## Simulation
 
 - Unit benches: `tb/<module>/run.sh` (Verilator; most compare against Hatari's
@@ -157,7 +214,9 @@ Quartus rewrites the project file when it closes it, including the
 - Persistence: `MAIN=/path/to/Main_MiSTer_falcon tb/nvram_store/run.sh` links
   the production Main save/load implementation to the real `hps_io`, NVRAM
   and persistence-controller RTL, using temporary files for storage.
-- Full system: `tb/system/build.sh`, then
+- Full system: `tb/system/build.sh` (`BRINGUP="CPU060" OBJ=obj_060` for the
+  ap060 variant, `BRINGUP="CPU040" OBJ=obj_040` for the ap040; add `NO_DSP`
+  to leave the DSP out), then
   `tb/system/obj_dir/Vtb_top +rom=<emutos.hex> --ms 25000 --ide0 disk.img --frames out`
   (see the header of `tb/system/sim_main.cpp`; `rom2hex64.py` converts a ROM).
 

@@ -406,9 +406,12 @@ wire [16:0] r25 = ste_mode ? ste_rate(r_8921[1:0]) : rate_25(div);
 wire [16:0] r32 = ste_mode ? 17'd0 : rate_32(div);
 wire [20:0] inc25 = r25 * slots;
 wire [20:0] inc32 = r32 * slots;
-reg  [31:0] acc25, acc32;
-wire [31:0] acc25_n = acc25 + {11'd0, inc25};
-wire [31:0] acc32_n = acc32 + {11'd0, inc32};
+// (below CLK_HZ + an increment of 21 bits: 26 bits at 32 MHz)
+localparam integer ACC_W = $clog2(CLK_HZ + (1 << 21)) + 1;
+localparam [ACC_W-1:0] ACC_M = ACC_W'(CLK_HZ);
+reg  [ACC_W-1:0] acc25, acc32;
+wire [ACC_W-1:0] acc25_n = acc25 + {{(ACC_W-21){1'b0}}, inc25};
+wire [ACC_W-1:0] acc32_n = acc32 + {{(ACC_W-21){1'b0}}, inc32};
 
 // ------------------------------------------------------------------------
 // State
@@ -439,6 +442,9 @@ reg         rec_run, rec_loop;
 reg  [24:0] rec_fstart, rec_fend, rec_pos;
 reg  [7:0]  rec_rearm;
 reg  [40:0] wq_mem [0:7];      // {addr[23:1], be[1:0], data[15:0]}
+reg  [40:0] wq_q, wq_byp_d;    // wq_mem's registered read; an entry written to the read address
+reg         wq_byp;
+wire [40:0] wq_head = wq_byp ? wq_byp_d : wq_q;   // wq_mem[wq_rd]
 reg  [2:0]  wq_rd, wq_wr;
 reg  [3:0]  wq_cnt;
 // DMA port
@@ -554,11 +560,10 @@ task rec_push(input [15:0] val);
 		if (v_rec_run) begin
 			if (m16 || mstereo) begin
 				v_wq_ent  = {v_rec_pos[23:1], 2'b11, val};
-				v_rec_pos = v_rec_pos + 25'd2;
 			end else begin
 				v_wq_ent  = {v_rec_pos[23:1], v_rec_pos[0] ? 2'b01 : 2'b10, val[7:0], val[7:0]};
-				v_rec_pos = v_rec_pos + 25'd1;
 			end
+			v_rec_pos = v_rec_pos + ((m16 || mstereo) ? 25'd2 : 25'd1);
 			v_wq_push = 1'b1;
 			if (v_rec_pos >= v_rec_fend) begin
 				line_upd(1'b0, 1'b1);
@@ -794,7 +799,7 @@ always @(posedge clk) begin
 		r_8937 <= 8'h03; r_8938 <= 8'h03; r_8939 <= 8'h00;
 		r_att <= 16'h0000; r_codec <= 16'h2401; r_893e <= 16'h0000;
 		r_gpdir <= 16'h0000; r_gpdat <= 16'h0000;
-		acc25 <= 32'd0; acc32 <= 32'd0; t25_p <= 1'b0; t32_p <= 1'b0;
+		acc25 <= {ACC_W{1'b0}}; acc32 <= {ACC_W{1'b0}}; t25_p <= 1'b0; t32_p <= 1'b0;
 		sndint_r <= 1'b1; soundint_r <= 1'b1;
 		play_run <= 1'b0; play_loop <= 1'b0; play_prime <= 1'b0;
 		play_fstart <= 25'hFFFFFE; play_fend <= 25'hFFFFFE; play_pos <= 25'hFFFFFE;
@@ -844,9 +849,9 @@ always @(posedge clk) begin
 		v_empty = (f_cnt == 0);
 
 		// ---------------- slot clocks ----------------
-		if (acc25_n >= CLK_HZ) acc25 <= acc25_n - CLK_HZ;
+		if (acc25_n >= ACC_M) acc25 <= acc25_n - ACC_M;
 		else acc25 <= acc25_n;
-		if (acc32_n >= CLK_HZ) acc32 <= acc32_n - CLK_HZ;
+		if (acc32_n >= ACC_M) acc32 <= acc32_n - ACC_M;
 		else acc32 <= acc32_n;
 
 		// ---------------- Microwire mask restore ----------------
@@ -1008,8 +1013,8 @@ always @(posedge clk) begin
 		end
 
 		// pending slot ticks: a new tick never gets lost under a consumed one
-		t25_p <= (t25_p & ~v_t25c) | (acc25_n >= CLK_HZ);
-		t32_p <= (t32_p & ~v_t32c) | (acc32_n >= CLK_HZ);
+		t25_p <= (t25_p & ~v_t25c) | (acc25_n >= ACC_M);
+		t32_p <= (t32_p & ~v_t32c) | (acc32_n >= ACC_M);
 
 		// ---------------- TX capture at the strobe ----------------
 		if (ssi_slot_stb && ssi_tx_en) begin
@@ -1089,22 +1094,31 @@ always @(posedge clk) begin
 					dma_busy    <= 1'b1;
 					dma_we      <= 1'b1;
 					dma_kind_rd <= 1'b0;
-					dma_addr    <= wq_mem[wq_rd][40:18];
-					dma_be      <= wq_mem[wq_rd][17:16];
-					dma_wdata   <= wq_mem[wq_rd][15:0];
+					dma_addr    <= wq_head[40:18];
+					dma_be      <= wq_head[17:16];
+					dma_wdata   <= wq_head[15:0];
 				end
 			end
 
 			// write queue
 			begin : wqueue
-				reg wq_pop;
-				wq_pop = !dma_busy && !dma_ack && !can_rd && wq_cnt != 4'd0;
-				if (wq_pop) wq_rd <= wq_rd + 3'd1;
-				if (v_wq_push && wq_cnt != 4'd8) begin
+				reg       wq_pop, wq_push;
+				reg [2:0] wq_rdn;
+				wq_pop  = !dma_busy && !dma_ack && !can_rd && wq_cnt != 4'd0;
+				wq_push = v_wq_push && wq_cnt != 4'd8;
+				wq_rdn  = wq_pop ? wq_rd + 3'd1 : wq_rd;
+				wq_rd <= wq_rdn;
+				if (wq_push) begin
 					wq_mem[wq_wr] <= v_wq_ent;
 					wq_wr <= wq_wr + 3'd1;
 				end
-				wq_cnt <= wq_cnt + ((v_wq_push && wq_cnt != 4'd8) ? 4'd1 : 4'd0)
+				// the head for the next clock (block RAM, read registered); the
+				// entry written now when it is the one at the read address (the
+				// queue empty, or its last entry going out now)
+				wq_q     <= wq_mem[wq_rdn];
+				wq_byp   <= wq_push && wq_wr == wq_rdn;
+				wq_byp_d <= v_wq_ent;
+				wq_cnt <= wq_cnt + (wq_push ? 4'd1 : 4'd0)
 				                 - (wq_pop ? 4'd1 : 4'd0);
 			end
 		end

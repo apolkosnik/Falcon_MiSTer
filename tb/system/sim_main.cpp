@@ -13,11 +13,20 @@
 //     --turbo           CPU on every clock (OSD 32 MHz turbo); default: the
 //                       Falcon's 16 MHz (8 MHz by $FF8007 bit 0)
 //     --tstat           the timing counters at $FFF000 (OSD "Timing counters")
+//     --fastram N       ap060 CT60 mode: Fast RAM 0 off, 1 64 MB, 2 128 MB, 3 240 MB
 //     --pctrace N       print the PC every N clocks
+//     --pcjump LO:HI    when the PC enters [LO,HI] (hex): print the time and
+//                       the 24 distinct PC values before it, then stop
+//     --fetchwatch LO:HI[:T]  when the CPU fetches code from [LO,HI] (hex, a read
+//                       with FC 2 or 6 on the bus) from T ms on: print the 64 CPU
+//                       bus transfers before it (time, address, FC, R/W, PC);
+//                       the first 8 such fetches
 //     --berrtrace       print every bus error cycle
+//     --arbtrace        print every change of bus ownership (and the snoop count)
 //     --iotrace A:B     print device bus accesses with address in [A,B] (hex)
 //     --key T:CODE      at time T ms press PS/2 set 2 CODE (hex, E0xx = extended) for 50 ms
 //     --mouse T:DX:DY:B at time T ms send a mouse packet
+//     --mousestream T:P:DX:DY  from time T ms on, a mouse packet every P ms
 //     --fpu             play the HPS FPU service (tools/falcon_fpu): MAGIC,
 //                       VERSION 4 and a heartbeat every 10 ms in the mailbox
 //                       at $E90000, and every request executed by the same
@@ -26,6 +35,8 @@
 //     --cookies         print the TOS cookie jar at the end
 //     --text ADDR       print the NUL-terminated text at guest ADDR (hex) at the end
 //     --done ADDR       end the run once the long at guest ADDR (hex) reads $D0E0600D
+//     --dump A:LEN:FILE write LEN bytes of guest memory from A (hex) to FILE at the end
+//     +ram=FILE         (plusarg) preload guest RAM from 0 with a rom2hex64.py image
 #include "Vtb_top.h"
 #include "Vtb_top__Dpi.h"
 #include "verilated.h"
@@ -105,13 +116,19 @@ int main(int argc, char **argv) {
     std::string frames_dir;
     int frame_every = 1, monitor = 2, ram = 14, ramtos = 0;
     long pctrace = 0;
+    bool arbtrace = false;
+    uint32_t pcjump_lo = 1, pcjump_hi = 0;   // empty range: off
+    uint32_t fetchwatch_lo = 1, fetchwatch_hi = 0; double fetchwatch_from = 0;
     bool berrtrace = false;
     unsigned io_lo = 1, io_hi = 0;
     double io_from = 0;
     Disk disk[7];
     bool fpu_service = false, cptrace = false, cookies = false, turbo = false, tstat = false;
+    int fastram = 0;
     uint32_t text_addr = 0, done_addr = 0;
+    std::string dump_spec;      // --dump ADDR:LEN:FILE  guest memory written to FILE at the end
     double wrlat_ms = 0, rdlat_ms = 0;
+    double ms_t = 0, ms_p = 0; int ms_dx = 0, ms_dy = 0; long ms_sent = 0;   // --mousestream
     std::vector<Event> events;
 
     for (int i = 1; i < argc; i++) {
@@ -140,18 +157,27 @@ int main(int argc, char **argv) {
         else if (a == "--ram") ram = atoi(next().c_str());
         else if (a == "--ramtos") ramtos = 1;
         else if (a == "--pctrace") pctrace = atol(next().c_str());
+        else if (a == "--arbtrace") arbtrace = true;
+        else if (a == "--fetchwatch") { std::string v = next(); size_t c = v.find(':');
+            fetchwatch_lo = (uint32_t)strtoul(v.c_str(), nullptr, 16); fetchwatch_hi = (uint32_t)strtoul(v.c_str() + c + 1, nullptr, 16);
+            size_t c2 = v.find(':', c + 1); if (c2 != std::string::npos) fetchwatch_from = atof(v.c_str() + c2 + 1); }
+        else if (a == "--pcjump") { std::string v = next(); size_t c = v.find(':');
+            pcjump_lo = (uint32_t)strtoul(v.c_str(), nullptr, 16); pcjump_hi = (uint32_t)strtoul(v.c_str() + c + 1, nullptr, 16); }
         else if (a == "--berrtrace") berrtrace = true;
         else if (a == "--iotrace") sscanf(next().c_str(), "%x:%x", &io_lo, &io_hi);
         else if (a == "--iofrom") io_from = atof(next().c_str());
         else if (a == "--key") { double t; unsigned c; sscanf(next().c_str(), "%lf:%x", &t, &c); events.push_back({t, 0, (int)c, 0, 0}); }
         else if (a == "--mouse") { double t; int dx, dy, b; sscanf(next().c_str(), "%lf:%d:%d:%d", &t, &dx, &dy, &b); events.push_back({t, 1, dx, dy, b}); }
+        else if (a == "--mousestream") sscanf(next().c_str(), "%lf:%lf:%d:%d", &ms_t, &ms_p, &ms_dx, &ms_dy);
         else if (a == "--fpu") fpu_service = true;
         else if (a == "--turbo") turbo = true;
+        else if (a == "--fastram") fastram = atoi(next().c_str()) & 3;
         else if (a == "--tstat") tstat = true;
         else if (a == "--cptrace") cptrace = true;
         else if (a == "--cookies") cookies = true;
         else if (a == "--text") text_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
         else if (a == "--done") done_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
+        else if (a == "--dump") dump_spec = next();
     }
     if (!frames_dir.empty()) mkdir(frames_dir.c_str(), 0755);
     svSetScope(svGetScopeFromName("TOP.tb_top.ddr"));
@@ -166,6 +192,7 @@ int main(int argc, char **argv) {
     top->ram_tos = ramtos;
     top->cpu_turbo = turbo;
     top->tstat_en = tstat;
+    top->fast_ram = fastram;
     top->joy0 = 0;
     top->ps2_key = 0;
     top->ps2_mouse = 0;
@@ -197,11 +224,31 @@ int main(int argc, char **argv) {
     uint32_t prev_pc = 0;
     bool prev_berr = false, rtc_toggle = false;
 
+#ifdef FALCON_CPU060
+    // one system clock (32 MHz, 31.25 ns) with the processor's 50 MHz
+    // (20 ns) edges where they fall, in picoseconds
+    uint64_t t_clk = 15625, t_cpu = 10000;
+    auto tick = [&]() {
+        for (int edges = 0; edges < 2; ) {
+            if (t_cpu < t_clk) {
+                t_cpu += 10000;
+                top->clk_cpu = !top->clk_cpu;
+            } else {
+                if (t_cpu == t_clk) { top->clk_cpu = !top->clk_cpu; t_cpu += 10000; }
+                t_clk += 15625;
+                top->clk = !top->clk; edges++;
+            }
+            top->eval();
+        }
+        cyc++;
+    };
+#else
     auto tick = [&]() {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
         cyc++;
     };
+#endif
 
     while (cyc < total && !Verilated::gotFinish()) {
         double now_ms = cyc / CLK_HZ * 1e3;
@@ -227,6 +274,13 @@ int main(int argc, char **argv) {
         } else if (mount_step >= 7 && top->img_mounted) top->img_mounted = 0;
 
         // scripted input
+        if (ms_p > 0 && now_ms >= ms_t) {
+            mouse_toggle = !mouse_toggle;
+            int st = 8 | (ms_dx < 0 ? 0x10 : 0) | (ms_dy < 0 ? 0x20 : 0);
+            top->ps2_mouse = (mouse_toggle << 24) | ((ms_dy & 0xFF) << 16) | ((ms_dx & 0xFF) << 8) | st;
+            ms_t += ms_p;
+            ms_sent++;
+        }
         for (auto &e : events) {
             if (e.kind < 0) continue;
             if (now_ms >= e.t) {
@@ -349,6 +403,49 @@ int main(int argc, char **argv) {
             printf("[%9.3f ms] pc=%08x ipl=%d\n", now_ms, top->dbg_pc, top->dbg_ipl);
             prev_pc = top->dbg_pc;
         }
+        if (fetchwatch_lo <= fetchwatch_hi) {
+            struct Xfer { double t; uint32_t a, pc; int fc, rw; };
+            static Xfer ring[64]; static int ring_n = 0; static bool prev_as = false;
+            static bool armed = false;   // once code has been fetched outside the range (the reset vectors are read as code)
+            bool as = top->dbg_as;
+            if (as && !prev_as) {
+                uint32_t ad = top->dbg_a; int fc = top->dbg_fc;
+                bool code = top->dbg_rw && (fc == 2 || fc == 6);
+                if (code && (ad < fetchwatch_lo || ad > fetchwatch_hi)) armed = true;
+                static int hits = 0;
+                if (armed && code && ad >= fetchwatch_lo && ad <= fetchwatch_hi && now_ms >= fetchwatch_from && hits < 8) {
+                    hits++;
+                    printf("[%9.3f ms] code fetch at %08x fc=%d (pc=%08x); the transfers before it:\n", now_ms, ad, fc, top->dbg_pc);
+                    for (int i = 0; i < 64; i++) { const Xfer &x = ring[(ring_n + i) % 64]; if (x.t > 0)
+                        printf("  [%9.3f ms] a=%08x fc=%d %s pc=%08x\n", x.t, x.a, x.fc, x.rw ? "rd" : "wr", x.pc); }
+                }
+                ring[ring_n] = Xfer{now_ms, ad, top->dbg_pc, fc, (int)top->dbg_rw}; ring_n = (ring_n + 1) % 64;
+            }
+            prev_as = as;
+        }
+        if (pcjump_lo <= pcjump_hi) {
+            static uint32_t ring[24]; static double ring_t[24]; static int ring_n = 0; static uint32_t last = 0xFFFFFFFF;
+            static bool armed = false;   // once the PC has been outside the range (it starts at 0)
+            uint32_t pc = top->dbg_pc;
+            if (top->dbg_retire && pc != last) {
+                last = pc;
+                if (pc < pcjump_lo || pc > pcjump_hi) armed = true;
+                else if (armed) {
+                    printf("[%9.3f ms] PC enters %08x (ipl=%d); before it:\n", now_ms, pc, top->dbg_ipl);
+                    for (int i = 0; i < 24; i++) { int k = (ring_n + i) % 24; if (ring_t[k] > 0) printf("  [%9.3f ms] pc=%08x\n", ring_t[k], ring[k]); }
+                    break;
+                }
+                ring[ring_n] = pc; ring_t[ring_n] = now_ms; ring_n = (ring_n + 1) % 24;
+            }
+        }
+        if (arbtrace) {
+            static bool prev_own = false; static long snoops = 0;
+            if (top->dbg_snoop) snoops++;
+            if (top->dbg_busown != prev_own) {
+                printf("[%9.3f ms] bus %s (snoops so far %ld) pc=%08x\n", now_ms, top->dbg_busown ? "taken from the CPU" : "back to the CPU", snoops, top->dbg_pc);
+                prev_own = top->dbg_busown;
+            }
+        }
         if (berrtrace && top->dbg_berr && !prev_berr)
             printf("[%9.3f ms] BERR a=%08x fc=%d %s pc=%08x\n", now_ms, top->dbg_a, top->dbg_fc, top->dbg_rw ? "rd" : "wr", top->dbg_pc);
         prev_berr = top->dbg_berr;
@@ -375,6 +472,15 @@ int main(int argc, char **argv) {
     printf("simulated %.3f ms, %llu clocks\n", cyc / CLK_HZ * 1e3, (unsigned long long)cyc);
     if (fpu_service)
         printf("FPU mailbox: MAGIC %04x HEARTBEAT %04x\n", guest_rd32(0xE90000) >> 16, guest_rd32(0xE90000) & 0xFFFF);
+    if (!dump_spec.empty()) {
+        unsigned long da = 0, dl = 0; char fn[512] = {0};
+        if (sscanf(dump_spec.c_str(), "%lx:%lx:%511s", &da, &dl, fn) == 3) {
+            FILE *df = fopen(fn, "wb");
+            for (unsigned long i = 0; df && i < dl; i++) fputc(guest_rd8((uint32_t)(da + i)), df);
+            if (df) fclose(df);
+            printf("dumped %06lx..%06lx to %s\n", da, da + dl, fn);
+        }
+    }
     if (text_addr) {
         printf("text at %06x:\n", text_addr);
         for (uint32_t i = 0; i < 65536; i++) {
@@ -395,6 +501,7 @@ int main(int argc, char **argv) {
             printf("  %s = %08x\n", n, val);
         }
     }
+    if (ms_p > 0) printf("mouse stream: %ld packets sent\n", ms_sent);
     top->final();
     delete top;
     return 0;

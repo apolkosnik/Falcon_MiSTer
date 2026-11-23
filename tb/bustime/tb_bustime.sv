@@ -186,6 +186,7 @@ falcon_l2 l2
 );
 falcon_memarb memarb
 (
+	.snoop_hold(1'b0),
 	.clk(clk), .reset(reset), .ram_mb(4'd4),
 	.vid_req(vid_req), .vid_addr(vid_addr), .vid_ack(vid_ack), .vid_data(), .vid_valid(),
 	.ld_wr(1'b0), .ld_addr(24'd0), .ld_data(8'd0), .ld_busy(),

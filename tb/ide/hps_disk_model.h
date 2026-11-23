@@ -11,8 +11,13 @@
 //    clock one clock later (b_wr[0]) and sd_buff_addr increments two clocks
 //    after that (b_wr[2]);
 //  - 0x18: each further strobe samples sd_buff_din and increments
-//    sd_buff_addr (saturating at 511);
+//    sd_buff_addr (saturating at its width's all-ones, 16383);
 //  - sd_ack drops when the command ends (io_enable low).
+//  - a request of sd_blk_cnt + 1 blocks (read with sd_lba in the 0x16 poll)
+//    moves all its (sd_blk_cnt + 1) * 512 bytes in one command, sd_ack high
+//    throughout and sd_buff_addr counting on across the blocks (hps_io,
+//    Main_MiSTer); reqs_rd / reqs_wr count the requests, ops_rd / ops_wr the
+//    sectors.
 // Strobes are spaced by a random number of clocks (min 3).
 //
 // The images are sparse: unwritten sectors return a deterministic pattern.
@@ -75,8 +80,10 @@ struct HpsModel {
 	int      wait = 0;
 	int      cnt = 0;
 	unsigned b_wr = 0;
-	uint8_t  buf[512];
+	uint8_t  buf[16384];
+	int      nblk = 1;           // blocks in the request
 	uint64_t ops_rd = 0, ops_wr = 0;
+	uint64_t reqs_rd = 0, reqs_wr = 0;
 	uint32_t last_lba[8];
 	int      min_lat = 20, max_lat = 400;
 	int      errors = 0;
@@ -90,10 +97,10 @@ struct HpsModel {
 
 	// Called once per clock before the rising edge with the core's current
 	// outputs.  Updates the model's registered outputs.
-	void step(uint32_t sd_rd, uint32_t sd_wr, uint32_t sd_lba, uint32_t sd_buff_din) {
+	void step(uint32_t sd_rd, uint32_t sd_wr, uint32_t sd_lba, uint32_t sd_buff_din, uint32_t sd_blk_cnt = 0) {
 		// b_wr pipeline (hps_io: sd_buff_wr <= b_wr[0]; addr++ on b_wr[2])
 		uint32_t n_wr = (b_wr & 1) ? 1 : 0;
-		if ((b_wr & 4) && sd_buff_addr != 511) sd_buff_addr++;
+		if ((b_wr & 4) && sd_buff_addr != 16383) sd_buff_addr++;
 		b_wr = (b_wr << 1) & 7;
 		sd_buff_wr = n_wr;
 
@@ -116,9 +123,12 @@ struct HpsModel {
 				if (!r && !w) { fprintf(stderr, "HPS: request dropped before ack (unit %d)\n", unit); errors++; st = IDLE; break; }
 				is_wr = w;
 				lba = sd_lba;
+				nblk = (int)(sd_blk_cnt & 63) + 1;
+				if (nblk * 512 > 16384) { fprintf(stderr, "HPS: request of %d blocks over 16384 bytes\n", nblk); errors++; nblk = 32; }
 				last_lba[unit] = sd_lba;
 				if (!is_wr) {
-					for (int i = 0; i < 512; i++) buf[i] = img[unit].get(lba, i);
+					for (int b = 0; b < nblk; b++)
+						for (int i = 0; i < 512; i++) buf[b * 512 + i] = img[unit].get(lba + b, i);
 				}
 				wait = rnd(10, 100);
 				st = XFER_START;
@@ -141,11 +151,11 @@ struct HpsModel {
 					b_wr = 1;
 				} else {
 					buf[cnt] = (uint8_t)sd_buff_din;
-					if (sd_buff_addr != 511) sd_buff_addr++;
+					if (sd_buff_addr != 16383) sd_buff_addr++;
 				}
 				cnt++;
 				wait = rnd(3, 8);
-				if (cnt == 512) { wait = rnd(4, 12); st = XFER_END; }
+				if (cnt == nblk * 512) { wait = rnd(4, 12); st = XFER_END; }
 			}
 			break;
 		case XFER_END:
@@ -153,9 +163,9 @@ struct HpsModel {
 				sd_ack = 0;
 				if (is_wr) {
 					if (img[unit].readonly) { fprintf(stderr, "HPS: write to read only image unit %d\n", unit); errors++; }
-					img[unit].put(lba, buf);
-					ops_wr++;
-				} else ops_rd++;
+					for (int b = 0; b < nblk; b++) img[unit].put(lba + b, buf + b * 512);
+					ops_wr += nblk; reqs_wr++;
+				} else { ops_rd += nblk; reqs_rd++; }
 				st = IDLE;
 			}
 			break;

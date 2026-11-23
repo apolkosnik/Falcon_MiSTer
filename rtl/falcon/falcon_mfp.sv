@@ -109,18 +109,32 @@ module falcon_mfp #(
 );
 
     // ------------------------------------------------------------------
-    // 2.4576 MHz clock enable (fractional accumulator)
-    reg [31:0] acc;
+    // 2.4576 MHz clock enable (fractional accumulator, reduced by the gcd:
+    // the same ticks, 48 per 625 clocks at 32 MHz)
+    function automatic integer gcd_f(input integer a, input integer b);
+        integer x, y, t, i;
+        begin
+            x = a; y = b;
+            for (i = 0; i < 64; i = i + 1)
+                if (y != 0) begin t = x % y; x = y; y = t; end
+            gcd_f = x;
+        end
+    endfunction
+    localparam integer MFP_G = gcd_f(CLK_HZ, MFP_HZ);
+    localparam integer MFP_I = MFP_HZ / MFP_G;
+    localparam integer MFP_M = CLK_HZ / MFP_G;
+    localparam integer MFP_W = $clog2(MFP_M + MFP_I) + 1;
+    reg [MFP_W-1:0] acc;
     reg        mfp_tick;
     always @(posedge clk) begin
         if (reset) begin
-            acc      <= 32'd0;
+            acc      <= {MFP_W{1'b0}};
             mfp_tick <= 1'b0;
-        end else if (acc + MFP_HZ >= CLK_HZ) begin
-            acc      <= acc + MFP_HZ - CLK_HZ;
+        end else if (acc + MFP_I >= MFP_M) begin
+            acc      <= acc + MFP_I - MFP_M;
             mfp_tick <= 1'b1;
         end else begin
-            acc      <= acc + MFP_HZ;
+            acc      <= acc + MFP_I;
             mfp_tick <= 1'b0;
         end
     end

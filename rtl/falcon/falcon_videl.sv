@@ -459,24 +459,37 @@ end
 //----------------------------------------------------------------------------
 // Base clock enable: 25.175 MHz or 32 MHz from CLK_HZ
 //----------------------------------------------------------------------------
-localparam [31:0] F25 = 32'd25175000;
-localparam [31:0] F32 = 32'd32000000;
-localparam [31:0] FCLK = CLK_HZ;
+// (a fractional accumulator reduced by the gcd of both rates and CLK_HZ:
+// the same enables, 1007 or 1280 per 1280 clocks at 32 MHz)
+function automatic integer gcd_f(input integer m, input integer n);
+	integer x, y, t, i;
+	begin
+		x = m; y = n;
+		for (i = 0; i < 64; i = i + 1)
+			if (y != 0) begin t = x % y; x = y; y = t; end
+		gcd_f = x;
+	end
+endfunction
+localparam integer FG   = gcd_f(gcd_f(25175000, 32000000), CLK_HZ);
+localparam integer FW   = $clog2(CLK_HZ / FG + 32000000 / FG) + 1;
+localparam [FW-1:0] F25  = FW'(25175000 / FG);
+localparam [FW-1:0] F32  = FW'(32000000 / FG);
+localparam [FW-1:0] FCLK = FW'(CLK_HZ / FG);
 
 reg        lt_clk25;                // line-latched clock select
-reg [31:0] facc;
+reg [FW-1:0] facc;
 reg        ce_base;
-wire [32:0] facc_sum = {1'b0, facc} + {1'b0, (lt_clk25 ? F25 : F32)};
+wire [FW:0] facc_sum = {1'b0, facc} + {1'b0, (lt_clk25 ? F25 : F32)};
 
 always @(posedge clk) begin
 	if (reset) begin
-		facc    <= 32'd0;
+		facc    <= {FW{1'b0}};
 		ce_base <= 1'b0;
 	end else if (facc_sum >= {1'b0, FCLK}) begin
-		facc    <= facc_sum[31:0] - FCLK;
+		facc    <= facc_sum[FW-1:0] - FCLK;
 		ce_base <= 1'b1;
 	end else begin
-		facc    <= facc_sum[31:0];
+		facc    <= facc_sum[FW-1:0];
 		ce_base <= 1'b0;
 	end
 end
