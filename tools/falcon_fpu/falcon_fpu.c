@@ -366,6 +366,15 @@ int main(int argc, char **argv)
 		t = now_ns();
 		if (got) last_req = t;
 		if (t >= next_hb) {
+			/* the mailbox is the core's memory: another core loaded meanwhile, or a
+			   RAM clear, takes the header away, and the FPU with it, for as long
+			   as this service runs.  Put it back */
+			if (rd16(O_MAGIC) != FPU_MAGIC || rd16(O_VERSION) != FPU_VERSION) {
+				wr32(O_STATUS, fields(fpu_status(seen, 0, 0), 0));
+				wr16(O_VERSION, FPU_VERSION);
+				barrier();
+				wr16(O_MAGIC, FPU_MAGIC);
+			}
 			wr16(O_HB, ++hb);
 			barrier();
 			next_hb += HB_PERIOD_NS;
