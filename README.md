@@ -3,7 +3,12 @@
 Atari Falcon030 core for MiSTer (DE10-Nano).
 
 - CPU: [AP68030](https://github.com/apolkosnik/AP68030), a pin-level MC68030
-  (caches, PMMU), submodule at `rtl/AP68030`.
+  (caches, PMMU), in `rtl/AP68030`; the ap040/ap060 variants use
+  [AP68040](https://github.com/apolkosnik/AP68040) (`rtl/AP68040`) and
+  [AP68060](https://github.com/apolkosnik/AP68060) (`rtl/AP68060`).  The
+  three cores are copied in (their `rtl/`, LICENSE and README), not
+  submodules: AP68030 at 31a229e (main), AP68040 at e238c62 and AP68060 at
+  cb171a4 (branch icsnoop: main with the instruction-cache self-snoop).  Their tests live in their own repositories.
 - Chipset: written for this core, with the
   [Hatari](https://hatari.tuxfamily.org/) emulator as the behavioural
   reference for every device (each module header names the Hatari functions it
@@ -64,8 +69,10 @@ interface and the program `falcon_fpu` executes the instructions on the ARM
 (Hatari's 68882 emulation; design and measurements in `docs/FPU_ARM.md`).
 Main starts it with the core and stops it before another core is loaded:
 
-1. Use a core with the bridge: `releases/Falcon-fpu_20261008.rbf` (it also has
-   the NVRAM store below).
+1. Use a core with the bridge: one built from `FalconFPU.qpf`
+   (`./scripts/build.sh FalconFPU`), or `releases/Falcon-fpu_20261008.rbf`
+   (it also has the NVRAM store below).  `Falcon.qpf` builds the core
+   without it.
 2. Copy `releases/falcon_fpu` to `/media/fat/` and make it executable.
 3. Use `releases/MiSTer_falcon_fpu.bin` as Main: the configuration-menu Main
    below plus the FPU service (`extra/falcon_fpu_main.patch`, on top of
@@ -154,19 +161,33 @@ receive and audio output. Physical audio input has not yet been tested.
 ## Building
 
 ```
-git clone --recurse-submodules <this repo>
-./scripts/build.sh          # Quartus 17.0.x; prints TIMING MET / FAILED
+git clone <this repo>
+./scripts/build.sh              # Falcon.qpf, the AP68030; prints TIMING MET / FAILED
+./scripts/build.sh FalconFPU    # FalconFPU.qpf, the AP68030 with the ARM FPU bridge
+./scripts/build.sh Falcon040    # Falcon040.qpf, the AP68040
+./scripts/build.sh Falcon060    # Falcon060.qpf, the AP68060
 QUARTUS=/path/to/intelFPGA_lite/17.0/quartus ./scripts/build.sh   # another install
 ```
+
+There is one Quartus project per processor, each with the DSP56001 and the
+whole chipset: `Falcon.qpf`, `FalconFPU.qpf` (the AP68030 with the 68882
+through the ARM FPU bridge), `Falcon040.qpf`, `Falcon060.qpf`.  The `.qsf`
+files source `Falcon_common.tcl` (device, pins, the MiSTer framework,
+fitter options) and `files.qip` (the chipset), each adds its processor
+(`files_030.qip`, `files_040.qip`, `files_060.qip`) and sets its own
+optimization settings and seed.  The result is `output_files/<project>.rbf`,
+the log `output_files/<project>.build.log`.  The projects share `db/` and
+`output_files/`: build one at a time in one checkout.
 
 `scripts/build.sh` runs the Quartus stages separately because Quartus 17.0's
 fitter can crash while exiting on newer Linux after a complete fit.  The
 project requires Quartus 17.0 (`/opt/intelFPGA_lite/17.0` by default,
 `QUARTUS` for another install).  The script deletes `db/` and
 `incremental_db/` when they were written by another Quartus version or
-edition (which Quartus refuses to open), and leaves `Falcon.qsf` as it was:
-Quartus rewrites the project file when it closes it, including the
-`FALCON_BRINGUP` macros `files.qip` adds.
+edition (which Quartus refuses to open), and leaves the project's `.qsf` as
+it was: Quartus rewrites the project file when it closes it, including the
+`FALCON_BRINGUP` macros `files.qip` adds.  `FALCON_BRINGUP` still removes
+devices for bring-up builds (`NO_IDE`, `NO_FDC`, `NO_DSP`, ...).
 
 The ap060 variant puts the [AP68060](https://github.com/apolkosnik/AP68060)
 (a pipelined 68060) in place of the AP68030, on its own bus bridge
@@ -176,12 +197,13 @@ with its bus at the same speed (BCLK = CLK) in every OSD CPU mode (no
 Falcon timing, no `$FFF000` counters); its transfers to the Falcon's memory
 and I/O cross to the 32 MHz system clock.  It has the 060's own FPU, so it
 is built without the FPU service; with the DSP it fills 99 % of the
-device (`scripts/build.sh` applies the area settings it needs), without it
+device (`Falcon060.qsf` has the area settings it needs, and
+`scripts/build.sh` runs the fitter in HIGH PERFORMANCE EFFORT), without it
 86 %:
 
 ```
-FALCON_BRINGUP="CPU060 NO_FPU" ./scripts/build.sh          # everything
-FALCON_BRINGUP="CPU060 NO_DSP NO_FPU" ./scripts/build.sh   # without the DSP
+./scripts/build.sh Falcon060                         # everything
+FALCON_BRINGUP=NO_DSP ./scripts/build.sh Falcon060   # without the DSP
 ```
 
 Its OSD has a Fast RAM option (CT60 mode, `docs/CT60_MODE.md`): 64, 128 or
@@ -191,20 +213,20 @@ answered on the 060 bus at 50 MHz from its own line buffers and cache
 Alt-RAM.  A size change
 takes effect after a cold reset.
 
-The ap040 variant (branch `ap040`) puts the
-[AP68040](https://github.com/apolkosnik/AP68040) (`faster` branch, a
-pipelined 68040) there instead, on `rtl/falcon/falcon_cpubus040.sv`: the
+The ap040 variant puts the
+[AP68040](https://github.com/apolkosnik/AP68040) (a pipelined 68040)
+there instead, on `rtl/falcon/falcon_cpubus040.sv`: the
 ap060's bridge for the 68040's bus (byte lanes from SIZ and A1:A0, DMA
 writes snooped as SC = 10 long-word writes, each ended with TA once the
 processor negates MI, a tenure ended by negating BB).  Everything else is
 the ap060's: the 50 MHz processor clock, CT60 Fast RAM through
-`ap060_fastram` (from the AP68060 submodule), the DDR3 port and the OSD.
+`ap060_fastram` (from `rtl/AP68060`), the DDR3 port and the OSD.
 The 68040's FPU is its hardware subset as well (unimplemented instructions
 trap for an FPSP).
 
 ```
-FALCON_BRINGUP="CPU040 NO_FPU" ./scripts/build.sh          # everything
-FALCON_BRINGUP="CPU040 NO_DSP NO_FPU" ./scripts/build.sh   # without the DSP
+./scripts/build.sh Falcon040                         # everything
+FALCON_BRINGUP=NO_DSP ./scripts/build.sh Falcon040   # without the DSP
 ```
 
 ## Simulation

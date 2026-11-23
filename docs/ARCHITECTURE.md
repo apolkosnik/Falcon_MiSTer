@@ -3,7 +3,7 @@
 Atari Falcon030 for MiSTer (DE10-Nano, Cyclone V 5CSEBA6U23I7).
 
 Sources:
-- CPU: AP68030 (`rtl/AP68030`, submodule), a pin-level MC68030.
+- CPU: AP68030 (`rtl/AP68030`, a copy of the AP68030 repository's `rtl/`), a pin-level MC68030.
 - Behavioural reference for every chipset device: Hatari (`/home/adam/hatari/src`,
   Falcon specifics in `src/falcon/`).  Where Hatari and the hardware
   documentation disagree, the hardware documentation wins and the difference

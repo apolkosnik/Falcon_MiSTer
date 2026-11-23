@@ -11,18 +11,36 @@
 # QUARTUS selects another install, as its quartus directory or its bin:
 #   QUARTUS=$HOME/intelFPGA_lite/17.0/quartus ./scripts/build.sh
 #
+# The project to build is the argument (default Falcon):
+#   ./scripts/build.sh              Falcon.qpf     the AP68030
+#   ./scripts/build.sh FalconFPU    FalconFPU.qpf  the AP68030, the ARM FPU bridge
+#   ./scripts/build.sh Falcon040    Falcon040.qpf  the AP68040
+#   ./scripts/build.sh Falcon060    Falcon060.qpf  the AP68060
+# (FALCON_BRINGUP with CPU040 or CPU060 picks Falcon040 or Falcon060, as
+# before the projects were split.)  The result is output_files/<project>.rbf,
+# the log output_files/<project>.build.log.  The projects share db/ and
+# output_files/: build one at a time in one checkout.
+#
 # Only processes started by this script are ever waited on; nothing is killed.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 Q=${QUARTUS:-/opt/intelFPGA_lite/17.0/quartus}
 [ -x "$Q/bin/quartus_sh" ] && Q=$Q/bin
 [ -x "$Q/quartus_sh" ] || { echo "no quartus_sh in $Q or $Q/bin (set QUARTUS)"; exit 1; }
-P=Falcon
-LOG=output_files/build.log
+P=${1:-}
+if [ -z "$P" ]; then
+	case " ${FALCON_BRINGUP:-} " in
+	*" CPU040 "*) P=Falcon040 ;;
+	*" CPU060 "*) P=Falcon060 ;;
+	*) P=Falcon ;;
+	esac
+fi
+case $P in Falcon|FalconFPU|Falcon040|Falcon060) ;; *) echo "unknown project $P (Falcon, FalconFPU, Falcon040, Falcon060)"; exit 1 ;; esac
+LOG=output_files/$P.build.log
 mkdir -p output_files
 : > $LOG
 
-# The build leaves Falcon.qsf as it was.  Quartus saves the project when
+# The build leaves the project's .qsf as it was.  Quartus saves the project when
 # build_id.tcl closes it, and then writes every assignment it evaluated into
 # the .qsf -- including the FALCON_BRINGUP macros files.qip adds, which would
 # turn every later build into a bring-up or measurement build.
@@ -31,42 +49,13 @@ cp $P.qsf $KEEP
 trap 'cp -f $KEEP $P.qsf; rm -f $KEEP' EXIT
 trap 'exit 130' INT TERM
 
-# The ap060 variant (FALCON_BRINGUP with CPU060) is at the edge of the
-# device: synthesis for area (the core is ~1,300 ALUTs smaller), registers
-# packed harder.  The HIGH PERFORMANCE EFFORT mode forces speed in
-# synthesis, so synthesis runs in BALANCED mode with technique AREA; the
-# fitter then runs in HIGH PERFORMANCE EFFORT again (the HDMI clock needs
-# its timing effort).  Project-file assignments win over files.qip's, so
-# these go into Falcon.qsf (restored on exit like the rest).
-# With everything in (the DSP, the 50 MHz processor, Fast RAM) the device is
-# 99 % full, and four more settings make it fit and meet timing:
-#  - no physical synthesis in the AP68060 (its register duplication and
-#    retiming for the 50 MHz clock cost ~1,400 ALMs; it meets 50 MHz without)
-#  - the scaler optimized for speed, with physical synthesis (its HDMI
-#    counter paths need it)
-#  - small RAMs stay in block RAM (no MLAB conversion: MLABs take logic LABs)
-#  - routability optimization always, and no redundant-cell removal (with it
-#    the scaler's HDMI paths miss timing at this density)
-# (the ap040 variant, CPU040, the same with the AP68040)
+# Falcon040 and Falcon060 synthesize in BALANCED mode for area (their .qsf);
+# the fitter runs in HIGH PERFORMANCE EFFORT (the HDMI clock needs its timing
+# effort): the mode is switched between the two stages (the .qsf is restored
+# on exit like the rest).
 AREA060=0
-CPUI=ap68060:cpu
-case " ${FALCON_BRINGUP:-} " in *" CPU040 "*) CPUI=ap68040:cpu ;; esac
-case " ${FALCON_BRINGUP:-} " in *" CPU060 "*|*" CPU040 "*)
-	AREA060=1
-	sed -i -e 's/^set_global_assignment -name OPTIMIZATION_MODE .*/set_global_assignment -name OPTIMIZATION_MODE BALANCED/' \
-	       -e 's/^set_global_assignment -name OPTIMIZATION_TECHNIQUE .*/set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA/' \
-	       -e 's/^set_global_assignment -name ALM_REGISTER_PACKING_EFFORT .*/set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH/' \
-	       -e '/^set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS /d' $P.qsf
-	[ -z "$(tail -c1 $P.qsf)" ] || echo >> $P.qsf
-	cat >> $P.qsf <<-EOF
-	set_global_assignment -name BLOCK_RAM_TO_MLAB_CELL_CONVERSION OFF
-	set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
-	set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "NEVER ALLOW" -to "emu:emu|falcon_system:system|$CPUI"
-	set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "ALWAYS ALLOW" -to "ascal:ascal"
-	set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -to "ascal:ascal"
-	EOF
-	echo "== CPU060: synthesis for area (BALANCED, AREA), register packing HIGH; the fitter in HIGH PERFORMANCE EFFORT;" | tee -a $LOG
-	echo "== CPU060: no physical synthesis in the CPU, the scaler for speed, no MLAB conversion, routability always" | tee -a $LOG ;;
+case $P in Falcon040|Falcon060) AREA060=1
+	echo "== $P: synthesis in BALANCED for area, the fitter in HIGH PERFORMANCE EFFORT" | tee -a $LOG ;;
 esac
 
 # A project database written by another Quartus version or edition is

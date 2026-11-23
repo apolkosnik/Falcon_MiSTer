@@ -3,9 +3,9 @@
 Status: milestones 0, 1, 3 and 4 implemented (2026-10-13; milestone 3 redone
 2026-10-16: the processor at 50 MHz, Fast RAM on its own bus; milestone 4,
 the 060 + DSP with CT60 mode, 2026-10-16), milestone 2 (the board) open, 5
-not started.  Applies to the ap060 variant (`FALCON_BRINGUP="CPU060 ..."`,
+not started.  Applies to the ap060 variant (`Falcon060.qpf`,
 the AP68060 on `falcon_cpubus060`) and to the ap040 variant (branch
-`ap040`, `FALCON_BRINGUP="CPU040 ..."`, the AP68040 on `falcon_cpubus040`
+`ap040`, `Falcon040.qpf`, the AP68040 on `falcon_cpubus040`
 with the same Fast RAM).
 
 Results so far:

@@ -221,7 +221,13 @@ wire        cpu040_mi_n, cpu040_rw_n_i;
 wire  [1:0] cpu040_siz_i, cpu040_sc;
 assign cpu060_bs_n = 4'b0000;
 // (DC1_ATC off, the core's default: DC1's own ATC port is for 60 MHz)
-ap68040 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0), .DC1_ATC(0)) cpu
+// (DEBUG: the dbg_* outputs, only the simulation's PC trace and monitors use
+// them on this path)
+ap68040 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0), .DC1_ATC(0)
+`ifdef VERILATOR
+	, .DEBUG(1)
+`endif
+) cpu
 (
 	.clk(clk_cpu), .bclk_en(1'b1), .rsti_n(~cpu060_rst),
 	.a_o(cpu_a), .a_oe(cpu060_a_oe), .a_i(cpu060_a_i), .ts_n_i(cpu060_ts_n_i), .rw_n_i(cpu040_rw_n_i),

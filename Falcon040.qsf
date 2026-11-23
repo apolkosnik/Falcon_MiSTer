@@ -1,0 +1,54 @@
+# --------------------------------------------------------------------------
+#
+# MiSTer project
+#
+# WARNING WARNING WARNING:
+# Do not add files to project in Quartus IDE! It will mess this file!
+# Add the files manually to files.qip file.
+#
+# --------------------------------------------------------------------------
+
+
+# Falcon040.qpf: the Falcon with the AP68040 on falcon_cpubus040 (the ap060's
+# clocks, Fast RAM and snooping: FALCON_CPU060 as well), the DSP56001.
+
+source Falcon_common.tcl
+# the HPS pins (set_hps_location_assignment is a .qsf command: Quartus does
+# not take it from a sourced file)
+set_hps_location_assignment HPSINTERFACEPERIPHERALSPIMASTER_X52_Y72_N111 -to spi
+set_hps_location_assignment HPSINTERFACEPERIPHERALUART_X52_Y67_N111 -to uart
+set_hps_location_assignment HPSINTERFACEPERIPHERALI2C_X52_Y60_N111 -to hdmi_i2c
+
+# The processor on its own 50 MHz clock with CT60-style Fast RAM, the DSP and
+# the whole chipset leave the device about 99 % full.  Synthesis runs for
+# area (the core is ~1,300 ALUTs smaller), registers packed harder; the
+# HIGH PERFORMANCE EFFORT mode forces speed in synthesis, so the project is
+# BALANCED with technique AREA, and scripts/build.sh switches it to HIGH
+# PERFORMANCE EFFORT for the fitter (the HDMI clock needs its timing
+# effort).  A Quartus GUI compile fits in BALANCED: it may miss the HDMI
+# clock.  Four more settings make it fit:
+#  - no physical synthesis in the AP68040 (its register duplication and
+#    retiming for the 50 MHz clock cost ~1,400 ALMs; it meets 50 MHz without)
+#  - the scaler optimized for speed, with physical synthesis (its HDMI
+#    counter paths need it)
+#  - small RAMs stay in block RAM (no MLAB conversion: MLABs take logic LABs)
+#  - routability optimization always, and no redundant-cell removal (with it
+#    the scaler's HDMI paths miss timing at this density)
+set_global_assignment -name OPTIMIZATION_MODE BALANCED
+set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA
+set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS OFF
+set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
+set_global_assignment -name SEED 1
+set_global_assignment -name BLOCK_RAM_TO_MLAB_CELL_CONVERSION OFF
+set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
+set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "NEVER ALLOW" -to "emu:emu|falcon_system:system|ap68040:cpu"
+set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "ALWAYS ALLOW" -to "ascal:ascal"
+set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -to "ascal:ascal"
+
+# the FPU is the processor's own (no ARM bridge)
+set_global_assignment -name VERILOG_MACRO "FALCON_CPU040=1"
+set_global_assignment -name VERILOG_MACRO "FALCON_CPU060=1"
+set_global_assignment -name VERILOG_MACRO "FALCON_NO_FPU=1"
+
+source files_040.qip
+source files.qip

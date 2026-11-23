@@ -1,0 +1,30 @@
+# --------------------------------------------------------------------------
+#
+# MiSTer project
+#
+# WARNING WARNING WARNING:
+# Do not add files to project in Quartus IDE! It will mess this file!
+# Add the files manually to files.qip file.
+#
+# --------------------------------------------------------------------------
+
+
+# FalconFPU.qpf: the Falcon030 with the AP68030 (its bus bridge, Falcon bus
+# timing, the line cache) and the 68882 FPU through the ARM bridge
+# (falcon_fpu_bridge; Main_MiSTer runs the FPU).
+
+source Falcon_common.tcl
+# the HPS pins (set_hps_location_assignment is a .qsf command: Quartus does
+# not take it from a sourced file)
+set_hps_location_assignment HPSINTERFACEPERIPHERALSPIMASTER_X52_Y72_N111 -to spi
+set_hps_location_assignment HPSINTERFACEPERIPHERALUART_X52_Y67_N111 -to uart
+set_hps_location_assignment HPSINTERFACEPERIPHERALI2C_X52_Y60_N111 -to hdmi_i2c
+
+set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
+set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS ON
+set_global_assignment -name ALM_REGISTER_PACKING_EFFORT MEDIUM
+set_global_assignment -name SEED 9
+
+source files_030.qip
+source files.qip

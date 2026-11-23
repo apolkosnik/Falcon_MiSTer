@@ -1,0 +1,20 @@
+# The AP68040 (Falcon040.qsf): the core, falcon_cpubus040 for its bus, and the
+# ap060's Fast RAM port and DDR3 arbiter (the 040 variant shares the ap060's
+# clocks and snooping: Falcon040.qsf defines FALCON_CPU060 as well)
+foreach f {ap68040_pkg.sv gen/ap68040_upkg.sv ap68040_alu.sv ap68040_alu_slow.sv ap68040_muldiv.sv ap68040_biu.sv
+           ap68040_ram.sv ap68040_atc.sv ap68040_dmu.sv ap68040_predec.sv ap68040_fetch.sv ap68040_decode.sv
+           ap68040_useq.sv ap68040_fpif.sv ap68040_backend.sv ap68040_snoop.sv ap68040.sv} {
+	set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68040/rtl/$f
+}
+set_global_assignment -name VERILOG_FILE rtl/AP68040/rtl/fpu/ap040_fpu.v
+set_global_assignment -name SEARCH_PATH rtl/AP68040/rtl
+set_global_assignment -name SEARCH_PATH rtl/AP68040/rtl/fpu
+set_global_assignment -name SEARCH_PATH rtl/AP68040/rtl/gen
+set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_async_fifo.v
+set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_fastram_fe.v
+set_global_assignment -name VERILOG_FILE rtl/AP68060/rtl/fastram/ap030_fastram_be.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap030_l2ram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap060_fastram_bus.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/AP68060/rtl/fastram/ap060_fastram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus040.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ddr_arb.sv
