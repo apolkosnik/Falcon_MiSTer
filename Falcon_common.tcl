@@ -1,5 +1,5 @@
-# Settings shared by Falcon.qsf and FalconFPU.qsf (AP68030), Falcon040.qsf and
-# Falcon060.qsf:
+# Settings shared by Falcon.qsf and FalconFPU.qsf (AP68030), Falcon040.qsf,
+# Falcon060.qsf and TT030.qsf:
 # the device, pins, the MiSTer framework (sys/), fitter options.  Each .qsf
 # sources this, sets its own optimization mode, technique, register packing,
 # redundant-cell removal and seed, and adds its processor's files.

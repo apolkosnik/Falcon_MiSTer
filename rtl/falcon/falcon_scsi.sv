@@ -55,9 +55,10 @@
 //   READ SUB-CHAN. op 42 flags[0] = MSF, flags[1] = SubQ, arg = format
 //                  (CD only)
 // A response length of 0 or above 512 means "no answer" (a stock Main returns
-// zeros for an LBA beyond the image): INQUIRY and READ CAPACITY then use the
-// built-in responses below (capacity from img_size), the others report CHECK
-// CONDITION, ILLEGAL REQUEST / invalid field in CDB.
+// zeros for an LBA beyond the image): INQUIRY, READ CAPACITY (with PMI) and, on a
+// disk, MODE SENSE(6) pages 0/3/4/$3F then use the built-in responses below
+// (capacity from img_size), the others report CHECK CONDITION, ILLEGAL REQUEST /
+// invalid field in CDB.
 // Forwarded to Main as one block WRITE of 0x7D000000 | unit<<20 | op<<8, the
 // CDB at bytes 496..505 and the parameter list at byte 0: MODE SELECT(6/10)
 // (any unit, parameter list up to 496 bytes) and, on the CD-ROM, PLAY AUDIO
@@ -119,6 +120,23 @@
 // - DMA "end address 16 bytes too high" (Hatari dma_check comment) is not
 //   reproduced; the DMA chip writes the last partial 16 byte FIFO half as a
 //   whole (address rounded up to 16).
+//
+// DaynaPORT (net_on): a Dayna SCSI/Link Ethernet adapter at ID 4, as the ZuluSCSI and
+// BlueSCSI present it (reference: the sp1 Hatari fork's src/daynaport.c, default mode).
+// A processor-type target: INQUIRY "Dayna   SCSI/Link       2.0f", TEST UNIT READY,
+// REQUEST SENSE, 09 MAC address + counters (18 bytes), 0E enable (CDB byte 5 bit 7) /
+// disable, 0D multicast address (data discarded), 0A send one frame (length in CDB
+// bytes 3..4, CDB byte 5 passed on: 0 raw, else framed), 08 receive one frame (an empty
+// queue or a disabled interface answers six zero bytes).  The frames go through the
+// sector buffer and two rings of 16 slots in DDR3 (port n_*), served on the HPS by
+// tools/falcon_net, which builds each receive answer whole (header, frame, CRC):
+//   guest $EA0010 RX_HEAD (HPS), $EA0012 RX_TAIL (here), $EA0014 TX_HEAD (here),
+//   $EA0016 TX_TAIL (HPS), $EA0018 ENABLED (here); 16-bit words, index in bits 3:0
+//   $EA1000 + n*$800 receive slot n: +0 length of the answer, +4 the answer
+//   $EA9000 + n*$800 send slot n: +0 frame length, +2 CDB byte 5, +4 the frame
+// After a reset the indices are taken from the HPS side (RX_TAIL = RX_HEAD, TX_HEAD =
+// TX_TAIL).  A receive slot with a length of 0 or above 1600 is skipped; a frame sent
+// with the send ring full is dropped, so the bus never waits on the HPS.
 
 module falcon_scsi #(
 	parameter CLK_HZ    = 32000000,
@@ -126,6 +144,7 @@ module falcon_scsi #(
 ) (
 	input             clk,
 	input             reset,
+	input             cd_off,          // TT build: no empty CD-ROM at ID 2 (only a mounted one)
 
 	// NCR 5380 register port (falcon_fdc)
 	input             acc,
@@ -163,6 +182,15 @@ module falcon_scsi #(
 	output      [7:0] sd_buff_din2,
 	input             sd_buff_wr,
 
+	// DaynaPORT at ID 4: its DDR3 rings (16-bit words, guest byte order)
+	input             net_on,
+	output reg        n_req,
+	output reg        n_we,
+	output reg [23:1] n_addr,
+	output reg [15:0] n_wdata,
+	input      [15:0] n_rdata,
+	input             n_ack,
+
 	output            led
 );
 
@@ -174,10 +202,12 @@ localparam [2:0] B_FREE = 3'd0, B_ARB = 3'd1, B_SEL1 = 3'd2, B_SEL2 = 3'd3, B_IN
 
 localparam [3:0] T_IDLE = 4'd0, T_MO = 4'd1, T_CMD = 4'd2, T_EXEC = 4'd3, T_CHK = 4'd4,
                  T_DIN = 4'd5, T_DOUT = 4'd6, T_WAITW = 4'd7, T_WIN = 4'd8, T_FILL = 4'd9,
-                 T_ST = 4'd10, T_MI = 4'd11;
+                 T_ST = 4'd10, T_MI = 4'd11, T_NEXEC = 4'd12, T_NOUT = 4'd13, T_NWAIT = 4'd14;
 
 localparam [1:0] K_RD = 2'd0, K_WR = 2'd1, K_VFY = 2'd2, K_NONE = 2'd3;
-localparam [1:0] G_SENSE = 2'd0, G_INQ = 2'd1, G_CAP = 2'd2, G_NONE = 2'd3;
+localparam [2:0] G_SENSE = 3'd0, G_INQ = 3'd1, G_CAP = 3'd2, G_NONE = 3'd3, G_MODE = 3'd4,
+                 G_NINQ = 3'd5, G_MAC = 3'd6;
+localparam [1:0] NS_RX = 2'd0, NS_TX = 2'd1, NS_ENA = 2'd2;
 
 localparam [7:0] WIN_RESP = 8'h7E, WIN_CMD = 8'h7D;
 
@@ -217,6 +247,19 @@ end
 reg  [3:0] skey [0:2];
 reg  [7:0] sasc [0:2];
 
+// DaynaPORT
+reg        t_net;            // the selected target is the DaynaPORT
+reg        n_en;             // interface enabled (0E)
+reg  [3:0] n_key;            // its sense key
+reg        ns_req_t = 1'b0, ns_ack_t = 1'b0;   // a ring operation: requested / done when equal
+reg  [1:0] ns_op;
+reg [10:0] ns_txlen;         // send: frame length
+reg  [7:0] ns_flags;         // send: CDB byte 5
+reg [10:0] ns_rxlen;         // receive: answer length, 0 = none
+reg        nb_we, nb_rd;
+reg [10:0] nb_a, nb_ra;
+reg  [7:0] nb_d;
+
 // command
 reg  [7:0] c0, c1, c2, c3, c4, c5, c6, c7, c8, c9;
 reg  [4:0] ccnt;
@@ -232,7 +275,10 @@ reg [31:0] lba;
 reg [15:0] cnt;
 reg [31:0] capl;             // capacity of the selected unit in its own blocks
 reg  [9:0] alloc_r;
-reg  [1:0] gsel;
+reg  [2:0] gsel;
+reg  [1:0] mpg;              // G_MODE: 0 page 0, 1 page 3, 2 page 4, 3 all ($3F)
+reg        cap_pmi;          // READ CAPACITY with PMI: the end of the cylinder holding cap_lba
+reg [31:0] cap_lba;
 reg  [3:0] rs_key;
 reg  [7:0] rs_asc;
 reg        rs_short;
@@ -253,7 +299,7 @@ reg  [3:0] fcnt;
 reg  [5:0] h_n;              // blocks in the pending / running HPS request
 
 wire       is_cd = (tid == 2'd2);
-wire [2:0] present = mnt | {CD_ALWAYS != 0, 2'b00};
+wire [2:0] present = mnt | {CD_ALWAYS != 0 && !cd_off, 2'b00};
 
 assign sd_lba0 = h_lba;
 assign sd_lba1 = h_lba;
@@ -277,10 +323,10 @@ reg [14:0] bw_a;
 reg  [7:0] bw_d;
 reg  [7:0] m_q;
 wire       hw_e = h_act & ~h_wr & ~h_drop & sd_ack[h_unit] & sd_buff_wr;
-wire       m_we = hw_e | bw_e;
-wire [14:0] m_wa = hw_e ? {hp, sd_buff_addr} : bw_a;
-wire [7:0] m_wd = hw_e ? sd_buff_dout : bw_d;
-wire [14:0] m_ra = (h_act & h_wr) ? {hp, sd_buff_addr} : {bp, pos};
+wire       m_we = hw_e | bw_e | nb_we;
+wire [14:0] m_wa = hw_e ? {hp, sd_buff_addr} : nb_we ? {4'd0, nb_a} : bw_a;
+wire [7:0] m_wd = hw_e ? sd_buff_dout : nb_we ? nb_d : bw_d;
+wire [14:0] m_ra = (h_act & h_wr) ? {hp, sd_buff_addr} : nb_rd ? {4'd0, nb_ra} : {bp, pos};
 always @(posedge clk) begin
 	if (m_we) buf_m[m_wa] <= m_wd;
 	m_q <= buf_m[m_ra];
@@ -290,8 +336,38 @@ assign sd_buff_din1 = m_q;
 assign sd_buff_din2 = m_q;
 
 // ===========================================================================
-// Built-in responses (REQUEST SENSE, INQUIRY and READ CAPACITY fallbacks)
+// Built-in responses (REQUEST SENSE, INQUIRY, READ CAPACITY and MODE SENSE(6) fallbacks)
+// MODE SENSE pages as Hatari's hdc.c (HDC_Cmd_ModeSense; Atari System V's loader asks for
+// the geometry): a 4-byte header, no block descriptor, then page 3 (format), page 4 (rigid
+// geometry) or both and the vendor page 0 for $3F; page 0 alone is 16 bytes, no header.
+// 128 heads x 32 sectors, a 4096-block cylinder, which READ CAPACITY with PMI agrees with.
 wire [31:0] capm1 = capl - 32'd1;
+wire [31:0] cap_end = cap_lba | 32'h00000FFF;
+wire [31:0] capv  = (cap_pmi && cap_end < capm1) ? cap_end : capm1;
+wire [23:0] cyls  = capl[31:12] + {23'd0, capl[11:0] != 12'd0};
+function [7:0] mp3(input [4:0] i);        // page 3, 24 bytes
+	case (i)
+		5'd0: mp3 = 8'h03; 5'd1: mp3 = 8'd22; 5'd3: mp3 = 8'd128; 5'd11: mp3 = 8'd32;
+		5'd12: mp3 = 8'h02; 5'd15: mp3 = 8'h01; 5'd20: mp3 = 8'h40;
+		default: mp3 = 8'h00;
+	endcase
+endfunction
+function [7:0] mp4(input [4:0] i, input [23:0] c);   // page 4, 24 bytes
+	case (i)
+		5'd0: mp4 = 8'h04; 5'd1: mp4 = 8'd22; 5'd2: mp4 = c[23:16]; 5'd3: mp4 = c[15:8];
+		5'd4: mp4 = c[7:0]; 5'd5: mp4 = 8'd128; 5'd20: mp4 = 8'h1C; 5'd21: mp4 = 8'h20;
+		default: mp4 = 8'h00;
+	endcase
+endfunction
+function [7:0] mp0(input [3:0] i, input [31:0] n);   // vendor page 0, 16 bytes
+	case (i)
+		4'd1: mp0 = 8'd14; 4'd3: mp0 = 8'd8; 4'd5: mp0 = n[23:16]; 4'd6: mp0 = n[15:8];
+		4'd7: mp0 = n[7:0]; 4'd10: mp0 = 8'h02;
+		default: mp0 = 8'h00;
+	endcase
+endfunction
+wire [9:0] mpos = pos - 10'd4;                // offset after the header
+wire [9:0] mslen = (mpg == 2'd0) ? 10'd16 : (mpg == 2'd3) ? 10'd68 : 10'd28;
 reg  [7:0] gen_b, gen_q;
 always @* begin
 	gen_b = 8'h00;
@@ -338,11 +414,53 @@ always @* begin
 			6'd34: gen_b = "0";
 			default: gen_b = 8'h00;
 		endcase
+		G_MODE:
+			if (mpg == 2'd0) gen_b = mp0(pos[3:0], capl);
+			else if (pos == 10'd0) gen_b = (mpg == 2'd3) ? 8'd67 : 8'd27;
+			else if (pos < 10'd4) gen_b = 8'h00;
+			else if (mpg == 2'd1) gen_b = mp3(mpos[4:0]);
+			else if (mpg == 2'd2) gen_b = mp4(mpos[4:0], cyls);
+			else if (mpos < 10'd24) gen_b = mp3(mpos[4:0]);
+			else if (mpos < 10'd48) gen_b = mp4(mpos[4:0] - 5'd24, cyls);
+			else gen_b = mp0(mpos[3:0], capl);
+		G_NINQ: case (pos[5:0])       // daynaport.c dp_inquiry
+			6'd0:  gen_b = lun_bad_r ? 8'h7F : 8'h03;
+			6'd2:  gen_b = 8'h01;
+			6'd4:  gen_b = 8'h1F;
+			6'd8:  gen_b = "D";
+			6'd9:  gen_b = "a";
+			6'd10: gen_b = "y";
+			6'd11: gen_b = "n";
+			6'd12: gen_b = "a";
+			6'd16: gen_b = "S";
+			6'd17: gen_b = "C";
+			6'd18: gen_b = "S";
+			6'd19: gen_b = "I";
+			6'd20: gen_b = "/";
+			6'd21: gen_b = "L";
+			6'd22: gen_b = "i";
+			6'd23: gen_b = "n";
+			6'd24: gen_b = "k";
+			6'd13, 6'd14, 6'd15, 6'd25, 6'd26, 6'd27, 6'd28, 6'd29, 6'd30, 6'd31: gen_b = " ";
+			6'd32: gen_b = "2";
+			6'd33: gen_b = ".";
+			6'd34: gen_b = "0";
+			6'd35: gen_b = "f";
+			default: gen_b = 8'h00;
+		endcase
+		G_MAC: case (pos[4:0])        // 00:80:19 (Dayna) 4D:53:54, then three zero counters
+			5'd1: gen_b = 8'h80;
+			5'd2: gen_b = 8'h19;
+			5'd3: gen_b = 8'h4D;
+			5'd4: gen_b = 8'h53;
+			5'd5: gen_b = 8'h54;
+			default: gen_b = 8'h00;
+		endcase
 		G_CAP: case (pos[2:0])
-			3'd0: gen_b = capm1[31:24];
-			3'd1: gen_b = capm1[23:16];
-			3'd2: gen_b = capm1[15:8];
-			3'd3: gen_b = capm1[7:0];
+			3'd0: gen_b = capv[31:24];
+			3'd1: gen_b = capv[23:16];
+			3'd2: gen_b = capv[15:8];
+			3'd3: gen_b = capv[7:0];
 			3'd6: gen_b = is_cd ? 8'h08 : 8'h02;
 			default: gen_b = 8'h00;
 		endcase
@@ -421,6 +539,8 @@ wire [2:0] cand = odr[2:0] & present &
                   ~((init_v && init_id == 3'd1) ? 3'b010 : 3'b000) &
                   ~((init_v && init_id == 3'd2) ? 3'b100 : 3'b000);
 wire [1:0] cand_id = cand[2] ? 2'd2 : cand[1] ? 2'd1 : 2'd0;
+wire       net_cand = net_on & odr[4] & ~(init_v && init_id == 3'd4);   // the highest ID here
+wire [15:0] c34    = {c3, c4};
 
 wire [31:0] cap_sel = (tid == 2'd0) ? cap0 : (tid == 2'd1) ? cap1 : cap2;
 wire [2:0]  lun     = msglun_v ? msglun : c1[7:5];
@@ -470,7 +590,14 @@ task automatic check(input [3:0] key, input [7:0] asc);
 	end
 endtask
 
-task automatic window(input [3:0] flags, input [7:0] op, input [7:0] arg, input [9:0] alloc, input [1:0] g);
+task automatic ncheck(input [3:0] key);
+	begin
+		n_key <= key;
+		status(8'h02);
+	end
+endtask
+
+task automatic window(input [3:0] flags, input [7:0] op, input [7:0] arg, input [9:0] alloc, input [2:0] g);
 	begin
 		h_lba <= {WIN_RESP, 2'b00, tid, flags, op, arg};
 		h_cnt <= 18'd1;
@@ -501,7 +628,7 @@ task automatic forward(input [9:0] plen);
 	end
 endtask
 
-task automatic din_gen(input [1:0] g, input [9:0] l);
+task automatic din_gen(input [2:0] g, input [9:0] l);
 	begin
 		gsel <= g;
 		dk_gen <= 1'b1;
@@ -535,6 +662,8 @@ always @(posedge clk) begin
 		h_wr <= 1'b0; h_disc <= 1'b0; h_act <= 1'b0; h_seen <= 1'b0; h_drop <= 1'b0; h_unit <= 2'd0;
 		h_lba <= 32'd0; h_n <= 6'd1; sd_rd <= 3'b000; sd_wr <= 3'b000; wl_hi <= 8'h00; wl_lo <= 8'h00;
 		pm_d <= 1'b0; bsy_d <= 1'b0; di_d <= 1'b0;
+		t_net <= 1'b0; n_en <= 1'b0; n_key <= 4'd0;
+		ns_op <= NS_RX; ns_txlen <= 11'd0; ns_flags <= 8'h00;
 	end else begin
 		hv_set = 2'b00;
 		hv_clr = 2'b00;
@@ -588,7 +717,11 @@ always @(posedge clk) begin
 			B_SEL1: begin
 				atn_l <= icr[1];
 				if (!icr[3]) begin
-					if (cand != 3'b000) begin
+					if (net_cand) begin
+						t_net <= 1'b1;
+						bst <= B_SEL2;
+					end else if (cand != 3'b000) begin
+						t_net <= 1'b0;
 						tid <= cand_id;
 						bst <= B_SEL2;
 					end else if (!icr[2])
@@ -664,7 +797,7 @@ always @(posedge clk) begin
 						cl = (ccnt == 5'd0) ? cmdlen(x_byte[7:5]) : clen;
 						clen <= cl;
 						ccnt <= ccnt + 5'd1;
-						if (ccnt + 5'd1 == cl) st <= T_EXEC;
+						if (ccnt + 5'd1 == cl) st <= t_net ? T_NEXEC : T_EXEC;
 					end else if (!t_req && !pio_ack)
 						t_req <= 1'b1;
 				end
@@ -728,8 +861,16 @@ always @(posedge clk) begin
 							cnt <= 16'd1;
 							st <= T_CHK;
 						end
-						8'h25: window(4'h0, 8'h25, 8'h00, 10'd8, G_CAP);
-						8'h1A: window({3'b000, c1[3]}, 8'h1A, c2, {2'b00, c4}, G_NONE);
+						8'h25: begin
+							cap_pmi <= c8[0];
+							cap_lba <= {c2, c3, c4, c5};
+							window(4'h0, 8'h25, 8'h00, 10'd8, G_CAP);
+						end
+						8'h1A: begin
+							mpg <= (c2[5:0] == 6'h03) ? 2'd1 : (c2[5:0] == 6'h04) ? 2'd2 : (c2[5:0] == 6'h3F) ? 2'd3 : 2'd0;
+							window({3'b000, c1[3]}, 8'h1A, c2, {2'b00, c4},
+							       (!is_cd && (c2[5:0] == 6'h00 || c2[5:0] == 6'h03 || c2[5:0] == 6'h04 || c2[5:0] == 6'h3F)) ? G_MODE : G_NONE);
+						end
 						8'h5A: window({3'b000, c1[3]}, 8'h5A, c2, c78_c, G_NONE);
 						8'h43: begin
 							if (!is_cd) check(4'h5, 8'h20);
@@ -792,6 +933,8 @@ always @(posedge clk) begin
 							din_gen(G_INQ, (alloc_r < 10'd36) ? alloc_r : 10'd36);
 						else if (gsel == G_CAP)
 							din_gen(G_CAP, 10'd8);
+						else if (gsel == G_MODE)
+							din_gen(G_MODE, (alloc_r < mslen) ? alloc_r : mslen);
 						else
 							check(4'h5, 8'h24);
 					end
@@ -837,7 +980,7 @@ always @(posedge clk) begin
 								lim <= {chunk(b_cnt - {12'd0, lim[14:9]}, is_cd), 9'd0};
 								if (b_cnt == {12'd0, lim[14:9]}) st <= T_WAITW;
 							end else
-								st <= T_FILL;
+								st <= t_net ? T_NOUT : T_FILL;
 						end else
 							pos <= pos + 10'd1;
 					end else if (!t_req && (!dk_sect || !hv[bp]) && !pio_ack)
@@ -868,6 +1011,88 @@ always @(posedge clk) begin
 				end
 
 				T_WAITW: if (h_cnt == 18'd0 && !h_act) status(8'h00);
+
+				// DaynaPORT commands (daynaport.c DaynaPort_EmulateCommand)
+				T_NEXEC: begin
+					hv_rst = 1'b1;
+					hp <= 1'b0;
+					bp <= 1'b0;
+					pos <= 10'd0;
+					h_wr <= 1'b0;
+					h_disc <= 1'b0;
+					dk_gen <= 1'b0;
+					dk_sect <= 1'b0;
+					prep <= 1'b0;
+					lun_bad_r <= (lun != 3'd0);
+					if (c0 != 8'h03) n_key <= 4'd0;
+					case (c0)
+						8'h00: status(8'h00);
+						8'h03: begin
+							rs_key <= n_key;
+							rs_asc <= 8'h00;
+							rs_short <= 1'b0;
+							din_gen(G_SENSE, (c4 > 8'd22) ? 10'd22 : {2'b00, c4});
+						end
+						8'h12: din_gen(G_NINQ, (c4 > 8'd36) ? 10'd36 : {2'b00, c4});
+						8'h09: din_gen(G_MAC, 10'd18);
+						8'h0E: begin
+							n_en <= c5[7];
+							ns_op <= NS_ENA;
+							ns_req_t <= ~ns_req_t;
+							st <= T_NWAIT;
+						end
+						8'h08: begin
+							if (c34 < 16'd70) ncheck(4'h5);
+							else if (!n_en) din_gen(G_NONE, 10'd6);
+							else begin
+								ns_op <= NS_RX;
+								ns_req_t <= ~ns_req_t;
+								st <= T_NWAIT;
+							end
+						end
+						8'h0A: begin
+							if (c34 == 16'd0 || c34 > 16'd1522) ncheck(4'h5);
+							else begin
+								lim <= c34[10:0];
+								ph <= PH_DO;
+								st <= T_DOUT;
+							end
+						end
+						8'h0D: begin
+							lim <= (c4 == 8'd0) ? 10'd6 : {2'b00, c4};
+							ph <= PH_DO;
+							st <= T_DOUT;
+						end
+						default: ncheck(4'h5);
+					endcase
+				end
+
+				// send: the frame is in the buffer; multicast: dropped
+				T_NOUT: begin
+					if (c0 == 8'h0A) begin
+						ns_txlen <= c34[10:0];
+						ns_flags <= c5;
+						ns_op <= NS_TX;
+						ns_req_t <= ~ns_req_t;
+						st <= T_NWAIT;
+					end else
+						status(8'h00);
+				end
+
+				T_NWAIT: begin
+					if (ns_ack_t == ns_req_t) begin
+						if (ns_op != NS_RX)
+							status(8'h00);
+						else if (ns_rxlen == 11'd0)
+							din_gen(G_NONE, 10'd6);
+						else begin
+							pos <= 10'd0;
+							lim <= ({5'd0, ns_rxlen} > c34) ? c34[10:0] : ns_rxlen;
+							ph <= PH_DI;
+							st <= T_DIN;
+						end
+					end
+				end
 
 				T_ST: begin
 					if (x_in) begin
@@ -990,6 +1215,139 @@ always @(posedge clk) begin
 		else
 			hv <= (hv | hv_set) & ~hv_clr;
 	end
+end
+
+// ===========================================================================
+// DaynaPORT rings in DDR3: one operation per request (ns_req_t toggled)
+localparam [23:0] N_MB = 24'hEA0000;
+localparam [4:0] N_IDLE = 5'd0, N_WAIT = 5'd1, N_SY1 = 5'd2, N_SY2 = 5'd3, N_SY3 = 5'd4,
+                 N_SY4 = 5'd5, N_RX1 = 5'd6, N_RX2 = 5'd7, N_RX3 = 5'd8, N_RX4 = 5'd9,
+                 N_RXP = 5'd10, N_TX1 = 5'd11, N_TX2 = 5'd12, N_TX3 = 5'd13, N_TX4 = 5'd14,
+                 N_TX5 = 5'd15, N_TX6 = 5'd16, N_TXP = 5'd17, N_DONE = 5'd18;
+reg  [4:0] nst, nret;
+reg [15:0] nq;
+reg        n_sync;
+reg  [3:0] rx_tail, tx_head;
+reg [10:0] nk;               // byte offset in the slot data
+reg [10:0] n_len;
+reg  [7:0] n_hi;
+reg        n_cur;            // the request being served
+wire [23:0] rx_slot = N_MB + 24'h001000 + {9'd0, rx_tail, 11'd0};
+wire [23:0] tx_slot = N_MB + 24'h009000 + {9'd0, tx_head, 11'd0};
+
+task automatic nacc(input we_, input [23:0] a, input [15:0] d, input [4:0] next);
+	begin
+		n_req <= 1'b1;
+		n_we <= we_;
+		n_addr <= a[23:1];
+		n_wdata <= d;
+		nret <= next;
+		nst <= N_WAIT;
+	end
+endtask
+
+always @(posedge clk) begin
+	nb_we <= 1'b0;
+	if (reset || !net_on) begin                  // off: idle, and resync on the way back on
+		n_req <= 1'b0; n_we <= 1'b0; n_addr <= 23'd0; n_wdata <= 16'd0;
+		nst <= N_IDLE; n_sync <= 1'b1; nb_rd <= 1'b0; ns_ack_t <= ns_req_t;
+		ns_rxlen <= 11'd0;
+	end else case (nst)
+		N_IDLE:
+			if (n_sync) begin
+				n_sync <= 1'b0;
+				n_cur <= ns_ack_t;
+				nacc(1'b0, N_MB + 24'h10, 16'd0, N_SY1);           // RX_HEAD
+			end else if (ns_req_t != ns_ack_t) begin
+				n_cur <= ns_req_t;
+				case (ns_op)
+					NS_ENA: nacc(1'b1, N_MB + 24'h18, {15'd0, n_en}, N_DONE);
+					NS_TX: begin
+						n_len <= ns_txlen;
+						nacc(1'b0, N_MB + 24'h16, 16'd0, N_TX1);    // TX_TAIL
+					end
+					default: nacc(1'b0, N_MB + 24'h10, 16'd0, N_RX1);   // RX_HEAD
+				endcase
+			end
+		N_WAIT: if (n_ack) begin
+			n_req <= 1'b0;
+			nq <= n_rdata;
+			nst <= nret;
+		end
+		// after a reset: take the HPS side's indices, interface disabled
+		N_SY1: begin rx_tail <= nq[3:0]; nacc(1'b1, N_MB + 24'h12, {12'd0, nq[3:0]}, N_SY2); end
+		N_SY2: nacc(1'b0, N_MB + 24'h16, 16'd0, N_SY3);
+		N_SY3: begin tx_head <= nq[3:0]; nacc(1'b1, N_MB + 24'h14, {12'd0, nq[3:0]}, N_SY4); end
+		N_SY4: nacc(1'b1, N_MB + 24'h18, 16'd0, N_DONE);
+		// receive: the next answer into the buffer at 0, then the slot is freed
+		N_RX1: begin
+			if (nq[3:0] == rx_tail) begin
+				ns_rxlen <= 11'd0;
+				nst <= N_DONE;
+			end else
+				nacc(1'b0, rx_slot, 16'd0, N_RX2);
+		end
+		N_RX2: begin
+			nk <= 11'd0;
+			if (nq == 16'd0 || nq > 16'd1600) begin
+				ns_rxlen <= 11'd0;
+				nst <= N_RXP;
+			end else begin
+				ns_rxlen <= nq[10:0];
+				n_len <= nq[10:0];
+				nacc(1'b0, rx_slot + 24'd4, 16'd0, N_RX3);
+			end
+		end
+		N_RX3: begin
+			nb_we <= 1'b1; nb_a <= nk; nb_d <= nq[15:8];
+			n_hi <= nq[7:0];
+			nst <= N_RX4;
+		end
+		N_RX4: begin
+			nb_we <= 1'b1; nb_a <= nk + 11'd1; nb_d <= n_hi;
+			nk <= nk + 11'd2;
+			if (nk + 11'd2 >= n_len) nst <= N_RXP;
+			else nacc(1'b0, rx_slot + 24'd6 + {13'd0, nk}, 16'd0, N_RX3);
+		end
+		N_RXP: begin
+			rx_tail <= rx_tail + 4'd1;
+			nacc(1'b1, N_MB + 24'h12, {12'd0, rx_tail + 4'd1}, N_DONE);
+		end
+		// send: a free slot (else the frame is dropped), the frame, its length and flags
+		N_TX1: begin
+			if (tx_head + 4'd1 == nq[3:0])
+				nst <= N_DONE;
+			else begin
+				nk <= 11'd0;
+				nb_rd <= 1'b1;
+				nb_ra <= 11'd0;
+				nst <= N_TX2;
+			end
+		end
+		N_TX2: begin nb_ra <= nk + 11'd1; nst <= N_TX3; end        // buffer read latency
+		N_TX3: begin n_hi <= m_q; nst <= N_TX4; end
+		N_TX4: nacc(1'b1, tx_slot + 24'd4 + {13'd0, nk}, {n_hi, m_q}, N_TX5);
+		N_TX5: begin
+			nk <= nk + 11'd2;
+			if (nk + 11'd2 >= n_len) begin
+				nb_rd <= 1'b0;
+				nacc(1'b1, tx_slot, {5'd0, n_len}, N_TX6);
+			end else begin
+				nb_ra <= nk + 11'd2;
+				nst <= N_TX2;
+			end
+		end
+		N_TX6: nacc(1'b1, tx_slot + 24'd2, {8'd0, ns_flags}, N_TXP);
+		N_TXP: begin
+			tx_head <= tx_head + 4'd1;
+			nacc(1'b1, N_MB + 24'h14, {12'd0, tx_head + 4'd1}, N_DONE);
+		end
+		N_DONE: begin
+			ns_ack_t <= n_cur;
+			nst <= N_IDLE;
+		end
+		default: nst <= N_IDLE;
+	endcase
 end
 
 endmodule

@@ -16,8 +16,9 @@
 #   ./scripts/build.sh FalconFPU    FalconFPU.qpf  the AP68030, the ARM FPU bridge
 #   ./scripts/build.sh Falcon040    Falcon040.qpf  the AP68040
 #   ./scripts/build.sh Falcon060    Falcon060.qpf  the AP68060
-# (FALCON_BRINGUP with CPU040 or CPU060 picks Falcon040 or Falcon060, as
-# before the projects were split.)  The result is output_files/<project>.rbf,
+#   ./scripts/build.sh TT030        TT030.qpf      the Atari TT030 (AP68030)
+# (FALCON_BRINGUP with CPU040 or CPU060 picks Falcon040 or Falcon060, and
+# FALCON_MACHINE=TT picks TT030, as before the projects were split.)  The result is output_files/<project>.rbf,
 # the log output_files/<project>.build.log.  The projects share db/ and
 # output_files/: build one at a time in one checkout.
 #
@@ -34,8 +35,9 @@ if [ -z "$P" ]; then
 	*" CPU060 "*) P=Falcon060 ;;
 	*) P=Falcon ;;
 	esac
+	[ "${FALCON_MACHINE:-}" = TT ] && P=TT030
 fi
-case $P in Falcon|FalconFPU|Falcon040|Falcon060) ;; *) echo "unknown project $P (Falcon, FalconFPU, Falcon040, Falcon060)"; exit 1 ;; esac
+case $P in Falcon|FalconFPU|Falcon040|Falcon060|TT030) ;; *) echo "unknown project $P (Falcon, FalconFPU, Falcon040, Falcon060, TT030)"; exit 1 ;; esac
 LOG=output_files/$P.build.log
 mkdir -p output_files
 : > $LOG

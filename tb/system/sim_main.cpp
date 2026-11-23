@@ -14,6 +14,8 @@
 //                       Falcon's 16 MHz (8 MHz by $FF8007 bit 0)
 //     --tstat           the timing counters at $FFF000 (OSD "Timing counters")
 //     --fastram N       ap060 CT60 mode: Fast RAM 0 off, 1 64 MB, 2 128 MB, 3 240 MB
+//     --tt              TT030 mode (work in progress): 32-bit decode, turbo timing
+//     --ttram MB        TT-RAM with --tt: 64, 128 or 256
 //     --pctrace N       print the PC every N clocks
 //     --pcjump LO:HI    when the PC enters [LO,HI] (hex): print the time and
 //                       the 24 distinct PC values before it, then stop
@@ -33,10 +35,18 @@
 //                       68882 engine (libfpe) the ARM service uses
 //     --cptrace         print every coprocessor (FPU) interface register access
 //     --cookies         print the TOS cookie jar at the end
-//     --text ADDR       print the NUL-terminated text at guest ADDR (hex) at the end
+//     --net             a DaynaPORT at SCSI ID 4, its rings served as tools/falcon_net does:
+//                       one ARP request queued for reception after 2 ms, every frame
+//                       sent printed
+//     --vme N           TT: the VME card, an ATW800/2: 1 2 MB at $FEC00000, 2 2 MB at $FEA00000, 3 4 MB at $FEA00000
+//     --text ADDR       print the NUL-terminated text at guest ADDR (hex) at the end;
+//                       --text @ADDR follows the pointer at ADDR
 //     --done ADDR       end the run once the long at guest ADDR (hex) reads $D0E0600D
 //     --dump A:LEN:FILE write LEN bytes of guest memory from A (hex) to FILE at the end
 //     +ram=FILE         (plusarg) preload guest RAM from 0 with a rom2hex64.py image
+//     --watch A,B,...   print (the first 20 times) when the PC reaches any of these (hex)
+//     --resettrace      at every return to the ROM's reset entry ($E00030) after start-up,
+//                       print the last 512 distinct PCs before it
 #include "Vtb_top.h"
 #include "Vtb_top__Dpi.h"
 #include "verilated.h"
@@ -87,6 +97,42 @@ static void guest_wr8(uint32_t a, uint8_t v)
 }
 static uint16_t guest_rd16(uint32_t a) { return (uint16_t)(guest_rd8(a) << 8 | guest_rd8(a + 1)); }
 
+// the HPS network service (tools/falcon_net) on the DDR3 model: guest $EA0000
+static unsigned net_txt;
+static void net_queue_test(void)
+{
+    const uint32_t NB = 0xEA0000;
+    // an ARP request for 192.168.2.240 from 192.168.2.239, as falcon_net answers a
+    // receive: [len16][0 0 0][flags] frame CRC
+    static const uint8_t f[42] = {
+        0xff,0xff,0xff,0xff,0xff,0xff, 0x02,0x00,0x00,0x00,0x00,0x01, 0x08,0x06,
+        0x00,0x01, 0x08,0x00, 6, 4, 0x00,0x01, 0x02,0x00,0x00,0x00,0x00,0x01,
+        192,168,2,239, 0,0,0,0,0,0, 192,168,2,240 };
+    uint8_t a[6 + 60 + 4] = {0};
+    a[0] = 0; a[1] = 64;
+    for (int i = 0; i < 42; i++) a[6 + i] = f[i];
+    unsigned head = guest_rd16(NB + 0x10) & 15;
+    uint32_t slot = NB + 0x1000 + head * 0x800;
+    guest_wr16(slot, sizeof a);
+    for (unsigned i = 0; i < sizeof a; i += 2) guest_wr16(slot + 4 + i, (uint16_t)(a[i] << 8 | a[i + 1]));
+    guest_wr16(NB + 0x10, (head + 1) & 15);
+    printf("NET: queued a %u byte answer in receive slot %u\n", (unsigned)sizeof a, head);
+}
+static void net_serve(void)
+{
+    const uint32_t NB = 0xEA0000;
+    unsigned head = guest_rd16(NB + 0x14) & 15;
+    while (net_txt != head) {
+        uint32_t slot = NB + 0x9000 + net_txt * 0x800;
+        unsigned len = guest_rd16(slot), flags = guest_rd16(slot + 2);
+        printf("NET: sent %u bytes (flags %02x):", len, flags);
+        for (unsigned i = 0; i < len && i < 24; i++) printf(" %02x", guest_rd8(slot + 4 + i));
+        printf("\n");
+        net_txt = (net_txt + 1) & 15;
+        guest_wr16(NB + 0x16, net_txt);
+    }
+}
+
 // the HPS FPU service (tools/falcon_fpu/falcon_fpu.c) on the DDR3 model
 static uint16_t fpu_seen;
 static void fpu_serve(void)
@@ -114,7 +160,7 @@ int main(int argc, char **argv) {
 
     double run_ms = 3000;
     std::string frames_dir;
-    int frame_every = 1, monitor = 2, ram = 14, ramtos = 0;
+    int frame_every = 1, monitor = 2, ram = 14, ramtos = 0, tt = 0, ttram = 0;
     long pctrace = 0;
     bool arbtrace = false;
     uint32_t pcjump_lo = 1, pcjump_hi = 0;   // empty range: off
@@ -123,10 +169,17 @@ int main(int argc, char **argv) {
     unsigned io_lo = 1, io_hi = 0;
     double io_from = 0;
     Disk disk[7];
+    bool net = false;
+    int vme = 0;
     bool fpu_service = false, cptrace = false, cookies = false, turbo = false, tstat = false;
     int fastram = 0;
     uint32_t text_addr = 0, done_addr = 0;
     std::string dump_spec;      // --dump ADDR:LEN:FILE  guest memory written to FILE at the end
+    bool text_ptr = false;   // --text @ADDR: the text is where the long at ADDR points
+    std::vector<uint32_t> watch; std::vector<int> watch_n;
+    bool resettrace = false;
+    uint32_t pcring[512] = {0}; unsigned pcr = 0; uint32_t last_pc = 0xFFFFFFFF;
+    uint32_t srring[16] = {0}, pcring16[16] = {0}; unsigned sr16 = 0; int uberr_n = 0;
     double wrlat_ms = 0, rdlat_ms = 0;
     double ms_t = 0, ms_p = 0; int ms_dx = 0, ms_dy = 0; long ms_sent = 0;   // --mousestream
     std::vector<Event> events;
@@ -156,6 +209,8 @@ int main(int argc, char **argv) {
         else if (a == "--monitor") monitor = atoi(next().c_str());
         else if (a == "--ram") ram = atoi(next().c_str());
         else if (a == "--ramtos") ramtos = 1;
+        else if (a == "--tt") tt = 1;
+        else if (a == "--ttram") ttram = atoi(next().c_str());
         else if (a == "--pctrace") pctrace = atol(next().c_str());
         else if (a == "--arbtrace") arbtrace = true;
         else if (a == "--fetchwatch") { std::string v = next(); size_t c = v.find(':');
@@ -173,9 +228,13 @@ int main(int argc, char **argv) {
         else if (a == "--turbo") turbo = true;
         else if (a == "--fastram") fastram = atoi(next().c_str()) & 3;
         else if (a == "--tstat") tstat = true;
+        else if (a == "--net") net = true;
+        else if (a == "--vme") vme = atoi(next().c_str());
         else if (a == "--cptrace") cptrace = true;
         else if (a == "--cookies") cookies = true;
-        else if (a == "--text") text_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
+        else if (a == "--text") { std::string t = next(); text_ptr = t[0] == '@'; text_addr = (uint32_t)strtoul(t.c_str() + text_ptr, nullptr, 16); }
+        else if (a == "--watch") { std::string w = next(); size_t q = 0; while (q < w.size()) { size_t e = w.find(',', q); if (e == std::string::npos) e = w.size(); watch.push_back((uint32_t)strtoul(w.substr(q, e - q).c_str(), nullptr, 16)); q = e + 1; } }
+        else if (a == "--resettrace") resettrace = true;
         else if (a == "--done") done_addr = (uint32_t)strtoul(next().c_str(), nullptr, 16);
         else if (a == "--dump") dump_spec = next();
     }
@@ -191,8 +250,12 @@ int main(int argc, char **argv) {
     top->ram_mb = ram;
     top->ram_tos = ramtos;
     top->cpu_turbo = turbo;
+    top->tt_mode = tt;
+    top->ttram_sel = ttram == 64 ? 1 : ttram == 128 ? 2 : ttram == 256 ? 3 : 0;
     top->tstat_en = tstat;
     top->fast_ram = fastram;
+    top->net_on = net;
+    top->vme_sel = vme;
     top->joy0 = 0;
     top->ps2_key = 0;
     top->ps2_mouse = 0;
@@ -254,7 +317,10 @@ int main(int argc, char **argv) {
         double now_ms = cyc / CLK_HZ * 1e3;
         top->por = cyc < 300;
         top->cold_reset = cyc < 400;
-        top->reset = cyc < 600;
+        // with --fpu the CPU leaves reset once the FPU service is seen (TOS 3.06 runs
+        // FRESTORE 0.08 ms after reset; on the MiSTer the service runs before the core
+        // leaves reset), at most 100 ms
+        top->reset = cyc < 600 || (fpu_service && !top->dbg_fpu_present && cyc < (uint64_t)(CLK_HZ / 10));
 
         // the MiSTer announces the RTC once after start
         if (cyc == 1000) { rtc_toggle = !rtc_toggle; top->rtc[2] = rtc_toggle; }
@@ -357,6 +423,8 @@ int main(int argc, char **argv) {
             guest_wr16(0xE90004, 4);          // VERSION
             guest_wr16(0xE90000, 0x4650);     // MAGIC "FP"
         }
+        if (net && cyc == 64000) net_queue_test();
+        if (net && cyc > 100 && (cyc & 255) == 0) net_serve();
         if (fpu_service && cyc % 320000 == 0) guest_wr16(0xE90002, ++fpu_hb);   // 10 ms
         if (fpu_service && cyc > 100 && (cyc & 31) == 0) fpu_serve();       // ~1 us poll
         if (top->dbg_fpu_present != fpu_was)
@@ -399,6 +467,22 @@ int main(int argc, char **argv) {
             prev_hb = hb; prev_vb = vb;
         }
 
+        if (top->dbg_pc != last_pc) {
+            last_pc = top->dbg_pc;
+            pcring16[sr16 & 15] = last_pc; srring[sr16++ & 15] = top->dbg_sr;
+            if (resettrace) {
+                if (last_pc == 0x00E00030u && now_ms > 5.0) {
+                    printf("[%9.3f ms] RESET ENTRY; the last distinct PCs, oldest first:\n", now_ms);
+                    for (unsigned k = 0; k < 512; k++) { uint32_t v = pcring[(pcr + k) & 511]; if (v) printf("  %08x\n", v); }
+                    fflush(stdout);
+                }
+                pcring[pcr++ & 511] = last_pc;
+            }
+            for (size_t k = 0; k < watch.size(); k++) {
+                if (watch_n.size() < watch.size()) watch_n.resize(watch.size(), 0);
+                if (last_pc == watch[k] && watch_n[k] < 20) { watch_n[k]++; printf("[%9.3f ms] PC %08x (watch, #%d)\n", now_ms, last_pc, watch_n[k]); fflush(stdout); }
+            }
+        }
         if (pctrace && (cyc % pctrace) == 0 && top->dbg_pc != prev_pc) {
             printf("[%9.3f ms] pc=%08x ipl=%d\n", now_ms, top->dbg_pc, top->dbg_ipl);
             prev_pc = top->dbg_pc;
@@ -447,7 +531,16 @@ int main(int argc, char **argv) {
             }
         }
         if (berrtrace && top->dbg_berr && !prev_berr)
-            printf("[%9.3f ms] BERR a=%08x fc=%d %s pc=%08x\n", now_ms, top->dbg_a, top->dbg_fc, top->dbg_rw ? "rd" : "wr", top->dbg_pc);
+        {
+            printf("[%9.3f ms] BERR a=%08x fc=%d %s pc=%08x sr=%04x st=%d own=%x ifc=%d dfc=%d\n", now_ms, top->dbg_a, top->dbg_fc, top->dbg_rw ? "rd" : "wr",
+                   top->dbg_pc, top->dbg_sr, top->dbg_state, top->dbg_owner, top->dbg_cfc >> 3, top->dbg_cfc & 7);
+            // a supervisor cycle at a user address (ASV: $80000000 up, translated only for user FCs):
+            // the PCs and SRs that led to it
+            if ((top->dbg_a >> 31) && top->dbg_fc >= 5 && top->dbg_a < 0xFE000000u && uberr_n < 60) {
+                uberr_n++;
+                for (unsigned k = 0; k < 16; k++) printf("    %08x sr=%04x\n", pcring16[(sr16 + k) & 15], srring[(sr16 + k) & 15]);
+            }
+        }
         prev_berr = top->dbg_berr;
 
         // device bus trace: print on the acknowledge (read data valid)
@@ -482,6 +575,7 @@ int main(int argc, char **argv) {
         }
     }
     if (text_addr) {
+        if (text_ptr) text_addr = guest_rd32(text_addr) & 0xFFFFFFF;   // TT-RAM too
         printf("text at %06x:\n", text_addr);
         for (uint32_t i = 0; i < 65536; i++) {
             uint8_t c = guest_rd8(text_addr + i);

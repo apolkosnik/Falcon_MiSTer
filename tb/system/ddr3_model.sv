@@ -3,7 +3,8 @@
 //
 //  The core's window at byte 0x30000000, 64-bit words, little endian like
 //  the real HPS DDR3: the guest's 24-bit space (0x30000000-0x30FFFFFF) in an
-//  array, the ap060's Fast RAM (CT60 mode, 0x31000000-0x3FFFFFFF) sparse.  Read latency and BUSY stalls are
+//  array, 0x31000000-0x3FFFFFFF sparse (the ap060/ap040's Fast RAM in CT60 mode, or a TT's
+//  TT-RAM, its last 16 MB of 256 at 0x2F000000).  Read latency and BUSY stalls are
 //  pseudo-random within the ranges seen on hardware so the arbiter is
 //  exercised with realistic, varying timing.  +ddrlat=N adds N clocks to
 //  every read's latency (N < 52) and +ddrseed=S (hex) seeds the pseudo-random timing;
@@ -31,11 +32,12 @@ reg [63:0] mem [0:(1<<21)-1];
 longint unsigned fmem [int unsigned];   // Fast RAM, by word offset in the window (sparse)
 
 // a 64-bit word of the window (word offset from 0x30000000)
-function automatic logic [63:0] wrd(input logic [24:0] w);
+// w: guest word index (guest byte / 8), 0 to 0x21FFFFF (TT-RAM to $10FFFFFF)
+function automatic logic [63:0] wrd(input logic [25:0] w);
 	if (w < 25'h200000) wrd = mem[w[20:0]];
 	else wrd = fmem.exists(int'(w)) ? fmem[int'(w)] : 64'd0;
 endfunction
-function automatic void wwr(input logic [24:0] w, input logic [63:0] d, input logic [7:0] be);
+function automatic void wwr(input logic [25:0] w, input logic [63:0] d, input logic [7:0] be);
 	logic [63:0] q;
 	integer i;
 	q = wrd(w);
@@ -50,10 +52,10 @@ endfunction
 export "DPI-C" function ddr_peek;
 export "DPI-C" function ddr_poke;
 function longint unsigned ddr_peek(input int unsigned qaddr);
-	ddr_peek = wrd(qaddr[24:0]);
+	ddr_peek = wrd(qaddr[25:0]);
 endfunction
 function void ddr_poke(input int unsigned qaddr, input longint unsigned data, input byte unsigned be);
-	wwr(qaddr[24:0], data, be);
+	wwr(qaddr[25:0], data, be);
 endfunction
 
 initial begin
@@ -80,13 +82,14 @@ end
 always @(posedge clk) lfsr <= {lfsr[30:0], lfsr[31] ^ lfsr[21] ^ lfsr[1] ^ lfsr[0]};
 
 reg        rd_pend = 0;
-reg [24:0] rd_addr;
+reg [25:0] rd_addr;
 reg  [7:0] rd_left;
 reg  [9:0] rd_wait;
 reg  [7:0] busy_left = 8'd0;
 
-wire hit = (DDRAM_ADDR[28:25] == 4'h3);    // 0x30000000-0x3FFFFFFF: word 0x6000000-0x7FFFFFF
-wire [24:0] woff = DDRAM_ADDR[24:0];          // word offset from 0x30000000
+wire hit  = (DDRAM_ADDR[28:25] == 4'h3);   // 0x30000000-0x3FFFFFFF: word 0x6000000-0x7FFFFFF
+wire hit2 = (DDRAM_ADDR[28:21] == 8'h2F);  // 0x2F000000-0x2FFFFFFF: TT-RAM $10000000-$10FFFFFF
+wire [25:0] woff = hit2 ? {5'b10000, DDRAM_ADDR[20:0]} : {1'b0, DDRAM_ADDR[24:0]};   // guest word index
 
 always @(posedge clk) begin
 	DDRAM_DOUT_READY <= 0;
@@ -103,12 +106,12 @@ always @(posedge clk) begin
 
 	if (!DDRAM_BUSY) begin
 		if (DDRAM_WE) begin
-			if (!hit) $display("DDR3 model: write outside the guest window %07x", DDRAM_ADDR);
+			if (!hit && !hit2) $display("DDR3 model: write outside the guest window %07x", DDRAM_ADDR);
 			wwr(woff, DDRAM_DIN, DDRAM_BE);
 		end
 		if (DDRAM_RD) begin
 			if (rd_pend) $display("DDR3 model: read issued while a read is outstanding");
-			if (!hit) $display("DDR3 model: read outside the guest window %07x", DDRAM_ADDR);
+			if (!hit && !hit2) $display("DDR3 model: read outside the guest window %07x", DDRAM_ADDR);
 			rd_pend <= 1;
 			rd_addr <= woff;
 			rd_left <= DDRAM_BURSTCNT;

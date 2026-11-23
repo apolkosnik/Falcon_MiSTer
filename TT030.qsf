@@ -1,0 +1,41 @@
+# --------------------------------------------------------------------------
+#
+# MiSTer project
+#
+# WARNING WARNING WARNING:
+# Do not add files to project in Quartus IDE! It will mess this file!
+# Add the files manually to files.qip file.
+#
+# --------------------------------------------------------------------------
+
+
+# TT030.qpf: the Atari TT030 from the same source (Falcon.sv FALCON_TT: core
+# name TT030, its own games/TT030 folder, config and NVRAM).  The AP68030 with
+# the 68882 through the ARM FPU bridge; no DSP56001, no IDE.  32-bit decode
+# with TT-RAM to 256 MB and 10 MB of ST-RAM, the second MFP, the SCU, the
+# TT's SCSI DMA and shifter modes, a DaynaPORT SCSI/Link target, the VME
+# window with an ATW800/2 card (its picture through the scaler's frame
+# buffer mode, MISTER_FB).
+
+source Falcon_common.tcl
+# the HPS pins (set_hps_location_assignment is a .qsf command: Quartus does
+# not take it from a sourced file)
+set_hps_location_assignment HPSINTERFACEPERIPHERALSPIMASTER_X52_Y72_N111 -to spi
+set_hps_location_assignment HPSINTERFACEPERIPHERALUART_X52_Y67_N111 -to uart
+set_hps_location_assignment HPSINTERFACEPERIPHERALI2C_X52_Y60_N111 -to hdmi_i2c
+
+set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
+set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS ON
+set_global_assignment -name ALM_REGISTER_PACKING_EFFORT MEDIUM
+set_global_assignment -name SEED 9
+
+set_global_assignment -name VERILOG_MACRO "FALCON_TT=1"
+set_global_assignment -name VERILOG_MACRO "FALCON_NO_DSP=1"
+set_global_assignment -name VERILOG_MACRO "FALCON_NO_IDE=1"
+# the VME card's picture is the scaler's frame buffer mode (rtl/vme/vme_atw800.sv)
+set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
+set_global_assignment -name VERILOG_MACRO "MISTER_FB_PALETTE=1"
+
+source files_030.qip
+source files.qip

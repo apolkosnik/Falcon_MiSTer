@@ -12,7 +12,7 @@ DEFS=""
 SRCS="$R/falcon/falcon_system.sv $R/falcon/falcon_memarb.sv $R/falcon/falcon_combel.sv
  $R/falcon/falcon_videl.sv $R/falcon/falcon_psg.sv $R/falcon/falcon_mfp.sv $R/falcon/falcon_mfp_timer.sv $R/falcon/falcon_mfp_usart.sv $R/scc/scc.v $R/scc/scc_chan.v
  $R/falcon/falcon_acia.sv $R/falcon/falcon_ikbd.sv $R/falcon/falcon_ikbd_keymap.sv $R/falcon/falcon_nvram.sv $R/falcon/falcon_mbox_test.sv $R/falcon/falcon_fpu_bridge.sv
- $R/falcon/falcon_blitter.sv $R/falcon/falcon_crossbar.sv"
+ $R/falcon/falcon_blitter.sv $R/falcon/falcon_crossbar.sv $R/falcon/falcon_ttdma.sv $R/falcon/falcon_ttshift.sv $R/scu/scu.v $R/vme/vme_atw800.sv"
 # the processor: the AP68030 with its bus bridge and Falcon timing, or the AP68060 (CPU060)
 A60=$R/AP68060/rtl
 A40=$R/AP68040/rtl

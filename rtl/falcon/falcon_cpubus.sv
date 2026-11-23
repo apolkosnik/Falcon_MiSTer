@@ -91,6 +91,8 @@ module falcon_cpubus
 
 	input       [3:0] ram_mb,      // ST-RAM size in MB (4 or 14)
 	input             ram_tos,     // the TOS image is a RAM TOS behind its loader (TOS 4.92)
+	input             tt_mode,     // TT030: 32-bit decode (with turbo timing), TT-RAM below
+	input       [1:0] ttram_sel,   // TT-RAM: 0 none, 1 64 MB, 2 128 MB, 3 256 MB
 
 	// 68030 pins
 	input      [31:0] a,
@@ -111,7 +113,7 @@ module falcon_cpubus
 	// memory arbiter, CPU port
 	output reg        ram_req,
 	output reg        ram_we,
-	output reg [23:2] ram_addr,
+	output reg [28:2] ram_addr,    // [28:24] non-zero: TT-RAM
 	output reg  [3:0] ram_be,
 	output reg [31:0] ram_wdata,
 	input      [31:0] ram_rdata,
@@ -129,6 +131,11 @@ module falcon_cpubus
 	input             dev_ack,
 	input             dev_berr,
 	output            dev_super,   // the access is in supervisor mode
+	input             vme_card,    // TT: an ATW800/2 on the VME bus (rtl/vme/vme_atw800.sv)
+	input             vme_base,    //   a 2 MB card's ADDR jumper: 0 $FEA00000, 1 $FEC00000
+	input             vme_4mb,     //   a 4 MB card, at $FEA00000
+	input             vme_lay4,    //   which has its 4 MB layout on (register 15 = 3)
+	output reg        dev_vme,     //   the device cycle is for its registers, not the I/O of $FFxxxx
 
 	// interrupt acknowledge
 	output reg        iack_req,    // one clock
@@ -162,7 +169,7 @@ module falcon_cpubus
 	output            wbuf_busy,   // a posted RAM write is not in memory yet
 	input      [63:0] ram_rdata64, // the whole DDR3 word of a read, with ram_ack
 	input             snoop_we,    // another master wrote RAM
-	input      [23:0] snoop_addr,
+	input      [28:0] snoop_addr,
 	input             buf_flush,   // the loader writes memory
 	input             iack_mfp,    // with iack_done: the vector came from the MFP
 
@@ -203,20 +210,49 @@ always @* begin
 	endcase
 end
 
+// TT mode decodes 32 bits, as ap060's CT60 mode: $00000000-$00FFFFFF and its mirror
+// $FF000000-$FFFFFFFF are the 24-bit map below (TOS reaches I/O as $FFFF8xxx), TT-RAM
+// from $01000000 (64, 128 or 256 MB, at DDR3 0x31000000 after ST-RAM's 0x30000000, its last
+// 16 MB at 0x2F000000: falcon_memarb), every
+// other address a bus error (VME at $FE000000 has no card), which is how TOS sizes TT-RAM.
+wire fspace    = !tt_mode || a[31:24] == 8'h00 || a[31:24] == 8'hFF;
+wire is_tt     = tt_mode && ttram_sel != 2'd0 && a[31:24] != 8'h00 &&
+                 a[31:24] < ((ttram_sel == 2'd1) ? 8'h05 : (ttram_sel == 2'd2) ? 8'h09 : 8'h11);
 wire [23:0] ram_top   = {ram_mb, 20'd0};
-wire is_vec    = (la[23:3] == 21'd0);
-wire is_ram    = (la < ram_top);
-wire is_rom    = (la[23:19] == 5'b11100);           // E00000-E7FFFF
-wire is_cart   = (la[23:17] == 7'b1111101);         // FA0000-FBFFFF
-wire is_ide    = (la[23:16] == 8'hF0);
-wire is_io     = (la[23:15] == 9'b111111111);       // FF8000-FFFFFF
-wire is_prot   = (la[23:11] == 13'd0) || is_io;
+wire is_vec    = fspace && (la[23:3] == 21'd0);
+wire is_ram    = fspace && (la < ram_top);
+wire is_rom    = fspace && (la[23:19] == 5'b11100);           // E00000-E7FFFF
+wire is_cart   = fspace && (la[23:17] == 7'b1111101);         // FA0000-FBFFFF
+wire is_ide    = fspace && (la[23:16] == 8'hF0);
+wire is_io     = fspace && (la[23:15] == 9'b111111111);       // FF8000-FFFFFF
+wire is_prot   = fspace && ((la[23:11] == 13'd0) || is_io);
 wire cpu_space = (fc == 3'd7);
 
+// TT: the VME bus, A24 at $FE000000 and A16 at $FEFF0000.  The one card is an ATW800/2:
+// 2 or 4 MB of video memory at its jumpers' address, kept in DDR3 at that address of the
+// 24-bit map (free there: a TT's ST-RAM ends at 10 MB), but for the FPGA's registers at the
+// top of it; and its bus CPLD's block at $FEFFFA80.  The rest of the bus stays a bus error,
+// which is how xVDI sizes the card.  D16, and never cached.
+// A 4 MB card starts in a 2 MB layout, its upper half a mirror of the lower, registers
+// and all, until register 15 = 3: then the registers are at the top of the 4 MB alone.
+wire is_vme  = tt_mode && vme_card && a[31:24] == 8'hFE && !cpu_space;
+wire vme_lo  = la[23:21] == 3'b101;                            // $FEA00000
+wire vme_hi  = la[23:21] == 3'b110;                            // $FEC00000
+wire vme_mir = vme_4mb && !vme_lay4;
+wire vme_win = is_vme && (vme_4mb ? vme_lo || vme_hi : vme_base ? vme_hi : vme_lo);
+wire vme_reg = (vme_win && la[20:12] == 9'h1FF && (vme_hi || !vme_4mb || vme_mir) &&
+                (la[11:9] == 3'd0  ||                          // +$1FF000 LUT
+                 la[11:5] == 7'h10 ||                          // +$1FF200 id
+                 la[11:5] == 7'h40 ||                          // +$1FF800 VTG
+                 la[11:6] == 6'h24 ||                          // +$1FF900 blitter
+                 la[11:5] == 7'h56)) ||                        // +$1FFAC0 link
+               (is_vme && la[23:7] == 17'h1FFF5);              // $FEFFFA80-$FEFFFAFF
+wire vme_ram = vme_win && !vme_reg;
+
 // RAM/ROM address actually used: the reset vectors come from ROM
-function [23:2] mem_addr;
+function [28:2] mem_addr;
 	input [23:0] x; input rd;
-	mem_addr = (rd && x[23:3] == 21'd0) ? (22'h380000 | {21'd0, x[2]}) : x[23:2];
+	mem_addr = {5'd0, (rd && x[23:3] == 21'd0) ? (22'h380000 | {21'd0, x[2]}) : x[23:2]};
 endfunction
 
 //----------------------------------------------------------------------------
@@ -235,13 +271,13 @@ reg  [4:0] fw;             // Hatari's wait states for this cycle
 reg  [4:0] ft0;            // processor clock position of S0, mod 20
 // posted RAM write
 reg        wb_valid, wb_inflight;
-reg [23:2] wb_addr;
+reg [28:2] wb_addr;
 reg  [3:0] wb_be;
 reg [31:0] wb_data;
 reg        rd_inflight;
 // read-ahead buffer: the last 64-bit DDR3 word read (guest order)
 reg        rb_valid;
-reg [23:3] rb_tag;
+reg [28:3] rb_tag;
 reg [63:0] rb_data;
 // device wait state memory
 reg        ym_seen, acia_seen;
@@ -398,8 +434,8 @@ function [15:0] word64;        // the 16-bit word i of a 64-bit word (guest orde
 	input [63:0] q; input [1:0] i;
 	word64 = q[63 - 16 * i -: 16];
 endfunction
-wire [23:2] maddr_rd = mem_addr(la, 1'b1);
-wire        rb_hit   = rb_valid && (rb_tag == maddr_rd[23:3]);
+wire [28:2] maddr_rd = mem_addr(la, 1'b1);
+wire        rb_hit   = rb_valid && (rb_tag == maddr_rd[28:3]);
 
 task f_start;                  // plan the cycle seen on the bus (S0 at position t0)
 	begin
@@ -467,8 +503,8 @@ task f_start;                  // plan the cycle seen on the bus (S0 at position
 		else if (is_ram && !rw) begin
 			fw <= bank_w;
 			if (!wb_valid) begin
-				wb_valid <= 1; wb_addr <= la[23:2]; wb_be <= p16_be; wb_data <= p16_wd;
-				if (rb_tag == la[23:3]) rb_valid <= 0;     // a write to the buffered word
+				wb_valid <= 1; wb_addr <= {5'd0, la[23:2]}; wb_be <= p16_be; wb_data <= p16_wd;
+				if (rb_tag == {5'd0, la[23:3]}) rb_valid <= 0;     // a write to the buffered word
 				fready <= 1;
 				if (bank_w == 5'd0) f_assert(K_D16); else fst <= F_RUN;
 			end
@@ -530,7 +566,7 @@ always @(posedge clk) begin
 	if (reset) begin
 		st <= S_IDLE;
 		dsack0_n <= 1; dsack1_n <= 1; berr_n <= 1; avec_n <= 1; ciin_n <= 1;
-		ram_req <= 0; dev_cs <= 0;
+		ram_req <= 0; dev_cs <= 0; dev_vme <= 0;
 		fmode <= fmode_in;
 		fst <= F_IDLE; wb_valid <= 0; wb_inflight <= 0; rd_inflight <= 0; rb_valid <= 0;
 		ym_seen <= 0; acia_seen <= 0;
@@ -580,9 +616,27 @@ always @(posedge clk) begin
 				ram_wdata <= d_o;
 				st        <= S_RAM;
 			end
-			else if (is_ide || is_io) begin
+			else if (is_tt) begin
+				ram_req   <= 1;
+				ram_we    <= !rw;
+				ram_addr  <= a[28:2];
+				ram_be    <= be32;
+				ram_wdata <= d_o;
+				st        <= S_RAM;
+			end
+			else if (vme_ram) begin
+				ram_req   <= 1;
+				ram_we    <= !rw;
+				ram_addr  <= {5'd0, vme_mir ? 3'b101 : la[23:21], la[20:2]};
+				ram_be    <= be32;
+				ram_wdata <= d_o;
+				ciin_n    <= 0;
+				st        <= S_RAM;
+			end
+			else if (is_ide || is_io || vme_reg) begin
 				dev_cs   <= 1;
 				dev_stb  <= 1;
+				dev_vme  <= vme_reg;
 				dev_we   <= !rw;
 				dev_addr <= la[23:1];
 				dev_uds  <= !la[0];
@@ -694,7 +748,7 @@ always @(posedge clk) begin
 						ram_req     <= 0;
 						rd_inflight <= 0;
 						rb_valid    <= 1;
-						rb_tag      <= maddr_rd[23:3];
+						rb_tag      <= maddr_rd[28:3];
 						rb_data     <= ram_rdata64;
 						d_i         <= {2{word64(ram_rdata64, {maddr_rd[2], la[1]})}};
 						fready      <= 1;
@@ -702,8 +756,8 @@ always @(posedge clk) begin
 					end
 				J_WR:
 					if (!wb_valid) begin
-						wb_valid <= 1; wb_addr <= la[23:2]; wb_be <= p16_be; wb_data <= p16_wd;
-						if (rb_tag == la[23:3]) rb_valid <= 0;
+						wb_valid <= 1; wb_addr <= {5'd0, la[23:2]}; wb_be <= p16_be; wb_data <= p16_wd;
+						if (rb_tag == {5'd0, la[23:3]}) rb_valid <= 0;
 						fready <= 1;
 						fjob   <= J_NONE;
 					end
@@ -774,8 +828,8 @@ always @(posedge clk) begin
 
 		// a DMA write to the buffered word, or to the word being loaded into
 		// the buffer this clock (its data was read before the write)
-		if (buf_flush || (snoop_we && (snoop_addr[23:3] == rb_tag ||
-		                               (rd_inflight && ram_ack && snoop_addr[23:3] == maddr_rd[23:3]))))
+		if (buf_flush || (snoop_we && (snoop_addr[28:3] == rb_tag ||
+		                               (rd_inflight && ram_ack && snoop_addr[28:3] == maddr_rd[28:3]))))
 			rb_valid <= 0;
 		// a new instruction: its first YM/ACIA access waits again (an access
 		// seen on the same clock belongs to the previous instruction)

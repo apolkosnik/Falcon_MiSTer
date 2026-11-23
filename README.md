@@ -166,13 +166,15 @@ git clone <this repo>
 ./scripts/build.sh FalconFPU    # FalconFPU.qpf, the AP68030 with the ARM FPU bridge
 ./scripts/build.sh Falcon040    # Falcon040.qpf, the AP68040
 ./scripts/build.sh Falcon060    # Falcon060.qpf, the AP68060
+./scripts/build.sh TT030        # TT030.qpf, the Atari TT030 (AP68030, no DSP)
 QUARTUS=/path/to/intelFPGA_lite/17.0/quartus ./scripts/build.sh   # another install
 ```
 
 There is one Quartus project per processor, each with the DSP56001 and the
 whole chipset: `Falcon.qpf`, `FalconFPU.qpf` (the AP68030 with the 68882
-through the ARM FPU bridge), `Falcon040.qpf`, `Falcon060.qpf`.  The `.qsf`
-files source `Falcon_common.tcl` (device, pins, the MiSTer framework,
+through the ARM FPU bridge), `Falcon040.qpf`, `Falcon060.qpf`; and
+`TT030.qpf`, an Atari TT030 from the same source (the AP68030 with the ARM
+FPU bridge, no DSP or IDE).  The `.qsf` files source `Falcon_common.tcl` (device, pins, the MiSTer framework,
 fitter options) and `files.qip` (the chipset), each adds its processor
 (`files_030.qip`, `files_040.qip`, `files_060.qip`) and sets its own
 optimization settings and seed.  The result is `output_files/<project>.rbf`,

@@ -1,4 +1,4 @@
-# The AP68030 (Falcon.qsf, FalconFPU.qsf): the core, its bus bridge, Falcon bus timing and
+# The AP68030 (Falcon.qsf, FalconFPU.qsf, TT030.qsf): the core, its bus bridge, Falcon bus timing and
 # the line cache
 set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_top.v
 set_global_assignment -name VERILOG_FILE rtl/AP68030/rtl/ap030_core.v
