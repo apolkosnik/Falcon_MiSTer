@@ -386,4 +386,102 @@ always @(posedge clk_cpu) if (lattrace && l_clk >= busfrom * 32000 && l_n < 600)
 end
 `endif
 
+// bus transfer latency (+buslat): every processor transfer timed from TS to
+// its last TA/TEA in processor clocks, by region (ST-RAM, ROM, I/O, Fast
+// RAM) and kind (line read, single read, single write); counts and totals
+// printed at the end
+`ifdef FALCON_CPU060
+bit buslat = 0;
+initial buslat = $test$plusargs("buslat");
+integer bl_n [0:3][0:2], bl_c [0:3][0:2], bl_max [0:3][0:2];
+initial for (int i = 0; i < 4; i++) for (int j = 0; j < 3; j++) begin bl_n[i][j] = 0; bl_c[i][j] = 0; bl_max[i][j] = 0; end
+reg        bl_act = 0;
+integer    bl_t = 0, bl_left = 0, bl_r = 0, bl_k = 0;
+always @(posedge clk_cpu) if (buslat) begin
+	if (bl_act) bl_t <= bl_t + 1;
+	if (!bl_act && !system.cpu060_ts_n && system.cpu060_a_oe) begin
+		automatic logic [31:0] a = system.cpu_a;
+		bl_act  <= 1'b1;
+		bl_t    <= 1;
+		bl_left <= (system.cpu060_siz == 2'b11) ? 4 : 1;
+		bl_r    <= (a >= 32'h01000000 && a < 32'hFF000000) ? 3 :
+		           (a[23:0] >= 24'hFF8000 || (a[23:0] >= 24'hF00000 && a[23:0] < 24'hF10000)) ? 2 :
+		           (a[23:0] >= 24'hE00000 && a[23:0] < 24'hF00000) ? 1 : 0;
+		bl_k    <= (system.cpu060_siz == 2'b11 && system.cpu060_rw_n) ? 0 : system.cpu060_rw_n ? 1 : 2;
+	end
+	else if (bl_act && (!system.cpu060_ta_n || !system.cpu060_tea_n)) begin
+		if (bl_left == 1 || !system.cpu060_tea_n) begin
+			bl_act <= 1'b0;
+			bl_n[bl_r][bl_k] <= bl_n[bl_r][bl_k] + 1;
+			bl_c[bl_r][bl_k] <= bl_c[bl_r][bl_k] + bl_t;
+			if (bl_t > bl_max[bl_r][bl_k]) bl_max[bl_r][bl_k] <= bl_t;
+		end
+		else bl_left <= bl_left - 1;
+	end
+end
+// the bridge's posted writes and line read bursts: bursts, line buffer hits,
+// posted writes, transfers that waited on the bus for a posted one
+// (a hit: S_DEC answers a line read of the buffer's 32 bytes from the read
+// RAM, the decode's own conditions)
+wire br_hit = system.cpubus.st == 4'd1 && system.cpubus.ltt != 2'd3 &&
+              !(system.cpubus.is_prot && !system.cpubus.sup) && system.cpubus.tsiz == 2'b11 &&
+              system.cpubus.rd && (system.cpubus.is_ram || system.cpubus.is_rom || system.cpubus.is_cart) &&
+              system.cpubus.la[23:5] != 19'd0 && system.cpubus.pb_v &&
+              system.cpubus.pb_tag == system.cpubus.la[23:5];
+integer br_lrb = 0, br_lrp = 0, br_post = 0, br_hold = 0;
+always @(posedge clk) if (buslat) begin
+	if (system.cpubus.st == 4'd9 && system.cpubus.ram_ack) br_lrb <= br_lrb + 1;
+	if (br_hit) br_lrp <= br_lrp + 1;
+end
+always @(posedge clk_cpu) if (buslat) begin
+	if ((system.cpubus.cst == 4'd2 && system.cpubus.sw_post) ||
+	    (system.cpubus.cst == 4'd6 && system.cpubus.beat == 2'd3)) br_post <= br_post + 1;
+	if (system.cpubus.cst == 4'd8 && system.cpubus.answered) br_hold <= br_hold + 1;
+end
+final if (buslat) begin
+	string rn [4] = '{"ST-RAM", "ROM", "I/O", "Fast RAM"};
+	string kn [3] = '{"line read", "single read", "single write"};
+	$display("BRIDGE line read bursts %0d, line buffer hits %0d, posted writes %0d, held behind one %0d",
+	         br_lrb, br_lrp, br_post, br_hold);
+	for (int i = 0; i < 4; i++) for (int j = 0; j < 3; j++) if (bl_n[i][j] != 0)
+		$display("BUSLAT %-8s %-12s n %8d  avg %6.2f  max %4d CPU clocks", rn[i], kn[j], bl_n[i][j],
+		         real'(bl_c[i][j]) / bl_n[i][j], bl_max[i][j]);
+end
+`endif
+
+// bus errors from the bridge's Falcon side (+teamon): every answer with an
+// error, with the state that produced it
+`ifdef FALCON_CPU060
+bit teamon = 0;
+initial teamon = $test$plusargs("teamon");
+always @(posedge clk) if (teamon) begin
+	if (system.cpubus.st == 4'd3 || system.cpubus.st == 4'd4) begin
+		if (system.dev_berr || system.cpubus.tmo == 10'h3FF)
+			$display("[%0t] TEAMON dev: la %08x st %0d dev_berr %0d tmo %0d dev_addr %06x bd_cs %0d blt_req %0d blt_addr %06x uds %0d lds %0d",
+			         $time, system.cpubus.la, system.cpubus.st, system.dev_berr, system.cpubus.tmo,
+			         {system.dev_addr, 1'b0}, system.bd_cs, system.blt_req, {system.blt_addr, 1'b0}, system.dev_uds, system.dev_lds);
+	end
+	if (system.cpubus.st == 4'd8 && system.cpubus.k_err)
+		$display("[%0t] TEAMON answer err: la %08x siz %0d rd %0d tt %0d tm %0d", $time,
+		         system.cpubus.la, system.cpubus.tsiz, system.cpubus.rd, system.cpubus.ltt, system.cpubus.ltm);
+end
+`endif
+
+// the bridge's line buffer (+brmon): every burst, buffer hit and drop
+`ifdef FALCON_CPU060
+bit brmon = 0;
+initial brmon = $test$plusargs("brmon");
+always @(posedge clk) if (brmon) begin
+	if (system.cpubus.st == 4'd9 && system.cpubus.ram_ack)
+		$display("BRMON burst  la %06x -> buffer %06x", system.cpubus.la[23:0],
+		         {system.cpubus.la[23:5], 5'd0});
+	if (br_hit)
+		$display("BRMON hit    la %06x", system.cpubus.la[23:0]);
+	if (system.cpubus.pb_v && system.cpubus.st == 4'd1 && !system.cpubus.rd && system.cpubus.la[23:5] == system.cpubus.pb_tag)
+		$display("BRMON drop by the processor's write la %06x", system.cpubus.la[23:0]);
+	if (system.cpubus.pb_v && system.owr_we && system.owr_addr[23:5] == system.cpubus.pb_tag)
+		$display("BRMON drop by another master's write %06x", {system.owr_addr, 3'd0});
+end
+`endif
+
 endmodule

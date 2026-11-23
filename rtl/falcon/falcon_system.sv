@@ -233,7 +233,7 @@ ap68040 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0), .DC1_ATC(0)) cpu
 	.ipl_n(cpu060_rst ? 3'b111 : ipl_n),   // the core synchronises IPL
 	.avec_n(cpu060_avec_n),
 	.br_n(), .bg_n(cpu060_bg_n), .bb_n_i(cpu060_bb_n_i), .bb_n_o(), .bb_oe(cpu060_bb_oe),
-	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(cpu_ipend_n), .pst(),
+	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ic_self(1'b1), .ipend_n(cpu_ipend_n), .pst(),
 	.dbg_pc(dbg_pc), .dbg_retire(cpu060_retire), .dbg_halted(cpu_halted)
 );
 `else
@@ -249,7 +249,7 @@ ap68060 #(.FPU_PIPE(0), .LOOP_PRED(0), .EARLY_RES(0)) cpu
 	.avec_n(cpu060_avec_n),
 	.br_n(), .bg_n(cpu060_bg_n), .bgr_n(1'b1), .bb_n_i(cpu060_bb_n_i), .bb_n_o(), .bb_oe(cpu060_bb_oe),
 	.btt_n_i(cpu060_btt_n_i), .btt_n_o(), .btt_oe(),
-	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(cpu_ipend_n), .pst(),
+	.rsto_n(cpu060_rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ic_self(1'b1), .ipend_n(cpu_ipend_n), .pst(),
 	.dbg_pc(dbg_pc), .dbg_retire(cpu060_retire), .dbg_halted(cpu_halted)
 );
 `endif
@@ -264,6 +264,7 @@ wire [27:2] cram_addr;   // [27:24]: the ap060's Fast RAM only
 wire  [3:0] cram_be;
 wire [31:0] cram_wdata, cram_rdata;
 wire [63:0] cram_rdata64;
+wire        cram_burst, cram_beat;   // the ap040/ap060 bridges' line read bursts
 // the same port behind the CPU's line cache (falcon_l2), to falcon_memarb
 wire        mram_req, mram_we, mram_ack, mram_burst, mram_beat;
 wire [27:2] mram_addr;
@@ -348,6 +349,7 @@ falcon_cpubus040 cpubus
 	.tt_i(cpu060_tt_i), .sc(cpu040_sc), .mi_n(cpu040_mi_n),
 	.ram_req(cram_req), .ram_we(cram_we), .ram_addr(cram_addr), .ram_be(cram_be),
 	.ram_wdata(cram_wdata), .ram_rdata(cram_rdata), .ram_rdata64(cram_rdata64), .ram_ack(cram_ack),
+	.ram_burst(cram_burst), .ram_beat(cram_beat), .owr_we(owr_we), .owr_addr(owr_addr),
 	.dev_cs(c_dev_cs), .dev_stb(c_dev_stb), .dev_we(c_dev_we), .dev_addr(c_dev_addr),
 	.dev_uds(c_dev_uds), .dev_lds(c_dev_lds), .dev_din(c_dev_din), .dev_dout(dev_dout),
 	.dev_ack(dev_ack), .dev_berr(dev_berr), .dev_super(dev_super),
@@ -372,6 +374,7 @@ falcon_cpubus060 cpubus
 	.a_i(cpu060_a_i), .ts_n_i(cpu060_ts_n_i), .tt_i(cpu060_tt_i), .snoop_n(cpu060_snoop_n),
 	.ram_req(cram_req), .ram_we(cram_we), .ram_addr(cram_addr), .ram_be(cram_be),
 	.ram_wdata(cram_wdata), .ram_rdata(cram_rdata), .ram_rdata64(cram_rdata64), .ram_ack(cram_ack),
+	.ram_burst(cram_burst), .ram_beat(cram_beat), .owr_we(owr_we), .owr_addr(owr_addr),
 	.dev_cs(c_dev_cs), .dev_stb(c_dev_stb), .dev_we(c_dev_we), .dev_addr(c_dev_addr),
 	.dev_uds(c_dev_uds), .dev_lds(c_dev_lds), .dev_din(c_dev_din), .dev_dout(dev_dout),
 	.dev_ack(dev_ack), .dev_berr(dev_berr), .dev_super(dev_super),
@@ -550,8 +553,8 @@ assign cram_addr[27:24] = 4'd0;
 assign mram_addr[27:24] = 4'd0;
 
 `else
-assign mram_req = cram_req, mram_we = cram_we, mram_addr = cram_addr, mram_be = cram_be, mram_wdata = cram_wdata, mram_burst = 1'b0;
-assign cram_rdata = mram_rdata, cram_rdata64 = mram_rdata64, cram_ack = mram_ack;
+assign mram_req = cram_req, mram_we = cram_we, mram_addr = cram_addr, mram_be = cram_be, mram_wdata = cram_wdata, mram_burst = cram_burst;
+assign cram_rdata = mram_rdata, cram_rdata64 = mram_rdata64, cram_ack = mram_ack, cram_beat = mram_beat;
 `endif
 
 // falcon_memarb's DDR3 port: straight out, or (ap060) shared with the

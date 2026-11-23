@@ -24,8 +24,16 @@
 //  synchronisers; each side holds its fields (address, size, lanes, write
 //  data; read data, flags) steady from its toggle until the other side has
 //  answered, so only the toggles need synchronising (Falcon.sdc: the clocks
-//  are asynchronous).  Writes are not posted: a write's bus error reaches
-//  the processor.
+//  are asynchronous).
+//
+//  Posted writes: a write that cannot end in a bus error (ST-RAM above the
+//  reset vectors, the supervisor-only page by a supervisor; a single write
+//  or a line) gets its last TA at once, before the clk half has done it.
+//  Another write's bus error still reaches the processor: it is not posted.
+//  The next transfer to the clk half waits until the posted one has been
+//  answered (its TS is taken; the 68060 holds the address, attributes and
+//  write data until its TA), so the Falcon side sees every transfer in
+//  program order; a Fast RAM transfer goes ahead meanwhile.
 //
 //  Address map, Fast RAM off (24 bits, A31..A24 ignored), as falcon_cpubus:
 //    000000-000007  reads: ROM (reset vectors; a RAM TOS: SSP $8000, PC
@@ -48,9 +56,17 @@
 //
 //  Transfers on the Falcon side: byte, word and long to RAM/ROM/cartridge
 //  go to the arbiter's 32-bit port with the byte lanes of BS3-BS0; a line
-//  (16 bytes) is read as two 64-bit words and written as four long words.
-//  The reset vectors keep their mapping in a line (a RAM TOS's are
-//  synthesized, a vector beat of a line write is dropped).  Device accesses
+//  (16 bytes) is written as four long words and read as one burst of the
+//  four 64-bit words of its aligned 32 bytes (cpu_burst), all four kept in
+//  the read RAM: the next line read of either line of those 32 bytes is
+//  answered from there without the arbiter (the line buffer, pb_v/pb_tag).
+//  Any write to those 32 bytes drops the buffer:
+//  the processor's own (at decode), and every other master's as the
+//  arbiter starts it (owr_we, DMA and the loader).  A line read in the first
+//  32 bytes is two 64-bit reads, as before (and drops the buffer: it
+//  writes the same read RAM): the reset vectors keep their
+//  mapping in a line (a RAM TOS's are synthesized, a vector beat of a line
+//  write is dropped).  Device accesses
 //  are 16-bit cycles (a long is two), answered with TCI; a line to a device
 //  is a bus error.  Interrupt acknowledge (TT = 11): the MFP vector in every
 //  byte lane, or AVEC, or TEA for a spurious interrupt; TM = 0 (breakpoint
@@ -133,6 +149,10 @@ module falcon_cpubus060 #(
 	input      [31:0] ram_rdata,
 	input      [63:0] ram_rdata64, // the whole 64-bit word, guest order
 	input             ram_ack,
+	output reg        ram_burst,   // with ram_req: a read of the four 64-bit words from ram_addr[23:5]
+	input             ram_beat,    // a word of the burst in ram_rdata64 (address order)
+	input             owr_we,      // another master writes RAM (the arbiter starts it)
+	input      [23:3] owr_addr,
 
 	// device bus (16 bits, clk)
 	output reg        dev_cs,
@@ -198,9 +218,10 @@ endfunction
 //============================================================================
 // clk_cpu: the 68060 bus
 //============================================================================
-localparam C_IDLE = 3'd0, C_FAST = 3'd1, C_DEC = 3'd2, C_WAIT = 3'd3,
-           C_RBEAT = 3'd4, C_LWACK = 3'd5, C_LWDATA = 3'd6, C_ACK = 3'd7;
-reg   [2:0] cst;
+localparam C_IDLE = 4'd0, C_FAST = 4'd1, C_DEC = 4'd2, C_WAIT = 4'd3,
+           C_RBEAT = 4'd4, C_LWACK = 4'd5, C_LWDATA = 4'd6, C_ACK = 4'd7,
+           C_HOLD = 4'd8;
+reg   [3:0] cst;
 reg  [31:0] xa;                    // the transfer (held for the clk half)
 reg         xrd;
 reg   [1:0] xsiz;
@@ -226,9 +247,13 @@ wire        answered = (k_s[2] == p_tgl);
 wire  [3:0] lanes = {~bs_n[0], ~bs_n[1], ~bs_n[2], ~bs_n[3]};
 wire [23:0] ram_top_c = {mb_c, 20'd0};
 
-// a line write goes to ST-RAM (or the vectors, dropped there) or is a bus error
+// a line write goes to ST-RAM (or the vectors, dropped there) or is a bus
+// error; one that goes is posted
 wire        lw_ok = fspace_f(xa, fsel_c) && (xa[23:0] < ram_top_c) &&
                     !((xa[23:11] == 13'd0) && !xtm[2]);
+// a single write posted: ST-RAM above the vectors, the clk half's S_RAMW
+// (never a bus error there)
+wire        sw_post = !xrd && !xtt[1] && lw_ok && (xa[23:3] != 21'd0);
 
 // Fast RAM: decoded with TS from the bus
 wire        fr_sel = !ts_n && a_oe && !owned && (tt != 2'd3) && is_fast_f(a, fsel_c);
@@ -245,28 +270,36 @@ wire        x_we = !cpu_rst && (cst == C_DEC || cst == C_LWDATA);
 wire  [1:0] x_wa = (cst == C_DEC) ? xa[3:2] : xa[3:2] + beat;
 always @(posedge clk_cpu) if (x_we) xmem[x_wa] <= d_o;
 
-// a line read's data: even and odd long words of each half, block RAM
-// written on clk (S_LRD), read on clk_cpu one beat ahead (k_ra: the row of
-// the long word the next clock takes, k_sel: its half)
-reg  [31:0] kmem_e [0:1], kmem_o [0:1];
+// a line read's data: even and odd long words of the 32 bytes by A4:A3,
+// block RAM written on clk (S_LRD, S_LRB), read on clk_cpu one beat ahead
+// (k_ni: the long word the next clock takes in the line at A4, k_sel: its
+// half)
+reg  [31:0] kmem_e [0:3], kmem_o [0:3];
 reg  [31:0] kq_e, kq_o;
 reg         k_sel;
 wire  [1:0] k_ni = (cst == C_RBEAT) ? xa[3:2] + beat + 2'd1 :
                    (cst == C_WAIT && answered) ? xa[3:2] + 2'd1 : xa[3:2];
 always @(posedge clk_cpu) begin
-	kq_e  <= kmem_e[k_ni[1]];
-	kq_o  <= kmem_o[k_ni[1]];
+	kq_e  <= kmem_e[{xa[4], k_ni[1]}];
+	kq_o  <= kmem_o[{xa[4], k_ni[1]}];
 	k_sel <= k_ni[0];
 end
 wire [31:0] k_word = k_sel ? kq_o : kq_e;
 
-task c_start;
+// a transfer's fields from the bus (TS, or held there while a posted write
+// is still being done: C_HOLD)
+task c_take;
 	begin
 		xa <= a; xrd <= rw_n; xsiz <= siz; xbe <= lanes; xtt <= tt; xtm <= tm;
 		beat <= 2'd0; last_beat <= 1'b0;
-		if (fr_sel) begin fleft <= (siz == 2'b11) ? 3'd4 : 3'd1; cst <= C_FAST; end
-		else cst <= C_DEC;
+		cst <= C_DEC;
 	end
+endtask
+
+task c_start;
+	if (fr_sel) begin fleft <= (siz == 2'b11) ? 3'd4 : 3'd1; cst <= C_FAST; end
+	else if (!answered) cst <= C_HOLD;   // the posted write's fields are still in use
+	else c_take;
 endtask
 
 always @(posedge clk_cpu) begin
@@ -285,6 +318,10 @@ always @(posedge clk_cpu) begin
 	C_IDLE:
 		if (!ts_n && a_oe && !owned) c_start;
 
+	C_HOLD:
+		// the transfer waits on the bus for the posted write's answer
+		if (answered) c_take;
+
 	C_FAST:
 		// ap060_fastram answers; its TAs are counted to see the end
 		if (!fr_ta_n) begin
@@ -297,6 +334,12 @@ always @(posedge clk_cpu) begin
 		if (xsiz == 2'b11 && !xrd) begin
 			if (!lw_ok) begin tea_n <= 1'b0; last_beat <= 1'b1; err_beat <= 1'b1; cst <= C_ACK; end
 			else begin b_ta_n <= 1'b0; beat <= 2'd1; cst <= C_LWACK; end
+		end else if (sw_post) begin
+			// posted: TA now, the clk half writes it
+			p_tgl     <= ~p_tgl;
+			b_ta_n    <= 1'b0;
+			last_beat <= 1'b1;
+			cst       <= C_ACK;
 		end else begin
 			p_tgl <= ~p_tgl;
 			cst   <= C_WAIT;
@@ -309,8 +352,11 @@ always @(posedge clk_cpu) begin
 
 	C_LWDATA: begin
 		if (beat == 2'd3) begin
-			p_tgl <= ~p_tgl;           // the last beat's TA waits for the write
-			cst   <= C_WAIT;
+			// the last beat: posted, the clk half writes the line
+			p_tgl     <= ~p_tgl;
+			b_ta_n    <= 1'b0;
+			last_beat <= 1'b1;
+			cst       <= C_ACK;
 		end else begin
 			b_ta_n <= 1'b0;
 			beat   <= beat + 2'd1;
@@ -442,7 +488,8 @@ ap060_fastram fastram (
 // clk: the Falcon side
 //============================================================================
 localparam S_IDLE = 4'd0, S_DEC = 4'd1, S_RAMW = 4'd2, S_DEV = 4'd3, S_DEV2 = 4'd4,
-           S_IACK = 4'd5, S_LRD = 4'd6, S_LWR = 4'd7, S_DONE = 4'd8;
+           S_IACK = 4'd5, S_LRD = 4'd6, S_LWR = 4'd7, S_DONE = 4'd8,
+           S_LRB = 4'd9;
 reg   [3:0] st;
 reg   [2:0] p_s = 3'b000;
 always @(posedge clk) p_s <= {p_s[1:0], p_tgl};
@@ -468,11 +515,18 @@ always @(posedge clk) xq <= xmem[x_ra];
 assign ram_wdata = xq;
 assign dev_din   = dev_lo ? xq[15:0] : xq[31:16];
 
-// a line read's 64-bit halves into the read RAM (S_LRD below): the RAM TOS
-// vectors at A3 = 0, or the arbiter's answer for half lb[1]
+// the line buffer: the read RAM holds the last burst's 32 bytes (pb_tag)
+reg         pb_v;
+reg  [23:5] pb_tag;
+reg   [1:0] bi;                    // the burst's beat (A4:A3)
+
+// the read RAM's 64-bit words (row A4:A3): the RAM TOS vectors at A3 = 0 or
+// the arbiter's answer for half lb[1] (S_LRD), every beat of a burst (S_LRB)
 wire        k_tos = (st == S_LRD) && !lb[0] && !ram_req && vec_line && !lb[1] && ram_tos;
-wire        k_we  = k_tos || ((st == S_LRD) && !(!lb[0] && !ram_req) && ram_ack);
-wire        k_row = k_tos ? 1'b0 : lb[1];
+wire        k_bst = (st == S_LRB) && ram_beat;
+wire        k_we  = k_tos || k_bst ||
+                    ((st == S_LRD) && !(!lb[0] && !ram_req) && ram_ack);
+wire  [1:0] k_row = k_tos ? {la[4], 1'b0} : k_bst ? bi : {la[4], lb[1]};
 wire [63:0] k_wd  = k_tos ? {32'h00008000, 32'h00E00000} : ram_rdata64;
 always @(posedge clk) if (k_we) begin kmem_e[k_row] <= k_wd[63:32]; kmem_o[k_row] <= k_wd[31:0]; end
 reg  [15:0] dev_hi;
@@ -507,7 +561,7 @@ always @(posedge clk) begin
 	cycle_done <= 1'b0;
 	if (reset) begin
 		st <= S_IDLE;
-		ram_req <= 1'b0; dev_cs <= 1'b0;
+		ram_req <= 1'b0; ram_burst <= 1'b0; dev_cs <= 1'b0;
 		k_tgl <= p_s[2];   // no answer owed for a request of before the reset
 	end
 	else case (st)
@@ -527,8 +581,10 @@ always @(posedge clk) begin
 		else if (tsiz == 2'b11) begin
 			// a line: ST-RAM, ROM or cartridge (a read), never a device
 			if (!(is_ram || ((is_rom || is_cart) && rd))) answer(1'b1, 1'b0, 1'b0);
-			else if (rd) st <= S_LRD;
-			else st <= S_LWR;
+			else if (!rd) st <= S_LWR;
+			else if (la[23:5] == 19'd0) st <= S_LRD;          // the vectors' 32 bytes
+			else if (pb_v && pb_tag == la[23:5]) answer(1'b0, 1'b0, 1'b0); // in the read RAM
+			else st <= S_LRB;
 		end
 		else if (is_vec && rd && ram_tos) begin
 			k_single <= la[2] ? 32'h00E00000 : 32'h00008000;
@@ -579,6 +635,23 @@ always @(posedge clk) begin
 			ram_req <= 1'b0;
 			if (lb[1]) answer(1'b0, 1'b0, 1'b0);
 			else lb <= 2'd2;
+		end
+
+	S_LRB:
+		// a line read: the burst of its 32 bytes, all four words to the read
+		// RAM (this line's and the line buffer's)
+		if (!ram_burst) begin
+			ram_req   <= 1'b1; ram_burst <= 1'b1; ram_we <= 1'b0; ram_be <= 4'hF;
+			ram_addr  <= {4'd0, la[23:5], 3'b000};
+			bi        <= 2'd0;
+		end else begin
+			if (ram_beat) bi <= bi + 2'd1;
+			if (ram_ack) begin
+				ram_req <= 1'b0; ram_burst <= 1'b0;
+				pb_v    <= 1'b1;
+				pb_tag  <= la[23:5];
+				answer(1'b0, 1'b0, 1'b0);
+			end
 		end
 
 	S_LWR:
@@ -644,6 +717,17 @@ always @(posedge clk) begin
 
 	default: st <= S_IDLE;
 	endcase
+
+	// the line buffer goes with any write to its 32 bytes: the processor's
+	// (decoded here, before the write is started), another master's (as the
+	// arbiter starts it; never in the clock a burst ends: the arbiter starts
+	// nothing then); and with a line read of the vectors' 32 bytes (S_LRD
+	// writes the same read RAM)
+	if (reset ||
+	    (st == S_DEC && !rd && ltt != 2'd3 && la[23:5] == pb_tag) ||
+	    (st == S_DEC && rd && ltt != 2'd3 && tsiz == 2'b11 && la[23:5] == 19'd0) ||
+	    (owr_we && owr_addr[23:5] == pb_tag))
+		pb_v <= 1'b0;
 end
 
 endmodule
