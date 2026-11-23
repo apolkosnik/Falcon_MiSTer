@@ -38,12 +38,14 @@ set_global_assignment -name OPTIMIZATION_MODE BALANCED
 set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA
 set_global_assignment -name REMOVE_REDUNDANT_LOGIC_CELLS OFF
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT HIGH
-set_global_assignment -name SEED 1
+set_global_assignment -name SEED 4
 set_global_assignment -name BLOCK_RAM_TO_MLAB_CELL_CONVERSION OFF
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
-set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "NEVER ALLOW" -to "emu:emu|falcon_system:system|ap68040:cpu"
-set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "ALWAYS ALLOW" -to "ascal:ascal"
-set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -to "ascal:ascal"
+set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "NEVER ALLOW" -entity sys_top -to "emu:emu|falcon_system:system|ap68040:cpu"
+set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "ALWAYS ALLOW" -entity sys_top -to "ascal:ascal"
+set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -entity sys_top -to "ascal:ascal"
+set_instance_assignment -name ADV_NETLIST_OPT_ALLOWED "ALWAYS ALLOW" -entity sys_top -to "osd:hdmi_osd"
+set_instance_assignment -name OPTIMIZATION_TECHNIQUE SPEED -entity sys_top -to "osd:hdmi_osd"
 
 # the FPU is the processor's own (no ARM bridge)
 set_global_assignment -name VERILOG_MACRO "FALCON_CPU040=1"

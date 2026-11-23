@@ -24,6 +24,8 @@
 module dsp56k_alu (
     input             clk,
     input             pre_en,      // first clock of the instruction
+    input             div,         // DIV (with pre_en): one step on the main adder
+    input             norm,        // NORM (with pre_en): the shift on the main adder
     input       [7:0] op,          // opcode bits 7:0 (valid when pre_en)
     input      [55:0] a,
     input      [55:0] b,
@@ -35,7 +37,9 @@ module dsp56k_alu (
     output reg        wr_d,        // write the destination accumulator
     output            dst_b,       // destination is B
     output reg [55:0] res,         // new destination accumulator value
-    output reg [15:0] sr_out       // SR with the ALU flag updates applied
+    output reg [15:0] sr_out,      // SR with the ALU flag updates applied
+    output     [55:0] sum,         // main adder result (DIV, NORM: the new accumulator)
+    output     [55:0] src          // the prepared source operand (Tcc: the value moved)
 );
 
     // ------------------------------------------------------------------
@@ -149,7 +153,16 @@ module dsp56k_alu (
         c_pre = 1'b0;
         v_pre = 1'b0;
         sub_pre = 1'b0;
-        if (op[7]) begin
+        if (div) begin
+            // DIV (op = 01JJd000: r24 is the divisor, D the accumulator)
+            dpre = {d_in[54:0], 1'b0};
+            spre = sext24(r24);
+            sub_pre = !(d_in[55] ^ r24[23]);
+        end else if (norm) begin
+            // NORM: ASL when !E & U & !Z, ASR when E (SR does not change before the last clock)
+            if (!sr[5] && sr[4] && !sr[2]) dpre = {d_in[54:0], 1'b0};
+            else if (sr[5])                dpre = {d_in[55], d_in[55:1]};
+        end else if (op[7]) begin
             dpre = op[1] ? d_in : 56'd0;     // MAC adds to D, MPY starts at 0
             spre = prod;
             sub_pre = op[2];
@@ -236,6 +249,8 @@ module dsp56k_alu (
     wire [56:0] main57 = sub_q ? ({1'b0, dpre_q} - {1'b0, spre_q})
                                : ({1'b0, dpre_q} + {1'b0, spre_q});
     wire [55:0] mr  = main57[55:0];
+    assign      sum = mr;
+    assign      src = spre_q;
     wire        c_m = main57[56];
     wire        v_m = sub_q ? ((spre_q[55] ^ dpre_q[55]) & (mr[55] ^ dpre_q[55]))
                             : ((spre_q[55] ^ mr[55]) & (dpre_q[55] ^ mr[55]));

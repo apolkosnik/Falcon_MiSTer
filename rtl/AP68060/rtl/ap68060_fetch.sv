@@ -51,7 +51,7 @@
 //--------------------------------------------------------------------------//
 
 module ap68060_fetch
-	import ap68060_pkg::*;
+	import ap68060_pkg::*, ap68060_upkg::*;
 (
 	input  logic        clk,
 	input  logic        nreset,
@@ -207,19 +207,20 @@ assign bt_tgt = {tq[0], 1'b0};
 logic  [1:0]  f2_n;
 logic [15:0]  f2_w [2];
 logic         f2_f, f2_d, f2_a;
-pd_t          f2_p [2];
 logic  [1:0]  f2_b;            // the word ends a BTB-taken branch
 logic [30:0]  f2_t;
 logic  [1:0]  f3_n;
 logic [15:0]  f3_w [2];
+pdw_t         f3_r [2];        // the table's words for f3_w
 pd_t          f3_p [2];
 logic         f3_f, f3_d, f3_a;
 logic  [1:0]  f3_b;
 logic [30:0]  f3_t;
+ap68060_pdrom pdrom (.clk(clk), .a0(f2_w[0][15:3]), .a1(f2_w[1][15:3]), .q0(f3_r[0]), .q1(f3_r[1]));
 genvar gp;
 generate
 	for (gp = 0; gp < 2; gp++) begin : g_pd
-		ap68060_predec pd (.op(f2_w[gp]), .pd(f2_p[gp]));
+		ap68060_predec pd (.op(f3_w[gp]), .w(f3_r[gp]), .pd(f3_p[gp]));
 	end
 endgenerate
 
@@ -333,7 +334,7 @@ always_ff @(posedge clk) begin
 	cw_set_q <= c_waddr;
 	cw_way_q <= c_wway;
 end
-logic [127:0]  cd [4];
+logic [31:0]   cd [4];        // each way's long word at F1's address
 logic [23:0]   ct [4];
 logic [23:0]   sst [4];        // the self-snoop's tag copies, at ssl_ra (read last cycle)
 
@@ -352,14 +353,25 @@ wire           sq_set = sq_all || (sq_v0 && sq_l0[10:4] == f1_pc[10:4]) ||
                         (sq_v1 && sq_l1[10:4] == f1_pc[10:4]) ||
                         (inv_busy && inv_sq && (inv_scope == 2'd3 || inv_pa[10:4] == f1_pc[10:4]));
 
-logic [127:0] m_line;            // the line being filled (and the line buffer)
+logic [31:0] m_cw;               // the fill's first long word (the one fetched)
 logic  [3:0] m_got;              // ... the long words of it that arrived
+logic        m_vclr;             // the fill's victim line is still to be invalidated
+logic        m_rrinc;            // ... the set was full: the replacement counter moves
+// The data RAMs hold a long word per address ({set, A3:A2}): F1 reads its
+// long word of each way directly, and a fill writes each beat into the
+// victim way as it arrives.  The victim is invalidated and given its new
+// tag as the fill starts, and validated when the line is complete (a
+// failed or TCI fill leaves it invalid): the line is in the cache for the
+// first fetch after it -- no line buffer.  The long word being fetched
+// (the burst's first) is kept for a fill that is not allocated (TCI, NAI,
+// a later beat's bus error), which delivers it alone.
+wire         c_dwe = (st == S_FILL) && b_rvalid && m_alloc && !m_vclr;
 genvar gw;
 generate
 	for (gw = 0; gw < 4; gw++) begin : g_way
-		ap68060_sdp_be #(.AW(7), .NB(16), .OREG(0)) dram (
-			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
-			.wbe(16'hFFFF), .wdata(m_line), .raddr(c_raddr), .oce(1'b1), .q(cd[gw])
+		ap68060_sdp_be #(.AW(9), .NB(4), .OREG(0)) dram (
+			.clk(clk), .we(c_dwe && m_way == 2'(gw)), .waddr({m_pa[10:4], b_rbeat}),
+			.wbe(4'hF), .wdata(b_rdata), .raddr(fpc[10:2]), .oce(1'b1), .q(cd[gw])
 		);
 		ap68060_sdp_be #(.AW(7), .NB(3), .OREG(0)) tram (
 			.clk(clk), .we(c_we && c_wway == 2'(gw)), .waddr(c_waddr),
@@ -404,10 +416,7 @@ logic        wf_v, wf_ok, wf_fc2;
 logic [31:0] wf_la;
 atce_t       wf_e;
 
-// line buffer: the last line filled (it also serves TCI lines)
 logic        m_tci;            // the fill in progress was answered with TCI
-logic        lb_v;             // m_line holds the line at lb_pa (the last fill):
-logic [27:0] lb_pa;            // it is also the cache's write data
 
 // miss engine
 logic        b_req_r;          // request pending (not granted yet)
@@ -434,7 +443,7 @@ wire [31:0] redir_npc = redir_v ? redir_pc : d_redir_pc;
 //--------------------------------------------------------------------------
 // F1 evaluation
 //--------------------------------------------------------------------------
-logic        x_ok, x_flt, x_walk, x_cach, x_hit, x_lb;
+logic        x_ok, x_flt, x_walk, x_cach, x_hit;
 logic [31:0] x_pa;
 logic  [1:0] x_cm, x_upa, x_way;
 logic [31:0] x_chunk;
@@ -483,29 +492,27 @@ always_comb begin
 	// (a way whose tag the fill wrote in the clock F0 read this set: the
 	// tag RAM gave the old tag while the valid bit is already the new one
 	// -- an old tag of zero matches any address below $800 --; that way is
-	// no hit here: the line just filled is the line buffer's, x_lb)
+	// no hit here)
 	for (int i = 3; i >= 0; i--) begin
 		x_mj[i] = ivf_q[i] && !(cw_q && cw_set_q == f1_pc[10:4] && cw_way_q == 2'(i)) &&
 		          (use_t ? (ct[i][20:0] == tg) : (ct[i][20:0] == f1_pc[31:11]));
 		if (x_mj[i]) begin x_hit = 1'b1; x_way = 2'(i); end
 	end
 	x_hit  = x_hit && x_cach && !sq_set;
-	x_lb   = x_cach && lb_v && !sq_set && (use_t ? (lb_pa == {tg, f1_pc[10:4]}) : (lb_pa == f1_pc[31:4]));
 	// (the chunk by the one-hot match, AND-OR: no encoded way on the path;
 	// at most one way holds a line)
 	x_chunk = '0;
-	for (int i = 0; i < 4; i++) if (x_mj[i]) x_chunk = x_chunk | cd[i][127 - 32 * f1_pc[3:2] -: 32];
-	if (x_lb) x_chunk = m_line[127 - 32 * f1_pc[3:2] -: 32];
+	for (int i = 0; i < 4; i++) if (x_mj[i]) x_chunk = x_chunk | cd[i];
 end
 wire f1_go      = f1_v && !redir_any;
 always_comb begin
 	logic [3:0] vq;
 	vq = ivs[ssl_pa[10:4]];
-	ssl_hit = (st == S_FILL && m_pa[31:4] == ssl_pa) || (lb_v && lb_pa == ssl_pa[31:4]);
+	ssl_hit = (st == S_FILL && m_pa[31:4] == ssl_pa);
 	for (int w = 0; w < 4; w++)
 		if (vq[w] && sst[w][20:0] == ssl_pa[31:11]) ssl_hit = 1'b1;
 end
-wire f1_deliver = f1_go && (x_hit || x_lb);
+wire f1_deliver = f1_go && x_hit;
 
 //--------------------------------------------------------------------------
 // F0 issue: room for this chunk and those in flight
@@ -580,11 +587,11 @@ always_ff @(posedge clk) begin
 		f2_n  <= '0; f2_f <= 1'b0; f2_d <= 1'b0; f2_a <= 1'b0;
 		for (int i = 0; i < 2; i++) f2_w[i] <= '0;
 		f3_n  <= '0; f3_f <= 1'b0; f3_d <= 1'b0; f3_a <= 1'b0;
-		for (int i = 0; i < 2; i++) begin f3_w[i] <= '0; f3_p[i] <= '0; end
-		lb_v  <= 1'b0; lb_pa <= '0; m_tci <= 1'b0;
+		for (int i = 0; i < 2; i++) f3_w[i] <= '0;
+		m_tci <= 1'b0;
 		busy  <= 1'b0; stale <= 1'b0; b_req_r <= 1'b0;
 		m_la  <= '0; m_pa <= '0; m_upa <= '0; m_s <= 1'b0; m_dem <= 1'b0; m_ci <= 1'b0; m_tt <= 1'b0;
-		m_alloc <= 1'b0; m_way <= '0; m_line <= '0;
+		m_alloc <= 1'b0; m_way <= '0; m_cw <= '0; m_vclr <= 1'b0; m_rrinc <= 1'b0;
 		iw_req <= 1'b0;
 		c_we  <= 1'b0; c_waddr <= '0; c_wway <= '0; c_wtag <= '0;
 		rr    <= '0;
@@ -687,7 +694,7 @@ always_ff @(posedge clk) begin
 		f3_n  <= f2_n;
 		f3_f  <= f2_f; f3_d <= f2_d; f3_a <= f2_a;
 		f3_b  <= f2_b; f3_t <= f2_t;
-		for (int i = 0; i < 2; i++) begin f3_w[i] <= f2_w[i]; f3_p[i] <= f2_p[i]; end
+		for (int i = 0; i < 2; i++) f3_w[i] <= f2_w[i];
 		f2_n  <= '0;
 		f2_b  <= '0;
 
@@ -782,8 +789,9 @@ always_ff @(posedge clk) begin
 				vv = ivf_q;
 				st      <= S_FILL;
 				m_got   <= 4'd0;
-				lb_v    <= 1'b0;          // its beats go into m_line
 				m_alloc <= !cacr[14];     // NAI: no allocation
+				m_vclr  <= !cacr[14];     // (... and no victim)
+				m_rrinc <= (vv == 4'hF);
 				m_tci   <= 1'b0;
 				m_way   <= !vv[0] ? 2'd0 : !vv[1] ? 2'd1 :
 				           cacr[13] ? {1'b0, rr[0]} :
@@ -816,11 +824,24 @@ always_ff @(posedge clk) begin
 				if (!iw_ent.r) if_cause <= iw_cause;
 			end
 		S_FILL: begin
-			logic [127:0] ln;
-			ln = m_line;
+			logic [31:0] lw0;
+			// the long word being fetched: arriving now, or kept
+			lw0 = (b_rvalid && b_rbeat == m_pa[3:2]) ? b_rdata : m_cw;
+			// (the fill's first cycle: no beat has arrived yet) the victim
+			// invalid, its tag the new line's
+			if (m_vclr && !inv_busy) begin
+				m_vclr  <= 1'b0;
+				iw_set = m_pa[10:4]; iw_m[m_way] = 1'b1; iw_v = 1'b0;
+				c_we    <= 1'b1;
+				c_waddr <= m_pa[10:4];
+				c_wway  <= m_way;
+				c_wtag  <= m_pa[31:11];
+			end
+			// (a beat before the victim is invalid is not written: the
+			// line is not allocated then)
+			if (b_rvalid && m_vclr) m_alloc <= 1'b0;
 			if (b_rvalid) begin
-				ln[127 - 32 * b_rbeat -: 32] = b_rdata;
-				m_line <= ln;
+				if (b_rbeat == m_pa[3:2]) m_cw <= b_rdata;
 				m_got[b_rbeat] <= 1'b1;
 				if (b_rtci) begin m_alloc <= 1'b0; m_tci <= 1'b1; end
 			end
@@ -828,24 +849,20 @@ always_ff @(posedge clk) begin
 				busy  <= 1'b0;
 				stale <= 1'b0;
 				if (m_alloc && !(b_rvalid && b_rtci)) begin
-					c_we    <= 1'b1;
-					c_waddr <= m_pa[10:4];
-					c_wway  <= m_way;
-					c_wtag  <= m_pa[31:11];
 					iw_set = m_pa[10:4]; iw_m[m_way] = 1'b1; iw_v = 1'b1;
-					if (ivo_q == 4'hF) rr <= rr + 2'd1;     // (ivo_ra: m_pa's set)
+					if (m_rrinc) rr <= rr + 2'd1;
 				end
-				lb_pa <= m_pa[31:4];
 				st    <= S_RUN;
-				if (m_tci || (b_rvalid && b_rtci)) begin
+				if (!m_alloc || (b_rvalid && b_rtci)) begin
 					// a TCI line is not kept (5.7.1: sequential access only
-					// until the burst's last long word arrives): the long word
-					// being fetched goes straight to the decoder, the next one
-					// is fetched anew (unless a redirect takes the stream)
-					lb_v <= 1'b0;
+					// until the burst's last long word arrives), nor a line
+					// CACR.NAI does not allocate (no line buffer): the long
+					// word being fetched goes straight to the decoder, the
+					// next one is fetched anew (unless a redirect takes the
+					// stream)
 					if (!stale && !redir_any) begin
 						logic [31:0] lw, nla;
-						lw  = ln[127 - 32 * m_pa[3:2] -: 32];
+						lw  = lw0;
 						nla = {m_la[31:2], 2'b00} + 32'd4;
 						if (m_la[1]) begin
 							f2_n    <= 2'd1;
@@ -864,7 +881,6 @@ always_ff @(posedge clk) begin
 						fnew  <= 1'b0;
 					end
 				end
-				else lb_v <= 1'b1;
 			end
 			if (busy && b_err) begin
 				busy  <= 1'b0;
@@ -876,7 +892,7 @@ always_ff @(posedge clk) begin
 					// is not allocated, and no exception (MC68060UM 7.9.1,
 					// 5.7.1).  The next long word is fetched anew.
 					logic [31:0] lw, nla;
-					lw  = ln[127 - 32 * m_pa[3:2] -: 32];
+					lw  = lw0;
 					nla = {m_la[31:2], 2'b00} + 32'd4;
 					if (m_la[1]) begin
 						f2_n    <= 2'd1;
@@ -994,12 +1010,11 @@ always_ff @(posedge clk) begin
 			logic all;
 			sqt       = !ic_inv && !sn_inv;
 			all       = ic_inv ? (ic_inv_scope == 2'd3) : sn_inv ? sn_inv_all : sq_all;
-			lb_v <= 1'b0;
 			inv_sn    <= !ic_inv && !sqt;
 			inv_sq    <= sqt;
 			inv_scope <= ic_inv ? ic_inv_scope : 2'd1;
 			inv_pa    <= ic_inv ? ic_inv_pa : sn_inv ? sn_inv_pa : {sq_l0, 4'd0};
-			inv_lbh   <= !ic_inv && !sqt && lb_v && lb_pa == sn_inv_pa[31:4];
+			inv_lbh   <= 1'b0;
 			if (all) begin
 				// every line: the sweep below (scope 3 matches every way)
 				inv_scope <= 2'd3;

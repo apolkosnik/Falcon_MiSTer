@@ -37,6 +37,7 @@ esac
 case " $BRINGUP " in *" NO_IDE "*) DEFS="$DEFS +define+FALCON_NO_IDE" ;; *) SRCS="$SRCS $(ls $R/falcon/falcon_ide*.sv)" ;; esac
 case " $BRINGUP " in *" NO_FDC "*) DEFS="$DEFS +define+FALCON_NO_FDC" ;; *) SRCS="$SRCS $(ls $R/falcon/falcon_fdc*.sv)" ;; esac
 case " $BRINGUP " in *" MBOX_TEST "*) DEFS="$DEFS +define+FALCON_MBOX_TEST" ;; esac
+case " $BRINGUP " in *" FALCON_ONLY "*) DEFS="$DEFS +define+TB_FALCON_ONLY" ;; esac   # falcon_system TT=0, as Falcon.sv builds a Falcon
 case " $BRINGUP " in *" NO_FPU "*) DEFS="$DEFS +define+FALCON_NO_FPU" ;; esac
 case " $BRINGUP " in *" NO_DSP "*) DEFS="$DEFS +define+FALCON_NO_DSP" ;; *) SRCS="$SRCS $(ls $R/falcon/dsp/*.sv)" ;; esac
 # the 68882 engine for --fpu (Hatari's fpp.c, tools/falcon_fpu/engine)

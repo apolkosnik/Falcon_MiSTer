@@ -443,6 +443,10 @@ always_comb begin
 				n_def_set = 1'b1;
 				n_def_reg = bre;
 				n_def_amt = (me.m == EM_AIP) ? {3'd0, amt} : -{3'd0, amt};
+				// AG forms the updated value now (base + upd_amt) and keeps
+				// it for the upd2 uop: no register file read port for it
+				nu.dcap    = 1'b1;
+				nu.upd_amt = n_def_amt;
 			end
 		end
 	end

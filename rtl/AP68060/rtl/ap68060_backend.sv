@@ -245,8 +245,8 @@ logic  [2:0] fwe, bwe;
 logic  [1:0] fwe_ag;           // fwe[0..1] without the advance (AG holds an update)
 logic  [4:0] fwa [3], bwa [3];
 logic [31:0] fwd [3], bwd [3];
-logic  [4:0] rra [5];
-logic [31:0] frd [5], brd [5], rrd [5];
+logic  [4:0] rra [4];
+logic [31:0] frd [4], brd [4], rrd [4];
 logic  [4:0] ccr_f, ccr_b;
 
 // special registers (architectural, written at WB)
@@ -382,8 +382,18 @@ wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata_al[15]}}, dm_ldata_al[15:0]} 
 
 assign ag_hold = ag_interlock;
 
-ap68060_rf #(.NR(5)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra), .rd(frd));
-ap68060_rf #(.NR(5), .NW(2)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
+ap68060_rf #(.NR(4)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra), .rd(frd));
+ap68060_rf #(.NR(4), .NW(2)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
+// synthesis translate_off
+// (simulation: the register upd2 names, read as the former third port did,
+// to check the value AG kept for it)
+logic  [4:0] rra_s [1];
+logic [31:0] frd_s [1], brd_s [1];
+assign rra_s[0] = ag_u.upd2_reg;
+ap68060_rf #(.NR(1)) rff_s (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra_s), .rd(frd_s));
+ap68060_rf #(.NR(1), .NW(2)) rfb_s (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra_s), .rd(brd_s));
+wire [31:0] u2_ref = (fv[ag_u.upd2_reg] ? frd_s[0] : brd_s[0]) + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
+// synthesis translate_on
 // AG's base and index are read as the uop enters AG (ports 0/1 address
 // the incoming uop) and kept in registers, so AG's address adders, and the
 // data cache's set index after them, start from flip-flops
@@ -401,10 +411,9 @@ always_ff @(posedge clk)
 		$finish;
 	end
 // synthesis translate_on
-assign rra[2] = ag_u.upd2_reg;
-assign rra[3] = ag_u.a_reg;
-assign rra[4] = ag_u.b_reg;
-always_comb for (int i = 0; i < 5; i++) rrd[i] = fv[rra[i]] ? frd[i] : brd[i];
+assign rra[2] = ag_u.a_reg;
+assign rra[3] = ag_u.b_reg;
+always_comb for (int i = 0; i < 4; i++) rrd[i] = fv[rra[i]] ? frd[i] : brd[i];
 
 logic [31:0] agb_q, agx_q;     // the base, and the index sign-extended and scaled
 wire  [31:0] ag_base = agb_q;
@@ -412,10 +421,20 @@ wire  [31:0] ag_ix   = agx_q;
 function automatic logic [31:0] ixf(input logic [31:0] v, input uop_t u);
 	ixf = u.idx_v ? ((u.idx_l ? v : {{16{v[15]}}, v[15:0]}) << u.scale) : 32'd0;
 endfunction
-wire [31:0] ag_ea   = ag_base + ag_ix + ag_u.disp;
 wire [31:0] ag_pinc = ag_base + {{24{ag_u.upd_amt[7]}}, ag_u.upd_amt};
-wire [31:0] ag_updv = ag_u.pinc ? ag_pinc : ag_ea;
-wire [31:0] ag_u2v  = rrd[2] + {{24{ag_u.upd2_amt[7]}}, ag_u.upd2_amt};
+// (ag_updv: below, from the memory address's adder)
+// the deferred source update: kept by AG from the uop that deferred it
+// (base + upd_amt, the updated address), written by the upd2 uop
+logic [31:0] u2q;
+wire  [31:0] ag_u2v  = u2q;
+always_ff @(posedge clk) if (adv_ag && ag_u.dcap) u2q <= ag_pinc;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ag_v && ag_u.upd2_v && u2q != u2_ref) begin
+		$display("FAIL: AG: the kept upd2 value %h, the register's %h (pc %h)", u2q, u2_ref, ag_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 // bit field memory transfers sized by the field (see ucode.py _bf_mem_load)
 wire        ag_bfh    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hE);
 wire        ag_bft    = (ag_u.mem != M_NONE) && (ag_u.op == OP_MOV) && (ag_u.cond == 4'hD);
@@ -431,6 +450,18 @@ wire  [1:0] ag_msz    = ag_bfh ? ((bf_nb == 3'd1) ? SZ_B : (bf_nb <= 3'd3) ? SZ_
 // to the data cache's set index
 wire [31:0] ag_mdisp  = (ag_bft && bf_nb == 3'd3) ? ag_u.disp - 32'd2 : ag_u.disp;
 wire [31:0] ag_maddr  = ag_base + ag_ix + ag_mdisp;
+// an update that is not a postincrement is the EA: the memory address's
+// adder (a bit field's tail byte, cond D, whose address differs from the
+// EA, has no update; checked below)
+wire [31:0] ag_updv = ag_u.pinc ? ag_pinc : ag_maddr;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ag_v && ag_u.upd_v && !ag_u.pinc && ag_maddr != ag_base + ag_ix + ag_u.disp) begin
+		$display("FAIL: AG: an update from the memory address %h, the EA %h (pc %h)",
+		         ag_maddr, ag_base + ag_ix + ag_u.disp, ag_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 
 // operand read with the EX broadcast of this cycle (see the snoop below)
 logic        exw_v;           // EX writes the front file this cycle
@@ -449,8 +480,8 @@ function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
 	opnd = v;
 endfunction
 
-wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
-wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
+wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[2], ag_u.imm, ag_u.a_sxw);
+wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[3], ag_u.imm_b, 1'b0);
 
 // AG's early result: MOVE, ADD, SUB, AND, OR, EOR and LSL/ASL by an
 // immediate count, from register or immediate operands whose values are
@@ -474,7 +505,7 @@ always_comb begin
 	logic [31:0] m, r;
 	// (the register file read, not EX's broadcast of this cycle: a
 	// writer still in EX that is not early leaves the operand unknown)
-	ea_v  = (ag_u.a_src == OS_REG) ? rrd[3] : (ag_u.a_src == OS_IMM) ? ag_u.imm : 32'd0;
+	ea_v  = (ag_u.a_src == OS_REG) ? rrd[2] : (ag_u.a_src == OS_IMM) ? ag_u.imm : 32'd0;
 	ea_ok = 1'b1;
 	if (ag_u.a_src == OS_REG) begin
 		w = yw(ag_u.a_reg);
@@ -483,7 +514,7 @@ always_comb begin
 			else ea_ok = 1'b0;
 		end
 	end
-	eb_v  = (ag_u.b_src == OS_REG) ? rrd[4] : (ag_u.b_src == OS_IMM) ? ag_u.imm_b : 32'd0;
+	eb_v  = (ag_u.b_src == OS_REG) ? rrd[3] : (ag_u.b_src == OS_IMM) ? ag_u.imm_b : 32'd0;
 	eb_ok = 1'b1;
 	if (ag_u.b_src == OS_REG) begin
 		w = yw(ag_u.b_reg);

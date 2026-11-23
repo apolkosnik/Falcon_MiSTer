@@ -209,7 +209,11 @@ always @(posedge clk) begin
 	if (fb_pal_wr) $display("fb: pal %02x = %06x", fb_pal_addr, fb_pal_rgb);
 end
 
+`ifdef TB_FALCON_ONLY
+falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // as Falcon.sv builds a Falcon
+`else
 falcon_system #(.CLK_HZ(32000000)) system
+`endif
 (
 	.clk(clk), .clk_cpu(clk_cpu), .reset(reset), .cold_reset(cold_reset), .por(por),
 	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en), .fast_ram(fast_ram),

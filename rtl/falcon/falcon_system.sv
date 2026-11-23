@@ -18,7 +18,10 @@
 `endif
 `endif
 
-module falcon_system #(parameter CLK_HZ = 32000000)
+module falcon_system #(
+	parameter CLK_HZ = 32000000,
+	parameter bit TT = 1           // 0: a Falcon-only build (falcon_memarb's narrow paths)
+)
 (
 	input             clk,
 	input             clk_cpu,      // ap060: the processor's clock (50 MHz, asynchronous to clk)
@@ -673,7 +676,7 @@ assign DDRAM_DIN = ma_din, DDRAM_BE = ma_be;
 assign ma_busy = DDRAM_BUSY, ma_dout = DDRAM_DOUT, ma_dout_ready = DDRAM_DOUT_READY;
 assign fr_waitrequest = 1'b1, fr_readdata = 64'd0, fr_readdatavalid = 1'b0;
 `endif
-falcon_memarb memarb
+falcon_memarb #(.TT(TT)) memarb
 (
 	.clk(clk), .reset(por), .ram_mb(ram_mb), .tt_top(tt_top),
 	.vid_req(vid_req), .vid_addr(vid_addr), .vid_ack(vid_ack), .vid_data(vid_data), .vid_valid(vid_valid),
@@ -1042,8 +1045,9 @@ falcon_ide ide
 );
 
 `else
-// bring-up build without the IDE controller
-assign ide_dout = 16'hFFFF; assign ide_ack = dev_stb & sel_ide; assign ide_irq = 0; assign ide_led = 0;
+// without the IDE controller (the TT030)
+assign ide_dout = 16'hFFFF; assign ide_ack = dev_stb & sel_ide; assign ide_irq = 0;
+assign hdd_led = scsi_led;
 assign ide_blk_cnt = 6'd0;
 assign sd_lba[2] = 0; assign sd_lba[3] = 0; assign sd_rd[3:2] = 0; assign sd_wr[3:2] = 0;
 assign sd_buff_din[2] = 0; assign sd_buff_din[3] = 0;

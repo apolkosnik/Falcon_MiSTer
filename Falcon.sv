@@ -101,8 +101,10 @@ localparam CONF_STR = {
 	"F2,STCIMGROM,Load Cartridge;",
 	"S0,ST ,Floppy A:;",
 	"S1,ST ,Floppy B:;",
+`ifndef FALCON_NO_IDE
 	"S2,VHDIMGHDF,IDE Master;",
 	"S3,VHDIMGHDF,IDE Slave;",
+`endif
 	"S4,VHDIMGHDF,SCSI 0;",
 	"S5,VHDIMGHDF,SCSI 1;",
 	"S6,ISOCUEBIN,SCSI 2 CD-ROM;",
@@ -164,7 +166,7 @@ wire  [7:0] sd_buff_dout;
 wire  [7:0] sd_buff_din[7];
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .CONF_STR_BRAM(1), .VDNUM(7)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -326,7 +328,11 @@ falcon_audio_adc #(.CLK_HZ(32000000)) audio_adc
 	.mic_l(mic_l), .mic_r(mic_r), .sample_stb()
 );
 
-falcon_system #(.CLK_HZ(32000000)) system
+`ifdef FALCON_TT
+falcon_system #(.CLK_HZ(32000000), .TT(1)) system
+`else
+falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbiter
+`endif
 (
 	.clk(clk_sys),
 	.clk_cpu(clk_cpu),

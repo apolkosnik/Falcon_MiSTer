@@ -168,7 +168,9 @@ void Rtl::read_state(DspState &s) {
 void Rtl::set_regs(const DspState &s) {
     RC(x0) = s.x0; RC(x1) = s.x1; RC(y0) = s.y0; RC(y1) = s.y1;
     RC(a0) = s.a0; RC(a1) = s.a1; RC(a2) = s.a2; RC(b0) = s.b0; RC(b1) = s.b1; RC(b2) = s.b2;
-    for (int i = 0; i < 8; i++) { RC(rr)[i] = s.r[i]; RC(nn)[i] = s.n[i]; RC(mm)[i] = s.m[i]; }
+    for (int i = 0; i < 8; i++) { RC(rr)[i] = s.r[i]; RC(nn)[i] = s.n[i]; RC(mm)[i] = s.m[i];
+        RC(nn_b)[i] = s.n[i]; RC(nn_c)[i] = s.n[i]; RC(nn_d)[i] = s.n[i];
+        RC(mm_b)[i] = s.m[i]; RC(mm_c)[i] = s.m[i]; RC(mm_d)[i] = s.m[i]; }
     RC(sr) = s.sr; RC(omr) = s.omr; RC(sp) = s.sp; RC(la) = s.la; RC(lc) = s.lc; RC(lcsave) = s.lcsave;
     for (int i = 0; i < 16; i++) { RC(stk_h)[i] = s.ssh[i]; RC(stk_l)[i] = s.ssl[i]; }
     RC(pc) = s.pc;
