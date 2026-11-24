@@ -29,7 +29,7 @@ module emu
 ///////// Default values for ports not used in this core /////////
 
 assign USER_OUT = '1;
-assign {UART_RTS, UART_DTR} = 0;
+assign UART_DTR = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 
@@ -75,6 +75,8 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[14]   network: a DaynaPORT at SCSI ID 4 (served by tools/falcon_net on the HPS)
 //   status[16:15] VME card: none, an ATW800/2 of 2 MB at $FEC00000, 2 MB at $FEA00000, 4 MB at $FEA00000
 //   status[17]   HDMI shows the card's picture while its timing generator is on, or the TT's always
+//   status[18]   serial handshake: off (Modem 1 and Modem 2 share the UART), RTS/CTS
+//   status[22]   with the handshake: the port that has the UART, Modem 1 (ST-MFP) or Modem 2 (SCC B)
 `include "build_id.v"
 localparam CONF_STR = {
 `ifdef FALCON_TT
@@ -91,6 +93,8 @@ localparam CONF_STR = {
 	"O[13:12],TT-RAM,64 MB,128 MB,256 MB,None;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[6],UART,Serial,MIDI;",
+	"O[18],Serial handshake,Off,RTS/CTS;",
+	"O[22],Handshake port,Modem 1,Modem 2;",
 	"O[14],Network (SCSI 4),Off,DaynaPORT;",
 	"O[16:15],VME card,None,ATW800/2 2MB FEC00000,ATW800/2 2MB FEA00000,ATW800/2 4MB FEA00000;",
 	"O[17],HDMI shows,VME card when on,TT video;",
@@ -320,7 +324,12 @@ assign FB_PAL_WR      = card_pal_wr;
 wire signed [15:0] audio_l, audio_r;
 wire signed [15:0] mic_l, mic_r;
 wire       fdd_led, hdd_led;
-wire       midi_tx, ser_tx;
+wire       midi_tx, ser_tx, ser_rts;
+`ifdef FALCON_TT
+wire       ser_hs = status[18] & ~status[6];
+`else
+wire       ser_hs = 0;
+`endif
 
 falcon_audio_adc #(.CLK_HZ(32000000)) audio_adc
 (
@@ -402,6 +411,7 @@ falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbite
 	.midi_tx(midi_tx),
 	.ser_rx(status[6] ? 1'b1 : UART_RXD),
 	.ser_tx(ser_tx),
+	.ser_hs(ser_hs), .ser_port(status[22]), .ser_cts(~UART_CTS), .ser_rts(ser_rts),
 
 	.fdd_led(fdd_led),
 	.hdd_led(hdd_led),
@@ -419,6 +429,8 @@ falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbite
 
 assign DDRAM_CLK = clk_sys;
 assign UART_TXD  = status[6] ? midi_tx : ser_tx;
+// RTS/CTS (TT, OSD): the pins are active low; without it RTS stays asserted
+assign UART_RTS  = ser_hs & ~ser_rts;
 
 assign AUDIO_L = audio_l;
 assign AUDIO_R = audio_r;
