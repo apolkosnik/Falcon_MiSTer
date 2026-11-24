@@ -83,7 +83,7 @@ struct Rtl {
     void eval0() { top->clk = 0; top->eval(); }
     void clock() { top->clk = 1; top->eval(); top->clk = 0; top->eval(); clocks++; }
     void idle_inputs();
-    void reset(int cycles = 4);
+    void reset(int cycles = 8);
     bool is_el() const;
     int  state() const { return top->rootp->falcon_dsp__DOT__u_core__DOT__state; }
     uint32_t ncyc() const { return top->rootp->falcon_dsp__DOT__u_core__DOT__ncyc; }

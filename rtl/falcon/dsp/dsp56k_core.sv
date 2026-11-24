@@ -128,8 +128,23 @@ module dsp56k_core (
     reg [23:0] b0 /*verilator public_flat_rw*/, b1 /*verilator public_flat_rw*/;
     reg  [7:0] a2 /*verilator public_flat_rw*/, b2 /*verilator public_flat_rw*/;
     reg [15:0] rr [0:7] /*verilator public_flat_rw*/;
-    reg [15:0] nn [0:7] /*verilator public_flat_rw*/;
-    reg [15:0] mm [0:7] /*verilator public_flat_rw*/;
+    // N and M: written only in the last clock of an instruction (one write),
+    // read by the two AGU units, the register read port and the AGU delay
+    // slot: four MLAB copies each, asynchronous reads, one shared write port.
+    // No reset in an MLAB: the reset values (N = 0, M = $FFFF) are written
+    // while rst is held, one entry a clock (rst must last 8 clocks or more).
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] nn   [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] nn_b [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] nn_c [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] nn_d [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] mm   [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] mm_b [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] mm_c [0:7] /*verilator public_flat_rw*/;
+    (* ramstyle = "MLAB, no_rw_check" *) reg [15:0] mm_d [0:7] /*verilator public_flat_rw*/;
+    reg        nn_we, mm_we;          // last clock: the write (from the EL logic)
+    reg  [2:0] nm_wa;
+    reg [15:0] nm_wd;
+    reg  [2:0] nm_ini;                // reset fill index
     reg [15:0] sr /*verilator public_flat_rw*/;
     reg  [7:0] omr /*verilator public_flat_rw*/;
     reg  [5:0] sp /*verilator public_flat_rw*/;
@@ -226,22 +241,18 @@ module dsp56k_core (
         .c_movem(d1_movem), .bitop(d1_bitop), .jb_set(d1_jb_set), .jb_sub(d1_jb_sub));
 
     // registered-opcode decoder (later clocks, EL)
-    wire [6:0] dq_cls;  wire [3:0] dq_pk;  wire dq_ispm, dq_alu_und;
-    wire dq_ea1_used, dq_ea2_used, dq_ea6, dq_ea_m6, dq_ea_imm, dq_ea_xtra, dq_acc_delay;
-    wire [2:0] dq_ea1_mode, dq_ea1_rn, dq_ea2_mode, dq_ea2_rn;
-    wire dq_bitaa, dq_bitea, dq_bitpp, dq_bitrg, dq_jbaa, dq_jbea, dq_jbpp, dq_jbrg;
-    wire dq_bit, dq_jb, dq_bwr, dq_do, dq_rep, dq_movem, dq_jb_set, dq_jb_sub;
-    wire [1:0] dq_bitop;
-    dsp56k_dec u_decq (
-        .ir(ir_q), .cls(dq_cls), .ispm(dq_ispm), .pk(dq_pk), .alu_und(dq_alu_und),
-        .ea1_used(dq_ea1_used), .ea1_mode(dq_ea1_mode), .ea1_rn(dq_ea1_rn),
-        .ea2_used(dq_ea2_used), .ea2_mode(dq_ea2_mode), .ea2_rn(dq_ea2_rn),
-        .ea6(dq_ea6), .ea_m6(dq_ea_m6), .ea_imm(dq_ea_imm), .ea_xtra(dq_ea_xtra),
-        .acc_delay(dq_acc_delay),
-        .c_bitaa(dq_bitaa), .c_bitea(dq_bitea), .c_bitpp(dq_bitpp), .c_bitrg(dq_bitrg),
-        .c_jbaa(dq_jbaa), .c_jbea(dq_jbea), .c_jbpp(dq_jbpp), .c_jbrg(dq_jbrg),
-        .c_bit(dq_bit), .c_jb(dq_jb), .c_bwr(dq_bwr), .c_do(dq_do), .c_rep(dq_rep),
-        .c_movem(dq_movem), .bitop(dq_bitop), .jb_set(dq_jb_set), .jb_sub(dq_jb_sub));
+    // (the E1 decoder's outputs registered with ir_q: the decode of ir_q)
+    reg  [6:0] dq_cls;  reg  [3:0] dq_pk;  reg  dq_ispm, dq_alu_und;
+    reg  dq_ea_m6, dq_ea_imm, dq_bitrg, dq_jbrg, dq_jb, dq_bwr, dq_do;
+    reg  [1:0] dq_bitop;
+    wire dq_jb_set = ir_q[5];
+    wire dq_jb_sub = ir_q[16];
+    always @(posedge clk)
+        if (!rst && e1) begin
+            dq_cls <= d1_cls; dq_pk <= d1_pk; dq_ispm <= d1_ispm; dq_alu_und <= d1_alu_und;
+            dq_ea_m6 <= d1_ea_m6; dq_ea_imm <= d1_ea_imm; dq_bitrg <= d1_bitrg; dq_jbrg <= d1_jbrg;
+            dq_jb <= d1_jb; dq_bwr <= d1_bwr; dq_do <= d1_do; dq_bitop <= d1_bitop;
+        end
 
     // ------------------------------------------------------------------
     // AGU (dsp_calc_ea / dsp_update_rn*), E1
@@ -267,9 +278,12 @@ module dsp56k_core (
         reg [16:0] rr17, lob, hib, modulo;
         reg [15:0] bufmask, absm, lsb;
         reg [17:0] t;
+        reg        gt, lt;
         begin
+            // (one adder for R + modifier: linear and modulo)
+            t = {2'b01, r} + {{2{md[15]}}, md};
             if (m == 16'hffff) begin
-                agu_upd = {1'b1, r + md};
+                agu_upd = {1'b1, t[15:0]};
             end else if (m == 16'h0000) begin
                 lsb = md & (16'd0 - md);
                 agu_upd = {1'b1, rev16(rev16(r) + rev16(lsb))};
@@ -280,13 +294,14 @@ module dsp56k_core (
                 lob     = rr17 & ~{1'b0, bufmask};
                 hib     = lob + {1'b0, m};
                 absm    = md[15] ? (16'd0 - md) : md;
-                t       = {1'b0, rr17} + {{2{md[15]}}, md};
                 if ((absm & bufmask) != 16'd0) begin
                     if ({1'b0, absm} > modulo) begin
                         agu_upd = {1'b1, r};
                     end else begin
-                        if (t > {1'b0, hib}) t = t - {1'b0, modulo};
-                        else if (t < {1'b0, lob}) t = t + {1'b0, modulo};
+                        // t - modulo = t + ~M (18 bits), t + modulo = t + M + 1: one adder
+                        gt = (t > {1'b0, hib});
+                        lt = (t < {1'b0, lob});
+                        if (gt | lt) t = t + (gt ? {2'b11, ~m} : {2'b00, m}) + {17'd0, !gt};
                         agu_upd = {1'b1, t[15:0]};
                     end
                 end else begin
@@ -333,8 +348,8 @@ module dsp56k_core (
     wire [15:0] n1_s = (agu_reg == {3'b011, d1_ea1_rn}) ? agu_val : nn[d1_ea1_rn];
     wire [15:0] m1_s = (agu_reg == {3'b100, d1_ea1_rn}) ? agu_val : mm[d1_ea1_rn];
     wire [15:0] r2_s = (agu_reg == {3'b010, d1_ea2_rn}) ? agu_val : rr[d1_ea2_rn];
-    wire [15:0] n2_s = (agu_reg == {3'b011, d1_ea2_rn}) ? agu_val : nn[d1_ea2_rn];
-    wire [15:0] m2_s = (agu_reg == {3'b100, d1_ea2_rn}) ? agu_val : mm[d1_ea2_rn];
+    wire [15:0] n2_s = (agu_reg == {3'b011, d1_ea2_rn}) ? agu_val : nn_b[d1_ea2_rn];
+    wire [15:0] m2_s = (agu_reg == {3'b100, d1_ea2_rn}) ? agu_val : mm_b[d1_ea2_rn];
     wire [32:0] agu1 = calc_ea(d1_ea1_mode, rr[d1_ea1_rn], r1_s, n1_s, m1_s, ew1[15:0]);
     // the Y address of an XY move: (Rn)+Nn, (Rn)-, (Rn)+ or (Rn) (modes 1, 2,
     // 3, 4), always at Rn
@@ -431,8 +446,8 @@ module dsp56k_core (
             6'h10, 6'h11, 6'h12, 6'h13, 6'h14, 6'h15, 6'h16, 6'h17:
                 sval = (agu1_commit && sreg[2:0] == d1_ea1_rn) ? {8'd0, agu1_newr}
                                                                  : {8'd0, rr[sreg[2:0]]};
-            6'h18, 6'h19, 6'h1a, 6'h1b, 6'h1c, 6'h1d, 6'h1e, 6'h1f: sval = {8'd0, nn[sreg[2:0]]};
-            6'h20, 6'h21, 6'h22, 6'h23, 6'h24, 6'h25, 6'h26, 6'h27: sval = {8'd0, mm[sreg[2:0]]};
+            6'h18, 6'h19, 6'h1a, 6'h1b, 6'h1c, 6'h1d, 6'h1e, 6'h1f: sval = {8'd0, nn_c[sreg[2:0]]};
+            6'h20, 6'h21, 6'h22, 6'h23, 6'h24, 6'h25, 6'h26, 6'h27: sval = {8'd0, mm_c[sreg[2:0]]};
             RG_LCSAVE: sval = lcsave;
             RG_SR:  sval = {8'd0, sr};
             RG_OMR: sval = {16'd0, omr};
@@ -792,11 +807,13 @@ module dsp56k_core (
     wire        alu_wr, alu_dst_b;
     wire [55:0] alu_res;
     wire [15:0] alu_sr;
+    wire [55:0] alu_sum, alu_src;
     reg         lhit_q;
     wire [15:0] sr_l = sr | (lhit_q ? 16'h0040 : 16'h0000);
 
     dsp56k_alu u_alu (
-        .clk(clk), .pre_en(e1), .op(ir1[7:0]),
+        .clk(clk), .pre_en(e1), .div(d1_cls == C_DIV), .norm(d1_cls == C_NORM),
+        .op({ir1[7:3], (d1_cls == C_TCC) ? 3'd0 : ir1[2:0]}), .sum(alu_sum), .src(alu_src),
         .a(acc_a), .b(acc_b), .x0(x0), .x1(x1), .y0(y0), .y1(y1),
         .sr(sr_l), .wr_d(alu_wr), .dst_b(alu_dst_b), .res(alu_res), .sr_out(alu_sr));
 
@@ -901,8 +918,6 @@ module dsp56k_core (
     reg [23:0] n_x0, n_x1, n_y0, n_y1, n_a0, n_a1, n_b0, n_b1;
     reg  [7:0] n_a2, n_b2;
     reg [15:0] n_rr [0:7];
-    reg [15:0] n_nn [0:7];
-    reg [15:0] n_mm [0:7];
     reg [15:0] n_sr;
     reg  [7:0] n_omr;
     reg  [5:0] n_sp;
@@ -947,10 +962,8 @@ module dsp56k_core (
         case (ir_q[5:4])
             2'd0: dv_v = x0; 2'd1: dv_v = y0; 2'd2: dv_v = x1; default: dv_v = y1;
         endcase
-        dv_r = {dn_s[54:0], 1'b0};
-        if (dn_s[55] ^ dv_v[23]) dv_r = dv_r + {{8{dv_v[23]}}, dv_v, 24'd0};
-        else                     dv_r = dv_r - {{8{dv_v[23]}}, dv_v, 24'd0};
-        dv_r[0] = dv_r[0] | sr_l[0];
+        // (the add/subtract step is the data ALU's main adder, prepared in E1)
+        dv_r = {alu_sum[55:1], sr_l[0]};
         nm_lft = !sr_l[5] && sr_l[4] && !sr_l[2];
         nm_rgt = sr_l[5];
         tc_t = cc_true(ir_q[15:12], sr_l);
@@ -961,19 +974,15 @@ module dsp56k_core (
             C_DIV:  acw_we = 1'b1;
             C_NORM: begin
                 acw_we = 1'b1;
-                acw_v = nm_lft ? {dn_s[54:0], 1'b0} : nm_rgt ? {dn_s[55], dn_s[55:1]} : dn_s;
+                acw_v = alu_sum;   // (the shift: data ALU pre-stage)
             end
             C_TCC: begin
                 acw_we = tc_t;
-                case (ir_q[6:3])
-                    4'd0:  begin acw_v = acc_b; acw_b = 1'b0; end
-                    4'd1:  begin acw_v = acc_a; acw_b = 1'b1; end
-                    4'd8,  4'd9:  begin acw_v = {{8{x0[23]}}, x0, 24'd0}; acw_b = ir_q[3]; end
-                    4'd10, 4'd11: begin acw_v = {{8{y0[23]}}, y0, 24'd0}; acw_b = ir_q[3]; end
-                    4'd12, 4'd13: begin acw_v = {{8{x1[23]}}, x1, 24'd0}; acw_b = ir_q[3]; end
-                    4'd14, 4'd15: begin acw_v = {{8{y1[23]}}, y1, 24'd0}; acw_b = ir_q[3]; end
-                    default: begin acw_v = 56'd0; acw_b = 1'b1; end  // NULL source/dest
-                endcase
+                // the source as the data ALU prepared it for op = ir[7:0]
+                // (JJJd = 000d: the other accumulator, 1JJd: X0, Y0, X1, Y1)
+                acw_v = alu_src;
+                acw_b = ir_q[3];
+                if (ir_q[6:4] != 3'd0 && !ir_q[6]) begin acw_v = 56'd0; acw_b = 1'b1; end  // NULL source/dest
             end
             default: ;
         endcase
@@ -1004,7 +1013,8 @@ module dsp56k_core (
 
         n_x0 = x0; n_x1 = x1; n_y0 = y0; n_y1 = y1;
         n_a0 = a0; n_a1 = a1; n_a2 = a2; n_b0 = b0; n_b1 = b1; n_b2 = b2;
-        for (i = 0; i < 8; i = i + 1) begin n_rr[i] = rr[i]; n_nn[i] = nn[i]; n_mm[i] = mm[i]; end
+        for (i = 0; i < 8; i = i + 1) begin n_rr[i] = rr[i]; end
+        nn_we = 1'b0; mm_we = 1'b0; nm_wa = 3'd0; nm_wd = 16'd0;
         n_sr = sr_l; n_omr = omr; n_sp = sp; n_la = la; n_lc = lc; n_lcsave = lcsave;
         n_loop_rep = loop_rep; n_pc_on_rep = pc_on_rep;
         n_int_state = int_state; n_int_cnt = int_cnt; n_int_fetch = int_fetch;
@@ -1270,12 +1280,12 @@ module dsp56k_core (
                     n_rr[w_num[2:0]] = w_val[15:0];
                 end
                 6'h18, 6'h19, 6'h1a, 6'h1b, 6'h1c, 6'h1d, 6'h1e, 6'h1f: begin
-                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = nn[w_num[2:0]]; end
-                    n_nn[w_num[2:0]] = w_val[15:0];
+                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = nn_d[w_num[2:0]]; end
+                    nn_we = 1'b1; nm_wa = w_num[2:0]; nm_wd = w_val[15:0];
                 end
                 6'h20, 6'h21, 6'h22, 6'h23, 6'h24, 6'h25, 6'h26, 6'h27: begin
-                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = mm[w_num[2:0]]; end
-                    n_mm[w_num[2:0]] = w_val[15:0];
+                    if (w_agu) begin n_agu_reg = w_num; n_agu_val = mm_d[w_num[2:0]]; end
+                    mm_we = 1'b1; nm_wa = w_num[2:0]; nm_wd = w_val[15:0];
                 end
                 RG_LCSAVE: n_lcsave = 24'd0;
                 RG_OMR: n_omr = w_val[7:0] & 8'hc7;
@@ -1570,6 +1580,23 @@ module dsp56k_core (
                      (do2 && p_r2 == RG_PER) ? p_a2_wd : p_a1_wd;
     end
 
+    // N, M write port: the last clock's write, the reset fill while rst
+    wire        nm_fill = rst;
+    wire        nn_wr = nm_fill || (el && nn_we);
+    wire        mm_wr = nm_fill || (el && mm_we);
+    wire  [2:0] nm_a  = nm_fill ? nm_ini : nm_wa;
+    always @(posedge clk) begin
+        nm_ini <= rst ? nm_ini + 3'd1 : 3'd0;
+        if (nn_wr) begin
+            nn[nm_a] <= nm_fill ? 16'd0 : nm_wd;   nn_b[nm_a] <= nm_fill ? 16'd0 : nm_wd;
+            nn_c[nm_a] <= nm_fill ? 16'd0 : nm_wd; nn_d[nm_a] <= nm_fill ? 16'd0 : nm_wd;
+        end
+        if (mm_wr) begin
+            mm[nm_a] <= nm_fill ? 16'hffff : nm_wd;   mm_b[nm_a] <= nm_fill ? 16'hffff : nm_wd;
+            mm_c[nm_a] <= nm_fill ? 16'hffff : nm_wd; mm_d[nm_a] <= nm_fill ? 16'hffff : nm_wd;
+        end
+    end
+
     // ------------------------------------------------------------------
     // sequential part
     // ------------------------------------------------------------------
@@ -1588,7 +1615,7 @@ module dsp56k_core (
         if (rst) begin
             x0 <= 24'd0; x1 <= 24'd0; y0 <= 24'd0; y1 <= 24'd0;
             a0 <= 24'd0; a1 <= 24'd0; a2 <= 8'd0; b0 <= 24'd0; b1 <= 24'd0; b2 <= 8'd0;
-            for (i = 0; i < 8; i = i + 1) begin rr[i] <= 16'd0; nn[i] <= 16'd0; mm[i] <= 16'hffff; end
+            for (i = 0; i < 8; i = i + 1) rr[i] <= 16'd0;
             for (i = 0; i < 16; i = i + 1) begin stk_h[i] <= 16'd0; stk_l[i] <= 16'd0; end
             sr <= 16'd0; omr <= 8'h02; sp <= 6'd0; la <= 16'd0; lc <= 24'd0; lcsave <= 24'd0;
             pc <= 16'd0;
@@ -1662,7 +1689,7 @@ module dsp56k_core (
                         retire <= 1'b1;
                         x0 <= n_x0; x1 <= n_x1; y0 <= n_y0; y1 <= n_y1;
                         a0 <= n_a0; a1 <= n_a1; a2 <= n_a2; b0 <= n_b0; b1 <= n_b1; b2 <= n_b2;
-                        for (i = 0; i < 8; i = i + 1) begin rr[i] <= n_rr[i]; nn[i] <= n_nn[i]; mm[i] <= n_mm[i]; end
+                        for (i = 0; i < 8; i = i + 1) rr[i] <= n_rr[i];
                         if (wa_h) stk_h[wa_i] <= wa_hv;
                         if (wa_l) stk_l[wa_i] <= wa_lv;
                         if (wb_h) begin stk_h[wb_i] <= wb_hv; stk_l[wb_i] <= wb_lv; end

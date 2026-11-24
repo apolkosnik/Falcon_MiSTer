@@ -51,8 +51,10 @@
 //  reversed at this boundary and nowhere else.
 //============================================================================
 
-module falcon_memarb
-(
+module falcon_memarb #(
+	parameter bit TT = 1         // 0: a Falcon only -- 24-bit DMA addresses, the CPU to [27] (Fast RAM),
+	                             //    no TT-RAM window, no 64-bit d2 (the inputs that carry them are not used)
+)(
 	input             clk,
 	input             reset,       // power-on only: the loader runs while the machine is in reset
 	input       [3:0] ram_mb,      // ST-RAM size in MB: DMA writes stop at ram_mb * 1 MB
@@ -166,6 +168,13 @@ endfunction
 localparam [28:0] DDR_BASE = 29'h6000000;    // byte 0x30000000 / 8
 localparam [28:0] DDR_TOP16 = 29'h5E00000;   // byte 0x2F000000 / 8
 
+// the TT's wide paths, or a Falcon's narrow ones (TT = 0)
+wire [28:1] d1_a   = TT ? d1_addr : {5'd0, d1_addr[23:1]};
+wire [28:2] cpu_a  = TT ? cpu_addr : {1'b0, cpu_addr[27:2]};
+wire [28:0] ttt    = TT ? tt_top : 29'd0;
+wire        d2_w64 = TT && d2_wide;
+wire        d2_vm  = TT && d2_vme;
+
 // loader: one byte write is captured and held until the arbiter takes it
 reg        ld_pend = 0;
 reg        ld_take;
@@ -208,34 +217,34 @@ always @* begin : sel
 	end else if (d0_req && !(snoop_hold && d0_we)) begin
 		g_owner = M_D0; g_we = d0_we; g_sub = d0_addr[2:1]; g_dma_be = d0_be;
 	end else if (d1_req && !(snoop_hold && d1_we)) begin
-		g_owner = M_D1; g_we = d1_we; g_sub = d1_addr[2:1]; g_dma_be = d1_be;
+		g_owner = M_D1; g_we = d1_we; g_sub = d1_a[2:1]; g_dma_be = d1_be;
 	end else if (d2_req && !(snoop_hold && d2_we)) begin
 		g_owner = M_D2; g_we = d2_we; g_sub = d2_addr[2:1]; g_dma_be = d2_be;
 	end else if (d3_req && !(snoop_hold && d3_we)) begin
 		g_owner = M_D3; g_we = d3_we; g_sub = d3_addr[2:1]; g_dma_be = d3_be;
 	end else if (cpu_req) begin
-		g_owner = M_CPU; g_we = cpu_we; g_sub = {cpu_addr[2], 1'b0};
-		g_be = cpu_addr[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
+		g_owner = M_CPU; g_we = cpu_we; g_sub = {cpu_a[2], 1'b0};
+		g_be = cpu_a[2] ? {4'd0, cpu_be} : {cpu_be, 4'd0};
 	end else g_any = 0;
 
 	// the address and data by owner (a DMA master's word sits on all four lanes)
 	case (g_owner)
 		M_D0:    begin dma_a = {5'd0, d0_addr[23:3]}; dma_w = d0_wdata; end
-		M_D1:    begin dma_a = d1_addr[28:3]; dma_w = d1_wdata; end   // TT-RAM too
+		M_D1:    begin dma_a = d1_a[28:3]; dma_w = d1_wdata; end   // TT-RAM too
 		M_D2:    begin dma_a = {5'd0, d2_addr[23:3]}; dma_w = d2_wdata; end
 		default: begin dma_a = {5'd0, d3_addr[23:3]}; dma_w = d3_wdata; end
 	endcase
 	case (g_owner)
 		M_VID:   begin g_addr = {5'd0, vid_addr};   g_wdata = 64'd0; end
 		M_LD:    begin g_addr = {5'd0, ld_a[23:3]}; g_wdata = {8{ld_d}}; end
-		M_CPU:   begin g_addr = cpu_burst ? {cpu_addr[28:5], 2'b00} : cpu_addr[28:3]; g_wdata = {2{cpu_wdata}}; end
+		M_CPU:   begin g_addr = cpu_burst ? {cpu_a[28:5], 2'b00} : cpu_a[28:3]; g_wdata = {2{cpu_wdata}}; end
 		default: begin g_addr = dma_a; g_wdata = {4{dma_w}}; end
 	endcase
 
     if (g_owner == M_D0 || g_owner == M_D1 || g_owner == M_D2 || g_owner == M_D3)
         g_be = {g_dma_be, 6'd0} >> {g_sub, 1'b0};
 	// the VME card's 2D engine moves whole 64-bit words (TT)
-	if (g_owner == M_D2 && d2_wide) begin g_wdata = d2_wdata64; g_be = d2_be8; end
+	if (g_owner == M_D2 && d2_w64) begin g_wdata = d2_wdata64; g_be = d2_be8; end
 
 	// memory types for the DMA masters
 	wa = {g_addr, g_sub, 1'b0};
@@ -244,8 +253,8 @@ always @* begin : sel
 			g_ok = (wa < ram_top) && (wa[23:3] != 21'd0 || g_owner == M_D1);
 		else
 			g_ok = (wa < ram_top) || (wa[28:24] == 5'd0 && ((wa[23:19] == 5'b11100) || (wa[23:17] == 7'b1111101)));
-		if (g_owner == M_D1 && wa[28:24] != 5'd0 && wa < tt_top) g_ok = 1;
-		if (g_owner == M_D2 && d2_vme) g_ok = 1;
+		if (g_owner == M_D1 && wa[28:24] != 5'd0 && wa < ttt) g_ok = 1;
+		if (g_owner == M_D2 && d2_vm) g_ok = 1;
 	end
 end
 

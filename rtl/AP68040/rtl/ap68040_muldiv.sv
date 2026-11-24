@@ -43,10 +43,13 @@ reg [63:0] prod;                  // registered DSP product
 reg [96:0] acc;
 
 // absolute values for signed operations
+// (one negator of op_lo serves the multiplicand and the dividend's low
+// half; the dividend's high half takes the borrow out of it)
 wire [31:0] abs_a  = (sign_op && op_a[31]) ? (32'd0 - op_a) : op_a;
-wire [63:0] dvd    = {op_hi, op_lo};
-wire [63:0] abs_d  = (sign_op && op_hi[31]) ? (64'd0 - dvd) : dvd;
-wire [31:0] abs_m  = (sign_op && op_lo[31]) ? (32'd0 - op_lo) : op_lo;
+wire [31:0] neg_lo = 32'd0 - op_lo;
+wire [31:0] neg_hi = ~op_hi + {31'd0, (op_lo == 32'd0)};
+wire [63:0] abs_d  = (sign_op && op_hi[31]) ? {neg_hi, neg_lo} : {op_hi, op_lo};
+wire [31:0] abs_m  = (sign_op && op_lo[31]) ? neg_lo : op_lo;
 
 // divide: four cascaded restoring steps per cycle (64 bits = 16 rounds),
 // each exactly one former one-bit iteration; the divisor is an explicit
@@ -70,6 +73,8 @@ wire [96:0] div4 = (DSTEPS == 4) ? div_step(div_step(div_step(div_step(acc, den)
 
 wire [63:0] q_raw = div_r ? acc[63:0] : prod;
 wire [31:0] r_raw = acc[95:64];
+wire [31:0] hi_raw = div_r ? r_raw : q_raw[63:32];
+wire        hi_c   = div_r || (q_raw[31:0] == 32'd0);
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -128,19 +133,13 @@ always @(posedge clk) begin
 			else begin
 				running <= 1'b0;
 				done    <= 1'b1;
-				if (div_r) begin
-					res_lo <= neg_q ? (32'd0 - q_raw[31:0]) : q_raw[31:0];
-					res_hi <= neg_r ? (32'd0 - r_raw) : r_raw;
-					ovf    <= (|q_raw[63:32]) |
-					          (sign_op & (neg_q ? (q_raw[31:0] > 32'h8000_0000)
-					                            : q_raw[31]));
-				end
-				else begin
-					res_lo <= neg_q ? (32'd0 - q_raw[31:0]) : q_raw[31:0];
-					res_hi <= neg_q ? (~q_raw[63:32] + {31'd0, (q_raw[31:0] == 32'd0)})
-					                : q_raw[63:32];
-					ovf    <= 0;
-				end
+				// (one negator for the quotient and the product's low half,
+				// one for the remainder and the product's high half)
+				res_lo <= neg_q ? (32'd0 - q_raw[31:0]) : q_raw[31:0];
+				res_hi <= (div_r ? neg_r : neg_q) ? (~hi_raw + {31'd0, hi_c}) : hi_raw;
+				ovf    <= div_r & ((|q_raw[63:32]) |
+				          (sign_op & (neg_q ? (q_raw[31:0] > 32'h8000_0000)
+				                            : q_raw[31])));
 			end
 		end
 	end

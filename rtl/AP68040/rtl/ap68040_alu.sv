@@ -109,7 +109,7 @@ endfunction
 //--------------------------------------------------------------------------
 logic        is_sub, use_x, b_zero;
 always_comb begin
-	is_sub = (op == OP_SUB) || (op == OP_SUBX) || (op == OP_CMP) ||
+	is_sub = (op == OP_SUB) || (op == OP_SUBX) || (op == OP_CMP) || (op == OP_CAS2C) ||
 	         (op == OP_NEG) || (op == OP_NEGX);
 	use_x  = (op == OP_ADDX) || (op == OP_SUBX) || (op == OP_NEGX);
 	b_zero = (op == OP_NEG) || (op == OP_NEGX);
@@ -191,7 +191,7 @@ always_comb begin
 			flags_out = {sum_c, sum_n, sum_z, sum_v, sum_c};
 		end
 
-		OP_CMP: begin
+		OP_CMP, OP_CAS2C: begin      // (CAS2's compares: B - A, as CMP)
 			r = b;
 			flags_out = {f_x, sum_n, sum_z, sum_v, sum_c};
 		end

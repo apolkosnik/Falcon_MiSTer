@@ -209,7 +209,11 @@ always @(posedge clk) begin
 	if (fb_pal_wr) $display("fb: pal %02x = %06x", fb_pal_addr, fb_pal_rgb);
 end
 
+`ifdef TB_FALCON_ONLY
+falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // as Falcon.sv builds a Falcon
+`else
 falcon_system #(.CLK_HZ(32000000)) system
+`endif
 (
 	.clk(clk), .clk_cpu(clk_cpu), .reset(reset), .cold_reset(cold_reset), .por(por),
 	.ram_mb(ram_mb), .ram_tos(ram_tos), .monitor(monitor), .cpu_turbo(cpu_turbo), .tstat_en(tstat_en), .fast_ram(fast_ram),
@@ -227,7 +231,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.fb_base(fb_base), .fb_stride(fb_stride),
 	.fb_pal_wr(fb_pal_wr), .fb_pal_addr(fb_pal_addr), .fb_pal_rgb(fb_pal_rgb),
 	.audio_l(audio_l), .audio_r(audio_r),
-	.midi_rx(1'b1), .midi_tx(midi_tx), .ser_rx(ser_loop ? ser_tx : 1'b1), .ser_tx(ser_tx),
+	.midi_rx(1'b1), .midi_tx(midi_tx), .ser_rx(ser_loop ? ser_tx : 1'b1), .ser_tx(ser_tx), .ser_hs(1'b0), .ser_port(1'b0), .ser_cts(1'b0), .ser_rts(),
 	.fdd_led(), .hdd_led(),
 	.DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),

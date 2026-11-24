@@ -291,6 +291,8 @@ typedef struct packed {
 	logic        a_upd;     // the same for operand A (MOVES An,(An)+ / -(An))
 	logic  [2:0] dyn;       // cancelled at AG by run-time state (FPU transfers)
 	logic  [4:0] dynk;      // ... its slot / word index
+	logic        dcap;      // its source (An)+/-(An) update is deferred to a later
+	                        // uop's upd2: AG keeps base + upd_amt for that uop
 } uop_t;
 
 //--------------------------------------------------------------------------

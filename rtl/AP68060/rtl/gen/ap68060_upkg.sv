@@ -161,4 +161,19 @@ localparam logic [9:0] UA_FPU_K_OUT2 = 10'd274;
 localparam logic [9:0] UA_FPU_K_OUT4 = 10'd266;
 localparam logic [9:0] UA_FPU_K_OUT8 = 10'd278;
 localparam logic [9:0] UA_FPU_K_OUT12 = 10'd284;
+// the predecoder table word (tools/ucode.py emit_pdrom)
+typedef struct packed {
+	logic [1:0] kind;
+	logic [5:0] alt;
+	logic [8:0] ent;
+	logic [1:0] szc;
+	logic [1:0] nfix;
+	logic [2:0] immk;
+	logic ea0v;
+	logic ea1v;
+	logic fpg;
+	logic leg1;
+	logic [4:0] leg0;
+} pdw_t;
+localparam logic [8:0] PD_NOENT = 9'd511;
 endpackage

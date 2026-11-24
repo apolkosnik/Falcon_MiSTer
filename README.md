@@ -250,4 +250,6 @@ FALCON_BRINGUP=NO_DSP ./scripts/build.sh Falcon040   # without the DSP
   time on the board is not measured yet; 32 MHz turbo is the default
   (docs/CPU_TIMING.md).
 - SCC: synchronous modes and the LAN port (channel A has no line);
-  Centronics printer, microphone input, `.MSA`/`.STX` floppy images.
+  Centronics printer, `.MSA`/`.STX` floppy images.
+- Microphone input (see Audio input) is tested only in simulation, not yet
+  with a physical source on the MiSTer's ADC.

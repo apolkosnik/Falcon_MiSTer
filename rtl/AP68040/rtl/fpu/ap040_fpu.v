@@ -400,10 +400,10 @@ reg  [63:0] b_m;
 reg   [1:0] b_t;
 reg   [2:0] grs;              // result rounding bits before F_ROUND
 reg         eff_sub;          // effective magnitude subtract
-reg  [64:0] acc_hi;           // multiply accumulator high / divide remainder
+reg  [68:0] acc_hi;           // divide remainder / sqrt remainder (one register: the
+                              // shared restoring datapath's; a divide's is 65 bits)
 reg  [63:0] acc_lo;           // multiply accumulator low / dividend feed
 reg  [66:0] qv;               // divide quotient / sqrt root
-reg  [68:0] srem;             // sqrt remainder
 reg  [65:0] srad;             // sqrt radicand feed (its nonzero top: the
                               // 132-bit radicand's low 66 bits are zero)
 reg   [6:0] loop_n;
@@ -786,8 +786,7 @@ always @* begin
 	case (fst)
 		F_ADDX:  begin rn_r = add_sum;            rn_s = 1'b0; end
 		F_MULT:  begin rn_r = mul_pd[127:60];     rn_s = (mul_pd[59:0] != 60'd0); end
-		F_SQRTL: begin rn_r = {qv, 1'b0};         rn_s = (srem != 69'd0); end
-		default: begin rn_r = {qv, 1'b0};         rn_s = (acc_hi != 65'd0); end
+		default: begin rn_r = {qv, 1'b0};         rn_s = (acc_hi != 69'd0); end
 	endcase
 	rn_hi = rn_r[67] && (fst != F_SQRTL);
 	rn_m  = rn_hi ? rn_r[67:4] : rn_r[66:3];
@@ -807,8 +806,8 @@ reg         ds_q1, ds_q2;
 always @* begin : dsq
 	reg [68:0] r2a, rem1, r2b, t1, t2;
 	reg [69:0] d1, d2;
-	r2a = ds_sq ? {srem[66:0], srad[65:64]} :
-	      ds_d0 ? {4'd0, acc_hi} : {3'd0, acc_hi[63:0], 1'b0};
+	r2a = ds_sq ? {acc_hi[66:0], srad[65:64]} :
+	      ds_d0 ? {4'd0, acc_hi[64:0]} : {3'd0, acc_hi[63:0], 1'b0};
 	t1  = ds_sq ? {1'b0, qv[65:0], 2'b01} : {5'd0, a_m};
 	d1  = {1'b0, r2a} - {1'b0, t1};
 	ds_q1 = !d1[69];
@@ -1509,7 +1508,7 @@ always @(posedge clk) begin
 		pk_neg <= 0; pk_isz <= 0;
 		b_s <= 0; b_e <= 0; b_m <= 0; b_t <= 0;
 		grs <= 0; eff_sub <= 0; acc_hi <= 0; acc_lo <= 0;
-		qv <= 0; srem <= 0; srad <= 0; loop_n <= 0; op_kind <= 0;
+		qv <= 0; srad <= 0; loop_n <= 0; op_kind <= 0;
 		sh_ret <= F_PACKI; e_w <= 0; r_pr <= 0; mv_st <= 0;
 		nsel <= 2'd0;
 		// Invalid entries read as the default positive nonsignaling NaN.
@@ -2422,7 +2421,7 @@ always @(posedge clk) begin
 							end
 							else begin
 								srad <= sE[0] ? {a_m, 2'b00} : {1'b0, a_m, 1'b0};
-								srem <= 0;
+								acc_hi <= 0;
 								qv <= 0;
 								loop_n <= 0;
 								begin fst <= F_SQRTL; wb_r <= (F_SQRTL == F_WB); acc_r <= 1'b1; end
@@ -2734,7 +2733,7 @@ always @(posedge clk) begin
 				else begin
 					// two result digits per cycle (66 = 2 x 33)
 					srad <= {srad[61:0], 4'b0000};
-					srem <= ds_rem;
+					acc_hi <= ds_rem;
 					qv <= {qv[64:0], ds_q1, ds_q2};
 					loop_n <= loop_n + 7'd1;
 				end

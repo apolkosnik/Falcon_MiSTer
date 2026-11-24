@@ -29,6 +29,7 @@ module emu
 ///////// Default values for ports not used in this core /////////
 
 assign {UART_RTS, UART_DTR} = 0;
+assign USER_OUT = '1;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 
@@ -71,13 +72,15 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //
 // FALCON_TT (TT030.qsf, ./scripts/build.sh TT030) builds the TT030 instead: its own
 // core name, so its own games/TT030 folder, config and NVRAM.  It changes:
-//   status[1]    monitor: mono (TT high, ST high), colour
+//   status[1]    monitor: ECL mono (TT high; the mono-detect line), VGA colour
 //   status[3]    ST-RAM: 10 MB, 4 MB
 //   status[9]    not used (a TT runs at 32 MHz)
 //   status[13:12] TT-RAM: 64 MB, 128 MB, 256 MB, none
 //   status[14]   network: a DaynaPORT at SCSI ID 4 (served by tools/falcon_net on the HPS)
 //   status[16:15] VME card: none, an ATW800/2 of 2 MB at $FEC00000, 2 MB at $FEA00000, 4 MB at $FEA00000
 //   status[17]   HDMI shows the card's picture while its timing generator is on, or the TT's always
+//   status[18]   serial handshake: off (Modem 1 and Modem 2 share the UART), RTS/CTS
+//   status[22]   with the handshake: the port that has the UART, Modem 1 (ST-MFP) or Modem 2 (SCC B)
 `include "build_id.v"
 localparam CONF_STR = {
 `ifdef FALCON_TT
@@ -89,13 +92,15 @@ localparam CONF_STR = {
 	"S4,VHDIMGHDF,SCSI 0;",
 	"S5,VHDIMGHDF,SCSI 1;",
 	"-;",
-	"O[1],Monitor,Mono,Colour;",
+	"O[1],Monitor,ECL mono (TT high),VGA colour;",
 	"O[3],ST-RAM,10 MB,4 MB;",
 	"O[13:12],TT-RAM,64 MB,128 MB,256 MB,None;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[6],UART,Serial,MIDI;",
 	"O[19],MT32-pi,MT-32,SoundFont;",
 	"O[21:20],MT32-pi ROM,MT-32 v1,MT-32 v2,CM-32L;",
+	"O[18],Serial handshake,Off,RTS/CTS;",
+	"O[22],Handshake port,Modem 1,Modem 2;",
 	"O[14],Network (SCSI 4),Off,DaynaPORT;",
 	"O[16:15],VME card,None,ATW800/2 2MB FEC00000,ATW800/2 2MB FEA00000,ATW800/2 4MB FEA00000;",
 	"O[17],HDMI shows,VME card when on,TT video;",
@@ -106,8 +111,10 @@ localparam CONF_STR = {
 	"F2,STCIMGROM,Load Cartridge;",
 	"S0,ST ,Floppy A:;",
 	"S1,ST ,Floppy B:;",
+`ifndef FALCON_NO_IDE
 	"S2,VHDIMGHDF,IDE Master;",
 	"S3,VHDIMGHDF,IDE Slave;",
+`endif
 	"S4,VHDIMGHDF,SCSI 0;",
 	"S5,VHDIMGHDF,SCSI 1;",
 	"S6,ISOCUEBIN,SCSI 2 CD-ROM;",
@@ -171,7 +178,7 @@ wire  [7:0] sd_buff_dout;
 wire  [7:0] sd_buff_din[7];
 wire        sd_buff_wr;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(7)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .CONF_STR_BRAM(1), .VDNUM(7)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -325,7 +332,12 @@ assign FB_PAL_WR      = card_pal_wr;
 wire signed [15:0] audio_l, audio_r;
 wire signed [15:0] mic_l, mic_r;
 wire       fdd_led, hdd_led;
-wire       midi_tx, ser_tx;
+wire       midi_tx, ser_tx, ser_rts;
+`ifdef FALCON_TT
+wire       ser_hs = status[18] & ~status[6];
+`else
+wire       ser_hs = 0;
+`endif
 
 falcon_audio_adc #(.CLK_HZ(32000000)) audio_adc
 (
@@ -333,7 +345,11 @@ falcon_audio_adc #(.CLK_HZ(32000000)) audio_adc
 	.mic_l(mic_l), .mic_r(mic_r), .sample_stb()
 );
 
-falcon_system #(.CLK_HZ(32000000)) system
+`ifdef FALCON_TT
+falcon_system #(.CLK_HZ(32000000), .TT(1)) system
+`else
+falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbiter
+`endif
 (
 	.clk(clk_sys),
 	.clk_cpu(clk_cpu),
@@ -403,6 +419,7 @@ falcon_system #(.CLK_HZ(32000000)) system
 	.midi_tx(midi_tx),
 	.ser_rx(status[6] ? 1'b1 : UART_RXD),
 	.ser_tx(ser_tx),
+	.ser_hs(ser_hs), .ser_port(status[22]), .ser_cts(~UART_CTS), .ser_rts(ser_rts),
 
 	.fdd_led(fdd_led),
 	.hdd_led(hdd_led),
@@ -420,6 +437,8 @@ falcon_system #(.CLK_HZ(32000000)) system
 
 assign DDRAM_CLK = clk_sys;
 assign UART_TXD  = status[6] ? midi_tx : ser_tx;
+// RTS/CTS (TT, OSD): the pins are active low; without it RTS stays asserted
+assign UART_RTS  = ser_hs & ~ser_rts;
 
 // MIDI on the user port (sys/mt32pi.sv), whatever the UART option says: MIDI out
 // to pin 1, MIDI in from pin 0 (or the MT32-pi's), and an MT32-pi's I2S audio
