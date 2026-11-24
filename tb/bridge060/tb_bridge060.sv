@@ -26,6 +26,7 @@ reg reset=1;
 reg [31:0] a=0, d_o=0;
 reg a_oe=1, bb_oe=1, rw_n=1, ts_n=1, ram_tos=0;
 reg [1:0] fast_ram=0;
+reg [2:0] tm=3'd5;          // supervisor data
 reg [1:0] siz=0;
 reg [3:0] bsn=0;            // bs_n[0] = BS0 = D31..D24
 reg [1:0] psiz=0; reg [3:0] pbs=0;   // the next single transfer's size and strobes
@@ -41,6 +42,10 @@ reg d1_req=0;
 reg [23:1] d1_addr=0;
 wire d1_ack;
 // DDR3: falcon_memarb and ap060_fastram through falcon_ddr_arb
+// the bridge's line read bursts and the arbiter's other-master writes (the
+// line buffer's fill and its invalidation)
+wire        ram_burst, ram_beat, owr_we;
+wire [23:3] owr_addr;
 wire        ma_busy, ma_dout_ready, ma_rd, ma_we;
 wire  [7:0] ma_burstcnt, ma_be;
 wire [28:0] ma_addr;
@@ -56,20 +61,22 @@ wire [63:0] din, dout;
 falcon_cpubus060 dut(.clk(clk),.clk_cpu(clk_cpu),.reset(reset),.cpu_rst(cpu_rst),.rsto(1'b0),.rsto_sys(),
  .ram_mb(4'd4),.ram_tos(ram_tos),.fast_ram(fast_ram),
  .a(a),.a_oe(a_oe),.d_o(d_o),.d_oe(!rw_n),.rw_n(rw_n),.siz(siz),.bs_n(bsn),
- .tt(2'b00),.tm(3'd5),.ts_n(ts_n),.ciout_n(1'b1),.bb_oe(bb_oe),.d_i(d_i),.ta_n(ta_n),.tea_n(tea_n),
+ .tt(2'b00),.tm(tm),.ts_n(ts_n),.ciout_n(1'b1),.bb_oe(bb_oe),.d_i(d_i),.ta_n(ta_n),.tea_n(tea_n),
  .a_i(a_i),.ts_n_i(ts_n_i),
  .avm_address(fr_address),.avm_burstcount(fr_burstcount),.avm_read(fr_read),.avm_write(fr_write),
  .avm_writedata(fr_writedata),.avm_byteenable(fr_byteenable),.avm_waitrequest(fr_waitrequest),
  .avm_readdata(fr_readdata),.avm_readdatavalid(fr_readdatavalid),
  .ram_req(ram_req),.ram_we(ram_we),.ram_addr(ram_addr),
  .ram_be(ram_be),.ram_wdata(ram_wdata),.ram_rdata(ram_rdata),.ram_rdata64(ram_rdata64),.ram_ack(ram_ack),
+ .ram_burst(ram_burst),.ram_beat(ram_beat),.owr_we(owr_we),.owr_addr(owr_addr),
  .dev_dout(16'd0),.dev_ack(1'b0),.dev_berr(1'b0),.iack_done(1'b0),.iack_avec(1'b0),
  .iack_spur(1'b0),.iack_vector(8'd0),.snoop_we(snoop_we),.snoop_addr(snoop_addr),.snoop_hold(snoop_hold),.blit_br(1'b0));
 falcon_memarb arb(.clk(clk),.reset(reset),.ram_mb(4'd4),.vid_req(1'b0),.vid_addr(21'd0),
  .ld_wr(1'b0),.ld_addr(24'd0),.ld_data(8'd0),.d0_req(1'b0),.d2_req(1'b0),.d3_req(1'b0),
  .d1_req(d1_req),.d1_we(1'b1),.d1_addr(d1_addr),.d1_be(2'b11),.d1_wdata(16'hcafe),.d1_ack(d1_ack),
  .cpu_req(ram_req),.cpu_we(ram_we),.cpu_addr(ram_addr),.cpu_be(ram_be),.cpu_wdata(ram_wdata),
- .cpu_rdata(ram_rdata),.cpu_rdata64(ram_rdata64),.cpu_ack(ram_ack),.cpu_burst(1'b0),
+ .cpu_rdata(ram_rdata),.cpu_rdata64(ram_rdata64),.cpu_ack(ram_ack),.cpu_burst(ram_burst),.cpu_beat(ram_beat),
+ .owr_we(owr_we),.owr_addr(owr_addr),
  .snoop_we(snoop_we),.snoop_addr(snoop_addr),.snoop_hold(snoop_hold),
  .DDRAM_BUSY(ma_busy),.DDRAM_BURSTCNT(ma_burstcnt),.DDRAM_ADDR(ma_addr),.DDRAM_DOUT(ma_dout),
  .DDRAM_DOUT_READY(ma_dout_ready),.DDRAM_RD(ma_rd),.DDRAM_DIN(ma_din),.DDRAM_BE(ma_be),.DDRAM_WE(ma_we));
@@ -134,6 +141,11 @@ endtask
 task word_wr(input [31:0] addr, input [15:0] v);
  begin psiz=2'b10; pbs=~(4'b0011 << {addr[1],1'b0}); wbuf[0]=32'(v) << (16-16*addr[1]); cpu_xfer(addr,0,1); end
 endtask
+// a guest long word of a DDR3 model word (little endian: the lowest address
+// in bits 7:0), the lower (hi = 0) or upper long word
+function [31:0] gl(input [63:0] w, input bit hi);
+ gl = hi ? {w[39:32], w[47:40], w[55:48], w[63:56]} : {w[7:0], w[15:8], w[23:16], w[31:24]};
+endfunction
 task dma_write(input [23:0] addr);
  begin
   @(negedge clk); d1_addr=addr[23:1]; d1_req=1;
@@ -233,6 +245,69 @@ initial begin
         $sformatf("size %0d: ST-RAM $000000-$00000F unchanged by Fast RAM writes: %016x %016x", fr, mem.mem[0], mem.mem[1]));
   long_rd(32'h00000010);
   check(!got_tea && result[0]==32'hefcdab89, $sformatf("size %0d: ST-RAM $000010 unchanged by Fast RAM writes", fr));
+ end
+
+ // the line buffer, answered on clk_cpu: a single read that misses fills the
+ // 32 bytes; reads of them, single and line, are hits (no crossing); the
+ // processor's own writes go into the buffer; another master's write drops
+ // it before the processor can read the old data; a user read of the
+ // supervisor-only first 2 KB is still a bus error on a hit
+ begin
+  integer ml, hl, ll, wl;
+  rst_with(2'd0);
+  for(integer w=0;w<4;w++) mem.mem[('h4000>>3)+w] = {32'h44440000 + 32'(w), 32'h11110000 + 32'(w)};
+  for(integer w=0;w<4;w++) mem.mem[('h0400>>3)+w] = {32'h66660000 + 32'(w), 32'h55550000 + 32'(w)};
+  long_rd(32'h00004004); ml=xclk;
+  check(!got_tea && result[0]==gl(mem.mem['h4000>>3],1), $sformatf("buffer: a single read that misses: %08x", result[0]));
+  long_rd(32'h00004018); hl=xclk;
+  check(!got_tea && result[0]==gl(mem.mem[('h4000>>3)+3],0), $sformatf("buffer: a single read of the filled 32 bytes: %08x", result[0]));
+  check(hl <= 4 && ml >= 3*hl, $sformatf("buffer: a hit answers without the crossing (hit %0d, miss %0d clocks)", hl, ml));
+  cpu_xfer(32'h00004014,1,0); ll=xclk;
+  check(!got_tea && result[0]==gl(mem.mem[('h4000>>3)+2],1) && result[1]==gl(mem.mem[('h4000>>3)+3],0) &&
+        result[2]==gl(mem.mem[('h4000>>3)+3],1) && result[3]==gl(mem.mem[('h4000>>3)+2],0),
+        $sformatf("buffer: a line read hit, wrapping from A3:A2 = 1: %08x %08x %08x %08x", result[0], result[1], result[2], result[3]));
+  check(ll <= 7, $sformatf("buffer: a line hit in four beats (%0d clocks)", ll));
+  // the processor's writes: long, byte, word and line, each read back
+  long_wr(32'h00004008, 32'h13579bdf); long_rd(32'h00004008);
+  check(!got_tea && result[0]==32'h13579bdf, $sformatf("buffer: a long written into it is read back: %08x", result[0]));
+  byte_wr(32'h0000400d, 8'h77); word_wr(32'h0000400e, 16'hbeef); long_rd(32'h0000400c);
+  check(!got_tea && result[0]==32'h0177beef,
+        $sformatf("buffer: byte and word writes land on their lanes: %08x", result[0]));
+  wbuf[0]=32'ha0000000; wbuf[1]=32'ha0000001; wbuf[2]=32'ha0000002; wbuf[3]=32'ha0000003;
+  cpu_xfer(32'h00004010,1,1); cpu_xfer(32'h00004010,1,0);
+  check(!got_tea && result[0]==32'ha0000000 && result[1]==32'ha0000001 && result[2]==32'ha0000002 && result[3]==32'ha0000003,
+        $sformatf("buffer: a line written into it is read back: %08x %08x %08x %08x", result[0], result[1], result[2], result[3]));
+  long_rd(32'h00004000); wl=xclk;
+  check(!got_tea && result[0]==gl(mem.mem['h4000>>3],0) && wl <= 4,
+        $sformatf("buffer: still a hit after the processor's writes (%08x, %0d clocks)", result[0], wl));
+  repeat(200) @(negedge clk);
+  check(mem.mem[('h4000>>3)+1][63:32]=={8'hef, 8'hbe, 8'h77, gl(mem.mem[('h4000>>3)+1],1)[31:24]} &&
+        mem.mem[('h4000>>3)+2]=={32'h010000a0, 32'h000000a0},
+        $sformatf("buffer: the processor's writes reached memory: %016x %016x", mem.mem[('h4000>>3)+1], mem.mem[('h4000>>3)+2]));
+  // another master's write: the next read sees it
+  dma_write(24'h004000);
+  long_rd(32'h00004000);
+  check(!got_tea && result[0][31:16]==16'hcafe, $sformatf("buffer: dropped by a DMA write to its 32 bytes: %08x", result[0]));
+  long_rd(32'h00004004);
+  check(!got_tea && result[0]==gl(mem.mem['h4000>>3],1), $sformatf("buffer: refilled after the DMA write: %08x", result[0]));
+  dma_write(24'h00401c);
+  cpu_xfer(32'h00004018,1,0);
+  check(!got_tea && result[1][31:16]==16'hcafe, $sformatf("buffer: a line read after a DMA write sees it: %08x", result[1]));
+  // a DMA write elsewhere keeps it
+  long_rd(32'h00004000);
+  dma_write(24'h005000);
+  long_rd(32'h00004008); wl=xclk;
+  check(!got_tea && wl <= 4, $sformatf("buffer: kept by a DMA write elsewhere (%0d clocks)", wl));
+  // supervisor fills $400-$41F; the user's read of it is a bus error
+  long_rd(32'h00000400);
+  check(!got_tea && result[0]==gl(mem.mem['h400>>3],0), $sformatf("buffer: supervisor read of $400: %08x", result[0]));
+  tm=3'd1; long_rd(32'h00000404); tm=3'd5;
+  check(got_tea, "buffer: a user read of the supervisor-only page is a bus error on a hit");
+  long_rd(32'h00000404);
+  check(!got_tea && result[0]==gl(mem.mem['h400>>3],1), $sformatf("buffer: the supervisor's read after it: %08x", result[0]));
+  // (the processor gives the bus up: the DMA writes' snoops are delivered)
+  @(negedge clk_cpu); a_oe=0; bb_oe=0;
+  repeat(800) @(negedge clk);
  end
 
  // transfer lengths (clk_cpu clocks from TS to the last TA, 16 of each):
