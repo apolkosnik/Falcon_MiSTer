@@ -68,7 +68,7 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //
 // FALCON_TT (TT030.qsf, ./scripts/build.sh TT030) builds the TT030 instead: its own
 // core name, so its own games/TT030 folder, config and NVRAM.  It changes:
-//   status[1]    monitor: mono (TT high, ST high), colour
+//   status[1]    monitor: ECL mono (TT high; the mono-detect line), VGA colour
 //   status[3]    ST-RAM: 10 MB, 4 MB
 //   status[9]    not used (a TT runs at 32 MHz)
 //   status[13:12] TT-RAM: 64 MB, 128 MB, 256 MB, none
@@ -86,7 +86,7 @@ localparam CONF_STR = {
 	"S4,VHDIMGHDF,SCSI 0;",
 	"S5,VHDIMGHDF,SCSI 1;",
 	"-;",
-	"O[1],Monitor,Mono,Colour;",
+	"O[1],Monitor,ECL mono (TT high),VGA colour;",
 	"O[3],ST-RAM,10 MB,4 MB;",
 	"O[13:12],TT-RAM,64 MB,128 MB,256 MB,None;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
