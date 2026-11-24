@@ -75,6 +75,7 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[14]   network: a DaynaPORT at SCSI ID 4 (served by tools/falcon_net on the HPS)
 //   status[16:15] VME card: none, an ATW800/2 of 2 MB at $FEC00000, 2 MB at $FEA00000, 4 MB at $FEA00000
 //   status[17]   HDMI shows the card's picture while its timing generator is on, or the TT's always
+//   status[23]   CPU timing: as fast as the core runs, or a real TT's time per instruction (tt030_pace)
 `include "build_id.v"
 localparam CONF_STR = {
 `ifdef FALCON_TT
@@ -91,6 +92,7 @@ localparam CONF_STR = {
 	"O[13:12],TT-RAM,64 MB,128 MB,256 MB,None;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[6],UART,Serial,MIDI;",
+	"O[23],CPU timing,Fast,Real TT;",
 	"O[14],Network (SCSI 4),Off,DaynaPORT;",
 	"O[16:15],VME card,None,ATW800/2 2MB FEC00000,ATW800/2 2MB FEA00000,ATW800/2 4MB FEA00000;",
 	"O[17],HDMI shows,VME card when on,TT video;",
@@ -253,11 +255,13 @@ wire cold_reset = por | status[7] | rom_download;
 // the TT-RAM size changes only at a cold reset
 `ifdef FALCON_TT
 wire      tt_mode = 1;
+wire      tt_timing = status[23];
 reg [1:0] ttram_sel = 0;
 always @(posedge clk_sys) if (cold_reset)
 	ttram_sel <= status[13:12] == 2'd3 ? 2'd0 : status[13:12] + 2'd1;
 `else
 wire      tt_mode = 0;
+wire      tt_timing = 0;
 wire [1:0] ttram_sel = 0;
 `endif
 // A TT has a 68882, and TOS 3.06 does not start right when it appears late: after power
@@ -354,7 +358,7 @@ falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbite
 	.net_on(1'b0),
 	.vme_sel(2'd0),
 `endif
-	.tt_mode(tt_mode), .ttram_sel(ttram_sel),
+	.tt_mode(tt_mode), .tt_timing(tt_timing), .ttram_sel(ttram_sel),
 `ifdef MISTER_FB
 	.fb_en(card_fb_en), .fb_format(card_fb_format), .fb_width(card_fb_width), .fb_height(card_fb_height),
 	.fb_base(card_fb_base), .fb_stride(card_fb_stride),

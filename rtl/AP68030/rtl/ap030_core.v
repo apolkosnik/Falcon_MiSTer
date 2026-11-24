@@ -116,6 +116,7 @@ module ap030_core
 	// multiply/divide started (1 MULU.W/MULS.W, 2 DIVU.W, 3 DIVS.W)
 	output reg  [1:0] tm_pop,
 	output reg  [1:0] tm_md,
+	output     [15:0] tm_ir,        // the operation word of the instruction dispatched last
 	// the prefetch queue for an external pipeline model (words from scan_pc
 	// on; valid count; a flush or reload of the queue in the last clock),
 	// and that model's stop point: with fetch_lazy no longword is fetched
@@ -276,6 +277,7 @@ assign ipend_n = ~ipend_r;
 //---------------------------------------------------------------------------
 reg  [7:0] state;
 reg [15:0] ir;             // operation word
+assign tm_ir = ir;
 reg [15:0] ext;            // second word (bitfield, MUL/DIV, CAS, CHK2, MOVES, MOVEC, MMU, coprocessor)
 reg [31:0] pc_i;           // address of the current instruction
 reg [31:0] ea, ea2;        // effective addresses

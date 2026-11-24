@@ -13,6 +13,7 @@ set_global_assignment -name SEARCH_PATH rtl/AP68030/rtl
 set_global_assignment -name SEARCH_PATH rtl/AP68030/rtl/core
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpubus.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_cpuclk.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/tt030_pace.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_pipescan.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_tstat.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_l2.sv
