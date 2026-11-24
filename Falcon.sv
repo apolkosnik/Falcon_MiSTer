@@ -28,8 +28,7 @@ module emu
 
 ///////// Default values for ports not used in this core /////////
 
-assign {UART_RTS, UART_DTR} = 0;
-assign USER_OUT = '1;
+assign UART_DTR = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 
