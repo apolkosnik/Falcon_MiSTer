@@ -1285,10 +1285,12 @@ static void sc_straddle()
 	for (; reps < 300; reps++) {
 		if (!present() && !run_until(present, 3 * POLL_CLKS)) break;
 		steps(rnd(1200) + 50);
+		child_signal(SIGSTOP);                         // the service stopped (running, it puts the header back)
 		mb_w16(0x000, 0);                              // service gone
 		if (!wait_fall(3 * POLL_CLKS)) break;
 		steps(rnd(250) + 10);
 		mb_w16(0x000, MAGIC);                          // service back
+		child_signal(SIGCONT);
 		if (!wait_rise(4 * POLL_CLKS)) break;
 	}
 	check_eq("straddle", "presence loss/return cycles completed", 300, reps, "test harness", 3);
