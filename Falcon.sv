@@ -28,8 +28,8 @@ module emu
 
 ///////// Default values for ports not used in this core /////////
 
+assign {UART_RTS, UART_DTR} = 0;
 assign USER_OUT = '1;
-assign UART_DTR = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 
@@ -58,7 +58,11 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[2:1]  monitor: VGA, RGB, TV, mono
 //   status[3]    ST-RAM: 14 MB, 4 MB
 //   status[5:4]  aspect ratio
-//   status[6]    MIDI on the user port UART
+//   status[6]    the UART: serial or MIDI
+//                MIDI is on the user port always (a MIDI adapter or an MT32-pi), so
+//                the serial port and MIDI work together
+//   status[19]   MT32-pi on the user port: MT-32 or SoundFont mode
+//   status[21:20] MT32-pi ROM: MT-32 v1, MT-32 v2, CM-32L
 //   status[7]    cold reset (clears the warm start flag)
 //   status[8]    reset NVRAM to defaults for the selected monitor
 //   status[9]    CPU: 32 MHz turbo (default), Falcon 16 MHz (8 MHz by $FF8007)
@@ -93,6 +97,8 @@ localparam CONF_STR = {
 	"O[13:12],TT-RAM,64 MB,128 MB,256 MB,None;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[6],UART,Serial,MIDI;",
+	"O[19],MT32-pi,MT-32,SoundFont;",
+	"O[21:20],MT32-pi ROM,MT-32 v1,MT-32 v2,CM-32L;",
 	"O[18],Serial handshake,Off,RTS/CTS;",
 	"O[22],Handshake port,Modem 1,Modem 2;",
 	"O[14],Network (SCSI 4),Off,DaynaPORT;",
@@ -117,6 +123,8 @@ localparam CONF_STR = {
 	"O[3],ST-RAM,14 MB,4 MB;",
 	"O[5:4],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[6],UART,Serial,MIDI;",
+	"O[19],MT32-pi,MT-32,SoundFont;",
+	"O[21:20],MT32-pi ROM,MT-32 v1,MT-32 v2,CM-32L;",
 	"O[9],CPU,32 MHz turbo,Falcon 16 MHz;",
 	"O[10],Timing counters,Off,On;",
 `ifdef FALCON_CPU060
@@ -407,7 +415,7 @@ falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbite
 	.audio_l(audio_l),
 	.audio_r(audio_r),
 
-	.midi_rx(status[6] ? UART_RXD : 1'b1),
+	.midi_rx((status[6] ? UART_RXD : 1'b1) & user_midi_rx),
 	.midi_tx(midi_tx),
 	.ser_rx(status[6] ? 1'b1 : UART_RXD),
 	.ser_tx(ser_tx),
@@ -432,8 +440,44 @@ assign UART_TXD  = status[6] ? midi_tx : ser_tx;
 // RTS/CTS (TT, OSD): the pins are active low; without it RTS stays asserted
 assign UART_RTS  = ser_hs & ~ser_rts;
 
-assign AUDIO_L = audio_l;
-assign AUDIO_R = audio_r;
+// MIDI on the user port (sys/mt32pi.sv), whatever the UART option says: MIDI out
+// to pin 1, MIDI in from pin 0 (or the MT32-pi's), and an MT32-pi's I2S audio
+// mixed in once it has answered on I2C
+wire [15:0] mt32_i2s_l, mt32_i2s_r;
+wire        mt32_available, user_midi_rx;
+
+mt32pi mt32pi
+(
+	.CLK_AUDIO(CLK_AUDIO),
+	.CLK_VIDEO(CLK_VIDEO),
+	.CE_PIXEL(CE_PIXEL),
+	.VGA_VS(VGA_VS),
+	.VGA_DE(VGA_DE),
+	.USER_IN(USER_IN),
+	.USER_OUT(USER_OUT),
+	.reset(reset),
+	.midi_tx(midi_tx),
+	.midi_rx(user_midi_rx),
+	.mt32_i2s_r(mt32_i2s_r),
+	.mt32_i2s_l(mt32_i2s_l),
+	.mt32_available(mt32_available),
+	.mt32_mode_req(status[19]),
+	.mt32_rom_req(status[21:20]),
+	.mt32_sf_req(8'd0),
+	.mt32_mode(), .mt32_rom(), .mt32_sf(), .mt32_newmode(),
+	.mt32_lcd_en(), .mt32_lcd_pix(), .mt32_lcd_update()
+);
+
+function [15:0] mix(input signed [15:0] a, input signed [15:0] m);
+	reg signed [16:0] sum;
+	begin
+		sum = a + m;
+		mix = (sum[16] == sum[15]) ? sum[15:0] : {sum[16], {15{~sum[16]}}};
+	end
+endfunction
+
+assign AUDIO_L = mt32_available ? mix(audio_l, mt32_i2s_l) : audio_l;
+assign AUDIO_R = mt32_available ? mix(audio_r, mt32_i2s_r) : audio_r;
 
 assign LED_USER = fdd_led;
 assign LED_DISK = {1'b0, hdd_led};
