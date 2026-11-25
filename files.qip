@@ -50,6 +50,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp_ram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/dsp/dsp56k_rom.sv
 set_global_assignment -name SEARCH_PATH rtl/falcon/dsp
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_scsi.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_lpt.sv
 # device modules are appended here as they are integrated
 set_global_assignment -name QIP_FILE rtl/pll.qip
 set_global_assignment -name SDC_FILE Falcon.sdc

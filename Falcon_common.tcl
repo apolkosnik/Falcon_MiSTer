@@ -287,3 +287,4 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_scsi.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_lpt.sv
