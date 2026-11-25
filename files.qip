@@ -27,6 +27,7 @@ set_global_assignment -name VERILOG_FILE rtl/scc/scc.v
 set_global_assignment -name VERILOG_FILE rtl/scc/scc_chan.v
 set_global_assignment -name VERILOG_FILE rtl/scu/scu.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/vme/vme_atw800.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vme/vme_et4000.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_acia.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/falcon/falcon_ikbd_keymap.sv

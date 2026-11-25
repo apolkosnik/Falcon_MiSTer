@@ -253,3 +253,7 @@ FALCON_BRINGUP=NO_DSP ./scripts/build.sh Falcon040   # without the DSP
   Centronics printer, `.MSA`/`.STX` floppy images.
 - Microphone input (see Audio input) is tested only in simulation, not yet
   with a physical source on the MiSTer's ADC.
+- TT030: the Nova ET4000 VME card (OSD "VME card", `rtl/vme/vme_et4000.sv`)
+  is tested in simulation, where EmuTOS's own driver brings up its 640x480
+  mono desktop; the Nova and NVDI drivers' 256 colour and HiColor modes only
+  in its unit bench (`tb/et4000`), not yet with the drivers themselves.

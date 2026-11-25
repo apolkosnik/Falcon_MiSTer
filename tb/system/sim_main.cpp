@@ -38,7 +38,8 @@
 //     --net             a DaynaPORT at SCSI ID 4, its rings served as tools/falcon_net does:
 //                       one ARP request queued for reception after 2 ms, every frame
 //                       sent printed
-//     --vme N           TT: the VME card, an ATW800/2: 1 2 MB at $FEC00000, 2 2 MB at $FEA00000, 3 4 MB at $FEA00000
+//     --vme N           TT: the VME card, an ATW800/2: 1 2 MB at $FEC00000, 2 2 MB at $FEA00000, 3 4 MB at $FEA00000;
+//                       4 a Nova ET4000
 //     --text ADDR       print the NUL-terminated text at guest ADDR (hex) at the end;
 //                       --text @ADDR follows the pointer at ADDR
 //     --done ADDR       end the run once the long at guest ADDR (hex) reads $D0E0600D

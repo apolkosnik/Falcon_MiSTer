@@ -39,7 +39,7 @@ module falcon_system #(
 	input             tstat_en,     // OSD: the timing counters at $FFF000 (falcon_tstat); 0: bus error there
 	input             net_on,       // OSD: a DaynaPORT at SCSI ID 4 (falcon_scsi, tools/falcon_net)
 	output            fpu_ok,       // the HPS FPU service answers (falcon_fpu_bridge)
-	input       [1:0] vme_sel,      // OSD, TT: the VME card: 0 none, an ATW800/2: 1 2 MB at $FEC00000, 2 2 MB at $FEA00000, 3 4 MB at $FEA00000
+	input       [2:0] vme_sel,      // OSD, TT: the VME card: 0 none, an ATW800/2: 1 2 MB at $FEC00000, 2 2 MB at $FEA00000, 3 4 MB at $FEA00000; 4 a Nova ET4000
 
 	// ROM/cartridge loader
 	input             ld_wr,
@@ -333,7 +333,14 @@ wire [21:3] atw_moff;
 wire  [7:0] atw_mbe;
 wire [63:0] atw_mwdata, atw_mrdata;
 // the card's memory is in the 24-bit map at its own A24 address (falcon_cpubus)
-wire [23:1] atw_maddr = {vme_sel == 2'd3 ? {2'b10, atw_moff[21]} + 3'b001 : vme_sel == 2'd1 ? 3'b110 : 3'b101, atw_moff[20:3], 2'b00};
+wire [23:1] atw_maddr = {vme_sel == 3'd3 ? {2'b10, atw_moff[21]} + 3'b001 : vme_sel == 3'd1 ? 3'b110 : 3'b101, atw_moff[20:3], 2'b00};
+wire        atw_on = vme_sel == 3'd1 || vme_sel == 3'd2 || vme_sel == 3'd3;
+// or a Nova ET4000, whose video memory and shadow are in the 24-bit map too
+wire        et4k_on = vme_sel == 3'd4;
+wire        et_mreq, et_mwe;
+wire [23:3] et_maddr;
+wire  [7:0] et_mbe;
+wire [63:0] et_mwdata;
 wire        blit_br;
 `ifdef FALCON_CPU060
 wire        blit_bg;           // the blitter owns the bus (falcon_cpubus040/060 grants it)
@@ -357,7 +364,8 @@ falcon_cpubus cpubus
 	.dev_cs(c_dev_cs), .dev_stb(c_dev_stb), .dev_we(c_dev_we), .dev_addr(c_dev_addr),
 	.dev_uds(c_dev_uds), .dev_lds(c_dev_lds), .dev_din(c_dev_din), .dev_dout(dev_dout),
 	.dev_ack(dev_ack), .dev_berr(dev_berr), .dev_super(dev_super),
-	.vme_card(vme_sel != 2'd0), .vme_base(vme_sel == 2'd1), .vme_4mb(vme_sel == 2'd3), .vme_lay4(atw_lay4), .dev_vme(c_dev_vme),
+	.vme_card(atw_on || et4k_on), .vme_base(vme_sel == 3'd1), .vme_4mb(vme_sel == 3'd3), .vme_lay4(atw_lay4),
+	.vme_et4k(et4k_on), .dev_vme(c_dev_vme),
 	.iack_req(iack_req), .iack_level(iack_level), .iack_done(iack_done), .iack_avec(iack_avec),
 	.iack_spur(iack_spur), .iack_vector(iack_vector),
 	.cp_req(cp_req), .cp_we(cp_we), .cp_id(cp_id), .cp_off(cp_off), .cp_siz(cp_siz),
@@ -691,10 +699,12 @@ falcon_memarb #(.TT(TT)) memarb
 	.d1_be(d1_tt ? ttd_be : fdc_dbe), .d1_wdata(d1_tt ? ttd_wdata : fdc_dwdata),
 	.d1_rdata(fdc_drdata), .d1_ack(d1_ack), .d1_bad(d1_bad),
 	// d2 is the blitter's; a TT has none, and the VME card's 2D engine takes it
-	.d2_req(tt_mode ? atw_mreq : blt_req & ~blt_io), .d2_we(tt_mode ? atw_mwe : blt_we),
-	.d2_addr(tt_mode ? atw_maddr : blt_addr), .d2_be(blt_be), .d2_wdata(blt_wdata),
-	.d2_wide(tt_mode), .d2_wdata64(atw_mwdata), .d2_be8(atw_mbe), .d2_rdata64(atw_mrdata),
-	.d2_rdata(mblt_rdata), .d2_ack(mblt_ack), .d2_hold(tt_mode ? atw_busy : blit_bg), .d2_vme(tt_mode),
+	.d2_req(tt_mode ? (et4k_on ? et_mreq : atw_mreq) : blt_req & ~blt_io),
+	.d2_we(tt_mode ? (et4k_on ? et_mwe : atw_mwe) : blt_we),
+	.d2_addr(tt_mode ? (et4k_on ? {et_maddr, 2'b00} : atw_maddr) : blt_addr), .d2_be(blt_be), .d2_wdata(blt_wdata),
+	.d2_wide(tt_mode), .d2_wdata64(et4k_on ? et_mwdata : atw_mwdata), .d2_be8(et4k_on ? et_mbe : atw_mbe),
+	.d2_rdata64(atw_mrdata),
+	.d2_rdata(mblt_rdata), .d2_ack(mblt_ack), .d2_hold(tt_mode ? (et4k_on | atw_busy) : blit_bg), .d2_vme(tt_mode),
 	.d3_req(d3_req), .d3_we(d3_we), .d3_addr(d3_addr), .d3_be(d3_be), .d3_wdata(d3_wdata),
 	.d3_rdata(d3_rdata), .d3_ack(d3_ack),
 	.cpu_req(mram_req), .cpu_we(mram_we), .cpu_addr(mram_addr), .cpu_be(mram_be),
@@ -814,7 +824,7 @@ always @* begin
 	dev_ack  = 0;
 	dev_berr = 0;
 	if (dev_cs) begin
-		if      (dev_vme)    begin dev_dout = atw_dout;    dev_ack = atw_ack;    end
+		if      (dev_vme)    begin dev_dout = et4k_on ? et_dout : atw_dout; dev_ack = et4k_on ? et_ack : atw_ack; end
 		else if (sel_ide)    begin dev_dout = ide_dout;    dev_ack = ide_ack;    end
 		else if (sel_combel) begin dev_dout = combel_dout; dev_ack = combel_ack; end
 		else if (sel_ttvid)  begin dev_dout = ttvid_dout;  dev_ack = ttvid_ack;  end
@@ -1257,23 +1267,62 @@ wire        atw_ack;
 wire [255:0] atw_vtg;
 wire [21:0] atw_fbstart;
 wire        atw_fben;
+wire  [4:0] atw_fbformat;
+wire [11:0] atw_fbwidth, atw_fbheight;
+wire [13:0] atw_fbstride;
+wire        atw_palwr;
+wire  [7:0] atw_paladdr;
+wire [23:0] atw_palrgb;
 // the video memory is in DDR3 at $30000000 + its A24 address
-assign fb_en   = atw_fben & tt_mode & vme_sel != 2'd0;
-assign fb_base = {8'h30, (vme_sel == 2'd1 ? 24'hC00000 : 24'hA00000) +
+wire [31:0] atw_fbbase = {8'h30, (vme_sel == 3'd1 ? 24'hC00000 : 24'hA00000) +
                          {2'b00, atw_fbstart[21] & atw_lay4, atw_fbstart[20:0]}};
 vme_atw800 atw800 (
-	.clk(clk), .reset(cold_reset), .sys_reset(dev_reset), .mem4(vme_sel == 2'd3), .lay4(atw_lay4),
-	.bus_cs(dev_cs & dev_vme), .bus_stb(dev_stb & dev_vme), .bus_we(dev_we),
+	.clk(clk), .reset(cold_reset), .sys_reset(dev_reset), .mem4(vme_sel == 3'd3), .lay4(atw_lay4),
+	.bus_cs(dev_cs & dev_vme & ~et4k_on), .bus_stb(dev_stb & dev_vme & ~et4k_on), .bus_we(dev_we),
 	.bus_aux(&dev_addr[23:21]), .bus_addr(dev_addr[11:1]),
 	.bus_uds(dev_uds), .bus_lds(dev_lds), .bus_din(dev_din),
 	.bus_dout(atw_dout), .bus_ack(atw_ack),
 	.vtg(atw_vtg),
-	.fb_en(atw_fben), .fb_format(fb_format), .fb_width(fb_width), .fb_height(fb_height),
-	.fb_start(atw_fbstart), .fb_stride(fb_stride),
-	.pal_wr(fb_pal_wr), .pal_addr(fb_pal_addr), .pal_rgb(fb_pal_rgb),
+	.fb_en(atw_fben), .fb_format(atw_fbformat), .fb_width(atw_fbwidth), .fb_height(atw_fbheight),
+	.fb_start(atw_fbstart), .fb_stride(atw_fbstride),
+	.pal_wr(atw_palwr), .pal_addr(atw_paladdr), .pal_rgb(atw_palrgb),
 	.mem_req(atw_mreq), .mem_we(atw_mwe), .mem_addr(atw_moff), .mem_be(atw_mbe), .mem_wdata(atw_mwdata),
-	.mem_rdata(atw_mrdata), .mem_ack(mblt_ack & tt_mode), .blit_busy(atw_busy)
+	.mem_rdata(atw_mrdata), .mem_ack(mblt_ack & tt_mode & ~et4k_on), .blit_busy(atw_busy)
 );
+
+// TT: or a Nova ET4000 (its 1 MB of video memory at $C00000 of the 24-bit map, the shadow
+// of its planar modes at $A00000)
+wire [15:0] et_dout;
+wire        et_ack, et_fben, et_palwr;
+wire  [4:0] et_fbformat;
+wire [11:0] et_fbwidth, et_fbheight;
+wire [23:0] et_fbaddr;
+wire [13:0] et_fbstride;
+wire  [7:0] et_paladdr;
+wire [23:0] et_palrgb;
+vme_et4000 #(.CLK_HZ(CLK_HZ)) et4000 (
+	.clk(clk), .reset(cold_reset), .sys_reset(dev_reset),
+	.bus_cs(dev_cs & dev_vme & et4k_on), .bus_stb(dev_stb & dev_vme & et4k_on), .bus_we(dev_we),
+	.bus_mem(dev_addr[23:20] == 4'hC), .bus_addr(dev_addr[19:1]),
+	.bus_uds(dev_uds), .bus_lds(dev_lds), .bus_din(dev_din),
+	.bus_dout(et_dout), .bus_ack(et_ack),
+	.fb_en(et_fben), .fb_format(et_fbformat), .fb_width(et_fbwidth), .fb_height(et_fbheight),
+	.fb_addr(et_fbaddr), .fb_stride(et_fbstride),
+	.pal_wr(et_palwr), .pal_addr(et_paladdr), .pal_rgb(et_palrgb),
+	.mem_req(et_mreq), .mem_we(et_mwe), .mem_addr(et_maddr), .mem_be(et_mbe), .mem_wdata(et_mwdata),
+	.mem_rdata(atw_mrdata), .mem_ack(mblt_ack & tt_mode & et4k_on)
+);
+
+// the scaler's frame buffer: the card's
+assign fb_en       = tt_mode & (et4k_on ? et_fben : atw_fben & atw_on);
+assign fb_format   = et4k_on ? et_fbformat : atw_fbformat;
+assign fb_width    = et4k_on ? et_fbwidth  : atw_fbwidth;
+assign fb_height   = et4k_on ? et_fbheight : atw_fbheight;
+assign fb_base     = et4k_on ? {8'h30, et_fbaddr} : atw_fbbase;
+assign fb_stride   = et4k_on ? et_fbstride : atw_fbstride;
+assign fb_pal_wr   = et4k_on ? et_palwr    : atw_palwr;
+assign fb_pal_addr = et4k_on ? et_paladdr  : atw_paladdr;
+assign fb_pal_rgb  = et4k_on ? et_palrgb   : atw_palrgb;
 
 wire [7:0] scu_dout;
 wire [2:0] scu_ipl;

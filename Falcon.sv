@@ -76,7 +76,8 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 //   status[9]    not used (a TT runs at 32 MHz)
 //   status[13:12] TT-RAM: 64 MB, 128 MB, 256 MB, none
 //   status[14]   network: a DaynaPORT at SCSI ID 4 (served by tools/falcon_net on the HPS)
-//   status[16:15] VME card: none, an ATW800/2 of 2 MB at $FEC00000, 2 MB at $FEA00000, 4 MB at $FEA00000
+//   status[25:23] VME card: none, an ATW800/2 of 2 MB at $FEC00000, 2 MB at $FEA00000, 4 MB at
+//                $FEA00000, a Nova ET4000 (status[16:15] were the ATW800/2's before; not used)
 //   status[17]   HDMI shows the card's picture while its timing generator is on, or the TT's always
 //   status[18]   serial handshake: off (Modem 1 and Modem 2 share the UART), RTS/CTS
 //   status[22]   with the handshake: the port that has the UART, Modem 1 (ST-MFP) or Modem 2 (SCC B)
@@ -101,7 +102,7 @@ localparam CONF_STR = {
 	"O[18],Serial handshake,Off,RTS/CTS;",
 	"O[22],Handshake port,Modem 1,Modem 2;",
 	"O[14],Network (SCSI 4),Off,DaynaPORT;",
-	"O[16:15],VME card,None,ATW800/2 2MB FEC00000,ATW800/2 2MB FEA00000,ATW800/2 4MB FEA00000;",
+	"O[25:23],VME card,None,ATW800/2 2MB FEC00000,ATW800/2 2MB FEA00000,ATW800/2 4MB FEA00000,Nova ET4000;",
 	"O[17],HDMI shows,VME card when on,TT video;",
 	"O[10],Timing counters,Off,On;",
 `else
@@ -363,12 +364,12 @@ falcon_system #(.CLK_HZ(32000000), .TT(0)) system   // no TT paths in the arbite
 	.monitor(status[1] ? 2'b10 : 2'b00),                     // mono or colour: the TT's GPIP7
 	.cpu_turbo(1'b1),
 	.net_on(status[14]),
-	.vme_sel(status[16:15]),
+	.vme_sel(status[25:23] > 3'd4 ? 3'd0 : status[25:23]),
 `else
 	.monitor(status[2:1] == 2'd0 ? 2'b10 : status[2:1] == 2'd1 ? 2'b01 : status[2:1] == 2'd2 ? 2'b11 : 2'b00),
 	.cpu_turbo(~status[9]),
 	.net_on(1'b0),
-	.vme_sel(2'd0),
+	.vme_sel(3'd0),
 `endif
 	.tt_mode(tt_mode), .ttram_sel(ttram_sel),
 `ifdef MISTER_FB

@@ -20,7 +20,7 @@ module tb_top
 	input             tstat_en,
 	input       [1:0] fast_ram,     // ap060 CT60 mode: 0 off, 1 64 MB, 2 128 MB, 3 240 MB
 	input             net_on,
-	input       [1:0] vme_sel,
+	input       [2:0] vme_sel,
 
 	input      [10:0] ps2_key,
 	input      [24:0] ps2_mouse,

@@ -135,6 +135,7 @@ module falcon_cpubus
 	input             vme_base,    //   a 2 MB card's ADDR jumper: 0 $FEA00000, 1 $FEC00000
 	input             vme_4mb,     //   a 4 MB card, at $FEA00000
 	input             vme_lay4,    //   which has its 4 MB layout on (register 15 = 3)
+	input             vme_et4k,    // TT: the VME card is a Nova ET4000 instead (rtl/vme/vme_et4000.sv)
 	output reg        dev_vme,     //   the device cycle is for its registers, not the I/O of $FFxxxx
 
 	// interrupt acknowledge
@@ -228,25 +229,28 @@ wire is_io     = fspace && (la[23:15] == 9'b111111111);       // FF8000-FFFFFF
 wire is_prot   = fspace && ((la[23:11] == 13'd0) || is_io);
 wire cpu_space = (fc == 3'd7);
 
-// TT: the VME bus, A24 at $FE000000 and A16 at $FEFF0000.  The one card is an ATW800/2:
+// TT: the VME bus, A24 at $FE000000 and A16 at $FEFF0000.  The card is an ATW800/2:
 // 2 or 4 MB of video memory at its jumpers' address, kept in DDR3 at that address of the
 // 24-bit map (free there: a TT's ST-RAM ends at 10 MB), but for the FPGA's registers at the
 // top of it; and its bus CPLD's block at $FEFFFA80.  The rest of the bus stays a bus error,
-// which is how xVDI sizes the card.  D16, and never cached.
+// which is how xVDI sizes the card.  D16, and never cached.  Or it is a Nova ET4000 (below).
 // A 4 MB card starts in a 2 MB layout, its upper half a mirror of the lower, registers
 // and all, until register 15 = 3: then the registers are at the top of the 4 MB alone.
 wire is_vme  = tt_mode && vme_card && a[31:24] == 8'hFE && !cpu_space;
 wire vme_lo  = la[23:21] == 3'b101;                            // $FEA00000
 wire vme_hi  = la[23:21] == 3'b110;                            // $FEC00000
 wire vme_mir = vme_4mb && !vme_lay4;
-wire vme_win = is_vme && (vme_4mb ? vme_lo || vme_hi : vme_base ? vme_hi : vme_lo);
-wire vme_reg = (vme_win && la[20:12] == 9'h1FF && (vme_hi || !vme_4mb || vme_mir) &&
+// A Nova ET4000: its 1 MB memory window at $FEC00000 and its I/O ports at $FEDC0000 are
+// both the card's (its memory goes through the VGA's data path), D16 and never cached.
+wire vme_win = is_vme && !vme_et4k && (vme_4mb ? vme_lo || vme_hi : vme_base ? vme_hi : vme_lo);
+wire vme_reg = (is_vme && vme_et4k && (la[23:20] == 4'hC || la[23:16] == 8'hDC)) ||
+               (vme_win && la[20:12] == 9'h1FF && (vme_hi || !vme_4mb || vme_mir) &&
                 (la[11:9] == 3'd0  ||                          // +$1FF000 LUT
                  la[11:5] == 7'h10 ||                          // +$1FF200 id
                  la[11:5] == 7'h40 ||                          // +$1FF800 VTG
                  la[11:6] == 6'h24 ||                          // +$1FF900 blitter
                  la[11:5] == 7'h56)) ||                        // +$1FFAC0 link
-               (is_vme && la[23:7] == 17'h1FFF5);              // $FEFFFA80-$FEFFFAFF
+               (is_vme && !vme_et4k && la[23:7] == 17'h1FFF5); // $FEFFFA80-$FEFFFAFF
 wire vme_ram = vme_win && !vme_reg;
 
 // RAM/ROM address actually used: the reset vectors come from ROM
