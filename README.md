@@ -32,6 +32,7 @@ frame.  The complete core fits (92% of the logic) and meets timing at 32 MHz.
 | Videl | `falcon_videl` | all ST/Falcon modes, VGA and RGB/TV timing from the registers, both palettes |
 | DSP56001 | `rtl/falcon/dsp` | 16 MIPS, 32K words, host port, SSI; matches Hatari instruction by instruction and cycle by cycle |
 | DMA sound, crossbar, codec | `falcon_crossbar` | play/record, multi-track, DSP links incl. handshake mode |
+| Printer port | `falcon_lpt`, `tools/falcon_lpt` | output side: each strobed byte to a program on the ARM, which prints it (USB, network) or files it |
 | YM2149 | `falcon_psg` | Hatari's volume table |
 | Audio input | `falcon_audio_adc` | MiSTer ADC channels 0/1 to the Falcon microphone inputs |
 | MFP 68901 | `falcon_mfp*` | timers, interrupts, USART (MiSTer UART) |
@@ -84,6 +85,24 @@ TOS then reports a 68881/68882.  Without `falcon_fpu` (or with another Main)
 the core has no FPU, as before.  `/tmp/falcon_fpu.log` holds its messages.
 Test programs for the machine: `tools/fputest` (FPUTEST.TOS checks results,
 FPUBENCH.TOS measures speed).
+
+### Printer port
+
+Bytes the machine prints (PSG port B, /STROBE on port A bit 5, BUSY on MFP
+GPIP0) go to the program `tools/falcon_lpt` on the MiSTer's Linux side.  Build
+it with `tools/falcon_lpt/build.sh`, copy `falcon_lpt` to `/media/fat/` and
+start it while the core runs:
+
+    /media/fat/falcon_lpt &                     # a file a print job in /media/fat/printer
+    /media/fat/falcon_lpt -n 192.168.1.50 &     # a network printer's raw port (9100)
+
+With a USB printer or a USB-to-parallel cable plugged into the MiSTer the
+bytes go there instead, and the printer's own paper-out, off-line and error
+lines hold BUSY.  The bytes are passed on as they are: the printer has to
+understand what the Atari program sends.  Without the program the machine sees
+a printer that is switched off, as before.  Output only: nothing is read back
+through the port.  Bench: `tb/lpt/run.sh`; `tb/lpt/lpttest.s` prints a known
+text through the BIOS.
 
 ### Configuration menu
 
@@ -250,7 +269,8 @@ FALCON_BRINGUP=NO_DSP ./scripts/build.sh Falcon040   # without the DSP
   time on the board is not measured yet; 32 MHz turbo is the default
   (docs/CPU_TIMING.md).
 - SCC: synchronous modes and the LAN port (channel A has no line);
-  Centronics printer, `.MSA`/`.STX` floppy images.
+  the Centronics port's input side (the output side: Printer port above),
+  `.MSA`/`.STX` floppy images.
 - Microphone input (see Audio input) is tested only in simulation, not yet
   with a physical source on the MiSTer's ADC.
 - TT030: the Nova ET4000 VME card (OSD "VME card", `rtl/vme/vme_et4000.sv`)

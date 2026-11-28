@@ -584,7 +584,8 @@ wire  [1:0] d3_be;
 wire [15:0] d3_wdata, d3_rdata;
 wire        fpu_present;
 assign      fpu_ok = fpu_present;
-// shared by two masters: p3 (the FPU bridge or the probe) and the SCSI DaynaPORT's rings
+// shared by three masters: p3 (the FPU bridge or the probe), the SCSI DaynaPORT's rings
+// and the printer port's ring
 wire        p3_req, p3_we, p3_ack;
 wire [23:1] p3_addr;
 wire  [1:0] p3_be;
@@ -592,21 +593,26 @@ wire [15:0] p3_wdata;
 wire        net_req, net_we, net_ack;
 wire [23:1] net_addr;
 wire [15:0] net_wdata;
-reg         d3_busy = 1'b0, d3_net = 1'b0;
+wire        lpt_req, lpt_we, lpt_ack;
+wire [23:1] lpt_addr;
+wire [15:0] lpt_wdata;
+reg         d3_busy = 1'b0, d3_net = 1'b0, d3_lpt = 1'b0;
 always @(posedge clk) begin
 	if (por) d3_busy <= 1'b0;
 	else if (!d3_busy) begin
-		if (p3_req) begin d3_busy <= 1'b1; d3_net <= 1'b0; end
-		else if (net_req) begin d3_busy <= 1'b1; d3_net <= 1'b1; end
+		if (p3_req) begin d3_busy <= 1'b1; d3_net <= 1'b0; d3_lpt <= 1'b0; end
+		else if (net_req) begin d3_busy <= 1'b1; d3_net <= 1'b1; d3_lpt <= 1'b0; end
+		else if (lpt_req) begin d3_busy <= 1'b1; d3_net <= 1'b0; d3_lpt <= 1'b1; end
 	end else if (d3_ack) d3_busy <= 1'b0;
 end
-assign d3_req   = d3_busy & (d3_net ? net_req : p3_req);
-assign d3_we    = d3_net ? net_we : p3_we;
-assign d3_addr  = d3_net ? net_addr : p3_addr;
-assign d3_be    = d3_net ? 2'b11 : p3_be;
-assign d3_wdata = d3_net ? net_wdata : p3_wdata;
-assign p3_ack   = d3_ack & ~d3_net;
+assign d3_req   = d3_busy & (d3_lpt ? lpt_req : d3_net ? net_req : p3_req);
+assign d3_we    = d3_lpt ? lpt_we : d3_net ? net_we : p3_we;
+assign d3_addr  = d3_lpt ? lpt_addr : d3_net ? net_addr : p3_addr;
+assign d3_be    = (d3_lpt | d3_net) ? 2'b11 : p3_be;
+assign d3_wdata = d3_lpt ? lpt_wdata : d3_net ? net_wdata : p3_wdata;
+assign p3_ack   = d3_ack & ~d3_net & ~d3_lpt;
 assign net_ack  = d3_ack & d3_net;
+assign lpt_ack  = d3_ack & d3_lpt;
 
 `ifdef FALCON_MBOX_TEST
 falcon_mbox_test #(.CLK_HZ(CLK_HZ)) mbox_test
@@ -913,6 +919,7 @@ falcon_videl #(.CLK_HZ(CLK_HZ)) videl
 
 // ---- PSG ----
 wire  [7:0] porta, portb;
+wire        porta_oe;
 // serial: with the handshake on, the UART belongs to one port (see ser_tx below)
 wire       ser_m1 = ser_hs & ~ser_port, ser_m2 = ser_hs & ser_port;
 wire signed [15:0] psg_audio;
@@ -923,7 +930,7 @@ falcon_psg #(.CLK_HZ(CLK_HZ), .MIRROR(0)) psg
 	.clk(clk), .reset(dev_reset),
 	`DEVBUS(sel_psg), .bus_addr(dev_addr[7:1]), .bus_dout(psg_dout), .bus_ack(psg_ack),
 	.port_a_in(8'hFF), .port_b_in(8'hFF),
-	.port_a_out(porta), .port_b_out(portb), .port_a_oe(), .port_b_oe(),
+	.port_a_out(porta), .port_b_out(portb), .port_a_oe(porta_oe), .port_b_oe(),
 	.ch_a(), .ch_b(), .ch_c(),
 	.snd_sample(psg_raw), .snd_stb(psg_stb)
 );
@@ -947,6 +954,16 @@ wire       acia_irq, fdc_irq, ide_irq, blit_busy, sndint, soundint;
 // TT with the OSD's mono monitor: GPIP7 low (as the ST's; Hatari also XORs the DMA sound
 // line on a TT), so TOS starts in TT high
 wire       tt_mono = tt_mode && (monitor == 2'b00);
+// the printer port: PSG port B is the data, port A bit 5 /STROBE; BUSY is MFP GPIP0
+wire       lpt_busy;
+falcon_lpt #(.CLK_HZ(CLK_HZ)) lpt
+(
+	.clk(clk), .por(por), .reset(dev_reset),
+	.strobe_n(porta[5]), .strobe_drv(porta_oe), .data(portb), .busy(lpt_busy),
+	.m_req(lpt_req), .m_we(lpt_we), .m_addr(lpt_addr), .m_wdata(lpt_wdata),
+	.m_rdata(d3_rdata), .m_ack(lpt_ack)
+);
+
 wire       mfp_tdo;
 falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 (
@@ -955,7 +972,7 @@ falcon_mfp #(.CLK_HZ(CLK_HZ)) mfp
 	.irq(mfp_irq), .iack(mfp_iack), .iack_vector(mfp_vector), .iack_ack(mfp_iack_ack), .iack_spurious(mfp_iack_spur),
 	// GPIP3 high while the blitter runs (blitter.c); in TT mode /CTS (2) and /DCD (1) are low: the
 	// MiSTer UART is a terminal that is always there (ASV's ttymon waits for carrier on open)
-	.gpip_in({sndint ^ tt_mono, 1'b1, ~(fdc_irq | ide_irq), ~acia_irq, blit_busy, ser_m1 ? ~ser_cts : ~tt_mode, ~tt_mode, 1'b1}),
+	.gpip_in({sndint ^ tt_mono, 1'b1, ~(fdc_irq | ide_irq), ~acia_irq, blit_busy, ser_m1 ? ~ser_cts : ~tt_mode, ~tt_mode, lpt_busy}),
 	.gpip_out(), .gpip_oe(),
 	.tai(soundint), .tbi(videl_de_tb),   // one event per source line (Hatari's ST line timing)
 	.tao(), .tbo(), .tco(), .tdo(mfp_tdo),

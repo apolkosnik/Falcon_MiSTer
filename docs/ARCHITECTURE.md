@@ -83,7 +83,7 @@ I/O decode (word address bits [23:1] are given to each device):
 | 2   | HBL  | autovector; latched at line start, cleared by the acknowledge |
 
 MFP GPIP inputs (Falcon):
-- I0 printer BUSY (1 = no printer)
+- I0 printer BUSY (`falcon_lpt`: 1 = busy, or `tools/falcon_lpt` is not running)
 - I1 Centronics ACK on the Falcon (idle: 1)
 - I2 RS232 CTS (inverted: 1)
 - I3 blitter busy (1 while the blitter runs, 0 when it finishes, so the
